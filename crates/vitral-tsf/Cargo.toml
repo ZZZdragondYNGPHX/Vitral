@@ -1,0 +1,32 @@
+[package]
+name = "vitral-tsf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vitral-core = { path = "../vitral-core" }
+vitral-ffi = { path = "../vitral-ffi" }
+vitral-tokens = { path = "../vitral-tokens" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_TextServices",
+    "implement", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_LibraryLoader",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_DirectComposition",
+] }
+
+[target.'cfg(windows)'.dependencies.windows-core]
+version = "0.58"
+[target.'cfg(windows)'.dependencies.serde_json]
+workspace = true
+
+[build-dependencies]
+cc = "1"

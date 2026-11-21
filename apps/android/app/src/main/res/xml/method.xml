@@ -1,0 +1,3 @@
+<input-method xmlns:android="http://schemas.android.com/apk/res/android" android:settingsActivity="dev.vitral.ime.SettingsActivity">
+    <subtype android:label="Vitral" android:imeSubtypeLocale="zh_CN" android:imeSubtypeMode="keyboard" android:languageTag="zh-CN"/>
+</input-method>

@@ -1,0 +1,18 @@
+[package]
+name = "vitral-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+fcitx-control = []
+
+[dependencies]
+vitral-core = { path = "../vitral-core" }
+vitral-tokens = { path = "../vitral-tokens" }
+serde.workspace = true
+serde_json.workspace = true

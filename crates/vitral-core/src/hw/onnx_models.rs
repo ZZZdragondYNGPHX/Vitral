@@ -1,0 +1,396 @@
+use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+
+#[cfg(feature = "native-onnx")]
+use crate::onnx_env::get_ort_env;
+#[cfg(feature = "native-onnx")]
+use ort::{session::Session, value::TensorRef};
+
+#[derive(Debug, Clone)]
+pub struct BertTokenizer {
+    vocab: HashMap<String, i64>,
+    pub cls_id: i64,
+    pub sep_id: i64,
+    pub mask_id: i64,
+    pub unk_id: i64,
+    pub pad_id: i64,
+}
+
+impl BertTokenizer {
+    pub fn from_vocab_file(path: &Path) -> Option<Self> {
+        let content = fs::read_to_string(path).ok()?;
+        let mut vocab = HashMap::with_capacity(22_000);
+        for (idx, line) in content.lines().enumerate() {
+            let tok = line.trim_end_matches(&['\r', '\n'][..]);
+            if !tok.is_empty() {
+                vocab.insert(tok.to_string(), idx as i64);
+            }
+        }
+        let cls_id = *vocab.get("[CLS]").unwrap_or(&101);
+        let sep_id = *vocab.get("[SEP]").unwrap_or(&102);
+        let mask_id = *vocab.get("[MASK]").unwrap_or(&103);
+        let unk_id = *vocab.get("[UNK]").unwrap_or(&100);
+        let pad_id = *vocab.get("[PAD]").unwrap_or(&0);
+        Some(Self {
+            vocab,
+            cls_id,
+            sep_id,
+            mask_id,
+            unk_id,
+            pad_id,
+        })
+    }
+
+    pub fn token_id(&self, tok: &str) -> Option<i64> {
+        if let Some(&id) = self.vocab.get(tok) {
+            return Some(id);
+        }
+        let lower = tok.to_lowercase();
+        self.vocab.get(&lower).copied()
+    }
+
+    pub fn char_token_id(&self, ch: char) -> Option<i64> {
+        let mut buf = [0u8; 4];
+        let s = ch.encode_utf8(&mut buf);
+        self.token_id(s)
+    }
+
+    pub fn encode_char_slots(&self, chars: &[char], mask_idx: Option<usize>) -> (Vec<i64>, usize) {
+        let mut ids = Vec::with_capacity(chars.len() + 2);
+        ids.push(self.cls_id);
+        let mut mask_pos = 0usize;
+        for (i, &ch) in chars.iter().enumerate() {
+            if mask_idx == Some(i) {
+                mask_pos = ids.len();
+                ids.push(self.mask_id);
+            } else {
+                let id = self.char_token_id(ch).unwrap_or(self.unk_id);
+                ids.push(id);
+            }
+        }
+        ids.push(self.sep_id);
+        (ids, mask_pos)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VisualPrediction {
+    pub ch: char,
+    pub prob: f32,
+    pub raw_logit: f32,
+}
+
+pub struct HwOnnxBundle {
+    pub hw_classes: Vec<char>,
+    pub hw_class_set: HashSet<char>,
+    pub tokenizer: Option<BertTokenizer>,
+    #[cfg(feature = "native-onnx")]
+    hw_session: Option<Mutex<Session>>,
+    #[cfg(feature = "native-onnx")]
+    rerank_session: Option<Mutex<Session>>,
+}
+
+impl std::fmt::Debug for HwOnnxBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HwOnnxBundle")
+            .field("hw_classes", &self.hw_classes.len())
+            .field("has_tokenizer", &self.tokenizer.is_some())
+            .finish()
+    }
+}
+
+static BUNDLE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<HwOnnxBundle>>>> = OnceLock::new();
+
+pub fn resolve_reranker_dir(assets_dir: &Path) -> Option<PathBuf> {
+    let primary = assets_dir.join("reranker");
+    if primary.join("model_int8.onnx").is_file() {
+        return Some(primary);
+    }
+    let fallback = assets_dir.join("models").join("reranker").join("rbt3-ONNX");
+    if fallback.join("model_int8.onnx").is_file() {
+        return Some(fallback);
+    }
+    if primary.is_dir() {
+        return Some(primary);
+    }
+    None
+}
+
+impl HwOnnxBundle {
+    pub fn load_cached(assets_dir: Option<&Path>) -> Arc<Self> {
+        let key = assets_dir
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("__no_assets__"));
+        let cache = BUNDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = cache.lock();
+        if let Some(b) = guard.get(&key) {
+            return Arc::clone(b);
+        }
+        let built = Arc::new(Self::load(assets_dir));
+        guard.insert(key, Arc::clone(&built));
+        built
+    }
+
+    fn load(assets_dir: Option<&Path>) -> Self {
+        let mut hw_classes = Vec::new();
+        let mut hw_class_set = HashSet::new();
+        let mut tokenizer = None;
+        #[cfg(feature = "native-onnx")]
+        let mut hw_session = None;
+        #[cfg(feature = "native-onnx")]
+        let mut rerank_session = None;
+
+        if let Some(dir) = assets_dir {
+            let classes_path = dir.join("handwriting").join("hw_model.classes.json");
+            if let Ok(raw) = fs::read_to_string(&classes_path) {
+                if let Ok(ords) = serde_json::from_str::<Vec<u32>>(&raw) {
+                    hw_classes.reserve(ords.len());
+                    for cp in ords {
+                        let ch = char::from_u32(cp).unwrap_or('\u{FFFD}');
+                        hw_classes.push(ch);
+                        if ch != '\u{FFFD}' {
+                            hw_class_set.insert(ch);
+                        }
+                    }
+                }
+            }
+
+            let rerank_dir = resolve_reranker_dir(dir);
+            if let Some(ref rdir) = rerank_dir {
+                tokenizer = BertTokenizer::from_vocab_file(&rdir.join("vocab.txt"));
+            }
+
+            #[cfg(feature = "native-onnx")]
+            if let Some(env) = get_ort_env() {
+                let int8_hw = dir.join("handwriting").join("hw_model.int8.onnx");
+                let fp32_hw = dir.join("handwriting").join("hw_model.onnx");
+                let chosen_hw = if int8_hw.is_file() {
+                    Some(int8_hw)
+                } else if fp32_hw.is_file() {
+                    Some(fp32_hw)
+                } else {
+                    None
+                };
+                if let Some(hw_path) = chosen_hw {
+                    if !hw_classes.is_empty() {
+                        if let Ok(builder) = Session::builder(env) {
+                            if let Ok(mut b) = builder.with_intra_threads(1) {
+                                if let Ok(sess) = b.commit_from_file(&hw_path) {
+                                    hw_session = Some(Mutex::new(sess));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref rdir) = rerank_dir {
+                    let rbt3_path = rdir.join("model_int8.onnx");
+                    if rbt3_path.is_file() && tokenizer.is_some() {
+                        if let Ok(builder) = Session::builder(env) {
+                            if let Ok(mut b) = builder.with_intra_threads(1) {
+                                if let Ok(sess) = b.commit_from_file(&rbt3_path) {
+                                    rerank_session = Some(Mutex::new(sess));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Self {
+            hw_classes,
+            hw_class_set,
+            tokenizer,
+            #[cfg(feature = "native-onnx")]
+            hw_session,
+            #[cfg(feature = "native-onnx")]
+            rerank_session,
+        }
+    }
+
+    pub fn has_hw_onnx(&self) -> bool {
+        #[cfg(feature = "native-onnx")]
+        {
+            self.hw_session.is_some()
+        }
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            false
+        }
+    }
+
+    pub fn has_reranker_onnx(&self) -> bool {
+        #[cfg(feature = "native-onnx")]
+        {
+            self.rerank_session.is_some() && self.tokenizer.is_some()
+        }
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            false
+        }
+    }
+
+    /// Run `hw_model` ONNX on a flattened `[B, 3, 48, 48]` DirectMap batch.
+    pub fn classify_directmap_batch(
+        &self,
+        directmaps_flat: &[f32],
+        batch_size: usize,
+        top_k: usize,
+    ) -> Option<Vec<Vec<VisualPrediction>>> {
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            let _ = (directmaps_flat, batch_size, top_k);
+            None
+        }
+        #[cfg(feature = "native-onnx")]
+        {
+            let sess_mtx = self.hw_session.as_ref()?;
+            if batch_size == 0 || directmaps_flat.len() != batch_size * 3 * 48 * 48 {
+                return None;
+            }
+            let num_classes = self.hw_classes.len();
+            if num_classes == 0 {
+                return None;
+            }
+            let input_ref = TensorRef::from_array_view((
+                [batch_size, 3usize, 48usize, 48usize],
+                directmaps_flat,
+            ))
+            .ok()?;
+
+            let mut sess = sess_mtx.lock();
+            let outputs = sess.run(ort::inputs!["directmap" => input_ref]).ok()?;
+            let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>().ok()?;
+            if shape.len() != 2 || shape[0] as usize != batch_size || shape[1] as usize != num_classes
+            {
+                return None;
+            }
+
+            let mut batch_out = Vec::with_capacity(batch_size);
+            for b in 0..batch_size {
+                let row = &logits[b * num_classes..(b + 1) * num_classes];
+                let max_z = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f64;
+                for &z in row {
+                    sum_exp += ((z - max_z) as f64).exp();
+                }
+                let log_norm = (max_z as f64) + sum_exp.ln();
+
+                // Partial selection of top_k indices
+                let k = top_k.min(num_classes);
+                let mut indexed: Vec<(usize, f32)> = row.iter().copied().enumerate().collect();
+                indexed.select_nth_unstable_by(k.saturating_sub(1), |a, b| b.1.total_cmp(&a.1));
+                let mut top_slice = indexed[..k].to_vec();
+                top_slice.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+                let preds = top_slice
+                    .into_iter()
+                    .map(|(idx, z)| {
+                        let prob = ((z as f64) - log_norm).exp() as f32;
+                        VisualPrediction {
+                            ch: self.hw_classes[idx],
+                            prob,
+                            raw_logit: z,
+                        }
+                    })
+                    .collect();
+                batch_out.push(preds);
+            }
+            Some(batch_out)
+        }
+    }
+
+    /// Score candidate characters at `[MASK]` positions using `rbt3-ONNX` (`BertForMaskedLM`).
+    /// Returns `None` for any candidate that maps to `[UNK]` (not in `vocab.txt`).
+    pub fn score_rbt3_masked_batch(
+        &self,
+        sequences: &[Vec<i64>],
+        mask_positions: &[usize],
+        cands_per_item: &[Vec<char>],
+    ) -> Option<Vec<Vec<Option<f32>>>> {
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            let _ = (sequences, mask_positions, cands_per_item);
+            None
+        }
+        #[cfg(feature = "native-onnx")]
+        {
+            let sess_mtx = self.rerank_session.as_ref()?;
+            let tok = self.tokenizer.as_ref()?;
+            let bsz = sequences.len();
+            if bsz == 0 || bsz != mask_positions.len() || bsz != cands_per_item.len() {
+                return None;
+            }
+            let max_len = sequences.iter().map(|s| s.len()).max().unwrap_or(0);
+            if max_len == 0 {
+                return None;
+            }
+
+            let mut input_ids = vec![tok.pad_id; bsz * max_len];
+            let mut attention_mask = vec![0i64; bsz * max_len];
+            let token_type_ids = vec![0i64; bsz * max_len];
+            for (b, seq) in sequences.iter().enumerate() {
+                let base = b * max_len;
+                for (t, &id) in seq.iter().enumerate() {
+                    input_ids[base + t] = id;
+                    attention_mask[base + t] = 1;
+                }
+            }
+
+            let t_ids = TensorRef::from_array_view(([bsz, max_len], input_ids.as_slice())).ok()?;
+            let t_att =
+                TensorRef::from_array_view(([bsz, max_len], attention_mask.as_slice())).ok()?;
+            let t_typ =
+                TensorRef::from_array_view(([bsz, max_len], token_type_ids.as_slice())).ok()?;
+
+            let mut sess = sess_mtx.lock();
+            let outputs = sess
+                .run(ort::inputs![
+                    "input_ids" => t_ids,
+                    "attention_mask" => t_att,
+                    "token_type_ids" => t_typ
+                ])
+                .ok()?;
+            let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>().ok()?;
+            if shape.len() != 3 || shape[0] as usize != bsz || shape[1] as usize != max_len {
+                return None;
+            }
+            let vocab_sz = shape[2] as usize;
+
+            let mut out = Vec::with_capacity(bsz);
+            for (b, &mpos) in mask_positions.iter().enumerate() {
+                if mpos >= max_len {
+                    out.push(vec![None; cands_per_item[b].len()]);
+                    continue;
+                }
+                let row_off = (b * max_len + mpos) * vocab_sz;
+                let row = &logits[row_off..row_off + vocab_sz];
+                let max_z = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f64;
+                for &z in row {
+                    sum_exp += ((z - max_z) as f64).exp();
+                }
+                let log_norm = (max_z as f64) + sum_exp.ln();
+
+                let mut scores = Vec::with_capacity(cands_per_item[b].len());
+                for &ch in &cands_per_item[b] {
+                    if let Some(tid) = tok.char_token_id(ch) {
+                        let uid = tid as usize;
+                        if tid != tok.unk_id && uid < vocab_sz {
+                            let lp = ((row[uid] as f64) - log_norm) as f32;
+                            scores.push(Some(lp));
+                            continue;
+                        }
+                    }
+                    scores.push(None);
+                }
+                out.push(scores);
+            }
+            Some(out)
+        }
+    }
+}

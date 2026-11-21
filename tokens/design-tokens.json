@@ -1,0 +1,110 @@
+{
+  "$schema": "https://vitral.dev/schemas/design-tokens-v1.json",
+  "brand": {
+    "name": "Vitral",
+    "version": "1.1.0",
+    "materialStyle": "frosted-glass",
+    "cloudRoot": "/Koofr/Vitral"
+  },
+  "color": {
+    "dark": {
+      "surfacePanel": "rgba(22, 26, 38, 0.68)",
+      "surfacePopover": "rgba(24, 29, 42, 0.74)",
+      "surfaceKeyPrimary": "rgba(255, 255, 255, 0.08)",
+      "surfaceKeyFunction": "rgba(255, 255, 255, 0.04)",
+      "surfaceKeyPressedGlow": "rgba(56, 189, 248, 0.34)",
+      "borderSpecular": "rgba(255, 255, 255, 0.16)",
+      "accentPrimary": "#0ea5e9",
+      "accentSoft": "rgba(14, 165, 233, 0.18)",
+      "accentText": "#7dd3fc",
+      "textPrimary": "#f8fafc",
+      "textSecondary": "#94a3b8",
+      "shadowElevation": "0 16px 36px rgba(0, 0, 0, 0.48)",
+      "inkStrokePrimary": "#7dd3fc",
+      "retroactiveFixGlow": "rgba(56, 189, 248, 0.65)"
+    },
+    "light": {
+      "surfacePanel": "rgba(255, 255, 255, 0.74)",
+      "surfacePopover": "rgba(255, 255, 255, 0.80)",
+      "surfaceKeyPrimary": "rgba(255, 255, 255, 0.86)",
+      "surfaceKeyFunction": "rgba(15, 23, 42, 0.06)",
+      "surfaceKeyPressedGlow": "rgba(14, 165, 233, 0.26)",
+      "borderSpecular": "rgba(255, 255, 255, 0.88)",
+      "accentPrimary": "#0284c7",
+      "accentSoft": "rgba(2, 132, 199, 0.14)",
+      "accentText": "#0369a1",
+      "textPrimary": "#0f172a",
+      "textSecondary": "#64748b",
+      "shadowElevation": "0 12px 28px rgba(15, 23, 42, 0.10)",
+      "inkStrokePrimary": "#0284c7",
+      "retroactiveFixGlow": "rgba(2, 132, 199, 0.55)"
+    }
+  },
+  "blur": {
+    "backdropStandardPx": 18,
+    "backdropFloatingWindowPx": 20
+  },
+  "radius": {
+    "desktopStatusCapsulePx": 9999,
+    "desktopCandidateWindowPx": 16,
+    "candidateActivePillPx": 10,
+    "mobileKeyboardSheetPx": 16,
+    "mobileKeycapPx": 10,
+    "popoverPanelPx": 16
+  },
+  "typography": {
+    "numericVariant": "tabular-nums",
+    "candidateFontSizeDefaultPx": 16,
+    "candidateFontSizeRangePx": [13, 22],
+    "toolbarIconStrokeWidthPx": 1.75,
+    "toolbarTextLabelsAllowed": false
+  },
+  "motion": {
+    "springCurve": "cubic-bezier(0.22, 1, 0.36, 1)",
+    "durationFastMs": 150,
+    "durationStandardMs": 180,
+    "desktopIdleFadeDelayMs": 5000,
+    "desktopIdleOpacity": 0.35
+  },
+  "handwriting": {
+    "modes": ["phonetic-lookup-single", "continuous-contextual-lattice"],
+    "strokeWidthPx": 3.5,
+    "superimposedInkFadeOutMs": 420,
+    "retroactiveHighlightDurationMs": 600,
+    "confusionTopK": 8,
+    "ambiguousMarginThreshold": 0.15,
+    "showXiaoheCodeInLookupMode": true
+  },
+  "ergonomics": {
+    "desktopCandidateOrientation": "horizontal",
+    "desktopCandidatePageSize": 5,
+    "desktopInitialToolbarItems": ["vitral-logo", "lang-toggle"],
+    "mobileDockedScreenRatio": 0.26,
+    "mobileTopHierarchy": ["icon-toolbar", "candidate-bar", "key-grid"],
+    "mobileFloatingWindow": {
+      "freeDrag": true,
+      "freeResize": true,
+      "minWidthDp": 220,
+      "minHeightDp": 165
+    },
+    "keyFeedbackMode": "in-key-specular-glow",
+    "spacebarVoiceHoldThresholdMs": 350,
+    "spacebarVoiceVisual": "in-place-waveform",
+    "haptics": {
+      "letterTickMs": 10,
+      "actionThudMs": 16
+    },
+    "schemaKeycaps": {
+      "double_pinyin_flypy": {
+        "rows": 4,
+        "topLeftSublabel": "swipe-up-number-or-symbol",
+        "bottomRightSublabel": "xiaohe-final"
+      },
+      "rime_ice_quanpin": {
+        "rows": 5,
+        "dedicatedTopNumberRow": true,
+        "topRightSublabel": "swipe-up-symbol"
+      }
+    }
+  }
+}

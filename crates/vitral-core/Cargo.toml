@@ -1,0 +1,47 @@
+[package]
+name = "vitral-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["native-rime", "native-onnx", "native-voice"]
+native-rime = []
+native-onnx = ["dep:ort"]
+native-voice = ["dep:ort", "dep:kaldi-fbank"]
+
+[dependencies]
+kaldi-fbank = { version = "0.3", optional = true }
+vitral-tokens = { path = "../vitral-tokens" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+pinyin.workspace = true
+sha2.workspace = true
+ciborium.workspace = true
+memmap2.workspace = true
+opendal = { workspace = true, features = ["services-webdav", "executors-tokio", "blocking", "layers-retry", "layers-timeout"] }
+opendal-http-transport-reqwest = { workspace = true, features = ["rustls-no-provider"] }
+reqwest = { workspace = true, features = ["rustls-no-provider", "http2", "charset"] }
+rustls = { workspace = true, features = ["ring", "std", "tls12"] }
+webpki-roots.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "time", "sync"] }
+chacha20poly1305.workspace = true
+getrandom.workspace = true
+zstd.workspace = true
+tiny_http.workspace = true
+ureq.workspace = true
+socket2.workspace = true
+mdns-sd.workspace = true
+chrono = { workspace = true, features = ["clock", "std"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ort = { workspace = true, optional = true, features = ["std", "download-binaries", "tls-rustls", "api-17"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+ort = { workspace = true, optional = true, features = ["std", "load-dynamic", "api-17"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation","Win32_Security_Authorization","Win32_Storage_FileSystem","Win32_System_IO","Win32_System_Pipes","Win32_System_Threading","Win32_System_RemoteDesktop"] }

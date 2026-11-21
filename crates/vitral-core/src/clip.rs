@@ -1,0 +1,371 @@
+use crate::error::VitralError;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardPayload {
+    #[serde(default)]
+    pub id: Option<String>,
+    pub content: String,
+    #[serde(default = "default_mime")]
+    pub mime_type: String,
+    #[serde(default)]
+    pub source_device: String,
+    #[serde(default)]
+    pub timestamp_ms: u64,
+}
+
+fn default_mime() -> String {
+    "text/plain".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardEntry {
+    pub id: String,
+    pub content: String,
+    pub mime_type: String,
+    pub source_device: String,
+    pub timestamp_ms: u64,
+    pub pinned: bool,
+    pub shortcut_code: Option<String>,
+}
+
+/// Persistent N-item clipboard ring state (no live_slot / no WebDAV Quick Paste storage).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardState {
+    pub capacity: usize,
+    pub pinned_count: usize,
+    pub ring: Vec<ClipboardEntry>,
+}
+
+/// Entry IDs changed on this device since its last successful WebDAV write.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RingChanges {
+    changed: std::collections::BTreeSet<String>,
+    removed: std::collections::BTreeSet<String>,
+}
+
+impl RingChanges {
+    pub fn record(&mut self, before: &[ClipboardEntry], after: &[ClipboardEntry]) {
+        for previous in before {
+            if !after.iter().any(|e| e.id == previous.id) {
+                self.changed.remove(&previous.id);
+                self.removed.insert(previous.id.clone());
+            }
+        }
+        for current in after {
+            if !before.contains(current) {
+                self.removed.remove(&current.id);
+                self.changed.insert(current.id.clone());
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn merge(
+        &self,
+        cloud: Vec<ClipboardEntry>,
+        local: &[ClipboardEntry],
+        capacity: usize,
+    ) -> Vec<ClipboardEntry> {
+        let mut result: Vec<_> = local
+            .iter()
+            .filter(|e| self.changed.contains(&e.id))
+            .cloned()
+            .collect();
+        result.extend(
+            cloud
+                .into_iter()
+                .filter(|e| !self.removed.contains(&e.id) && !self.changed.contains(&e.id)),
+        );
+        result.sort_by_key(|e| std::cmp::Reverse(e.timestamp_ms));
+        while result.len() > capacity {
+            let Some(oldest) = result.iter().rposition(|e| !e.pinned) else {
+                break;
+            };
+            result.remove(oldest);
+        }
+        result
+    }
+}
+
+/// Strictly per-device RAM-only Quick Paste state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickPasteState {
+    pub quick_paste: Option<ClipboardEntry>,
+    pub seen_while_ime_open: bool,
+    pub ime_open: bool,
+    pub last_seen_copy_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuickPasteConsumeResult {
+    pub consumed: Option<ClipboardEntry>,
+    pub state: QuickPasteState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClipboardManager {
+    capacity: usize,
+    device_id: String,
+    instance_seq: u64,
+    next_id: u64,
+    ring: VecDeque<ClipboardEntry>,
+    quick_paste: Option<ClipboardEntry>,
+    seen_while_ime_open: bool,
+    ime_open: bool,
+    last_seen_copy_id: Option<String>,
+}
+
+impl ClipboardManager {
+    pub fn new(capacity: usize) -> Self {
+        Self::with_device(capacity, "vitral-local-device")
+    }
+
+    pub fn with_device(capacity: usize, device_id: &str) -> Self {
+        let instance_seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let trimmed = device_id.trim();
+        let effective_device_id = if trimmed.is_empty() {
+            format!("vitral-device-{instance_seq}")
+        } else {
+            trimmed.to_string()
+        };
+        Self {
+            capacity: capacity.max(1),
+            device_id: effective_device_id,
+            instance_seq,
+            next_id: 1,
+            ring: VecDeque::new(),
+            quick_paste: None,
+            seen_while_ime_open: false,
+            ime_open: false,
+            last_seen_copy_id: None,
+        }
+    }
+
+    fn alloc_entry(&mut self, payload: ClipboardPayload) -> ClipboardEntry {
+        let explicit_id = payload.id.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+        let id = explicit_id.unwrap_or_else(|| {
+            let seq = self.next_id;
+            self.next_id += 1;
+            format!(
+                "{}-p{}i{}-{}-{}",
+                self.device_id,
+                std::process::id(),
+                self.instance_seq,
+                payload.timestamp_ms,
+                seq
+            )
+        });
+        ClipboardEntry {
+            id,
+            content: payload.content,
+            mime_type: payload.mime_type,
+            source_device: payload.source_device,
+            timestamp_ms: payload.timestamp_ms,
+            pinned: false,
+            shortcut_code: None,
+        }
+    }
+
+    fn push_ring_entry(&mut self, entry: ClipboardEntry) {
+        if self.ring.iter().any(|e| e.id == entry.id) {
+            return;
+        }
+        while self.ring.len() >= self.capacity {
+            if let Some(pos) = self.ring.iter().rposition(|e| !e.pinned) {
+                self.ring.remove(pos);
+            } else {
+                break;
+            }
+        }
+        if self.ring.len() < self.capacity {
+            self.ring.push_front(entry);
+        }
+    }
+
+    pub fn push(&mut self, payload: ClipboardPayload) -> ClipboardState {
+        let entry = self.alloc_entry(payload);
+        self.last_seen_copy_id = Some(entry.id.clone());
+        self.quick_paste = Some(entry.clone());
+        self.seen_while_ime_open = self.ime_open;
+        self.push_ring_entry(entry);
+        self.state()
+    }
+
+    pub fn ingest_remote(
+        &mut self,
+        payload: ClipboardPayload,
+        is_cold_boot: bool,
+    ) -> QuickPasteState {
+        let entry = self.alloc_entry(payload);
+        let copy_id = entry.id.clone();
+        self.push_ring_entry(entry.clone());
+
+        if is_cold_boot {
+            self.last_seen_copy_id = Some(copy_id);
+        } else if self.last_seen_copy_id.as_deref() != Some(copy_id.as_str()) {
+            self.last_seen_copy_id = Some(copy_id);
+            self.quick_paste = Some(entry);
+            self.seen_while_ime_open = self.ime_open;
+        }
+        self.quick_paste_state()
+    }
+
+    pub fn quick_paste_state(&self) -> QuickPasteState {
+        QuickPasteState {
+            quick_paste: self.quick_paste.clone(),
+            seen_while_ime_open: self.seen_while_ime_open,
+            ime_open: self.ime_open,
+            last_seen_copy_id: self.last_seen_copy_id.clone(),
+        }
+    }
+
+    pub fn consume_quick_paste(&mut self) -> QuickPasteConsumeResult {
+        let consumed = self.quick_paste.take();
+        self.seen_while_ime_open = false;
+        QuickPasteConsumeResult {
+            consumed,
+            state: self.quick_paste_state(),
+        }
+    }
+
+    pub fn on_ime_open(&mut self) -> QuickPasteState {
+        self.ime_open = true;
+        if self.quick_paste.is_some() {
+            self.seen_while_ime_open = true;
+        }
+        self.quick_paste_state()
+    }
+
+    pub fn on_ime_close(&mut self) -> QuickPasteState {
+        self.ime_open = false;
+        if self.seen_while_ime_open {
+            self.quick_paste = None;
+            self.seen_while_ime_open = false;
+        }
+        self.quick_paste_state()
+    }
+
+    pub fn dismiss_quick_paste(&mut self) -> QuickPasteState {
+        self.quick_paste = None;
+        self.seen_while_ime_open = false;
+        self.quick_paste_state()
+    }
+
+    pub fn pin(
+        &mut self,
+        item_id: &str,
+        shortcut_code: Option<&str>,
+    ) -> Result<ClipboardState, VitralError> {
+        let normalized_code = shortcut_code.and_then(|s| {
+            let t = s.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        });
+        let item = self
+            .ring
+            .iter_mut()
+            .find(|e| e.id == item_id)
+            .ok_or_else(|| {
+                VitralError::NotFound(format!("clipboard item '{item_id}' not found"))
+            })?;
+        item.pinned = true;
+        item.shortcut_code = normalized_code;
+        Ok(self.state())
+    }
+
+    pub fn clear_unpinned(&mut self) -> ClipboardState {
+        self.ring.retain(|e| e.pinned);
+        self.state()
+    }
+
+    pub fn find_shortcut(&self, code: &str) -> Option<&ClipboardEntry> {
+        self.ring
+            .iter()
+            .find(|e| e.pinned && e.shortcut_code.as_deref() == Some(code))
+    }
+
+    pub fn state(&self) -> ClipboardState {
+        let mut ring: Vec<ClipboardEntry> = self.ring.iter().cloned().collect();
+        ring.sort_by_key(|a| std::cmp::Reverse(a.pinned));
+        let pinned_count = ring.iter().filter(|e| e.pinned).count();
+        ClipboardState {
+            capacity: self.capacity,
+            pinned_count,
+            ring,
+        }
+    }
+
+    pub fn export_ring(&self) -> Vec<ClipboardEntry> {
+        self.ring.iter().cloned().collect()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
+        while self.ring.len() > self.capacity {
+            if let Some(pos) = self.ring.iter().rposition(|e| !e.pinned) {
+                self.ring.remove(pos);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Cold-boot restore of persistent clipboard ring from Koofr WebDAV:
+    /// updates `N`-ring & `last_seen_copy_id` without populating RAM-only `quick_paste`.
+    pub fn observe_cloud_ring(&mut self, entries: Vec<ClipboardEntry>, first_read: bool) {
+        let newest = entries.first().cloned();
+        let fresh = newest.as_ref().is_some_and(|e| {
+            self.last_seen_copy_id.as_ref() != Some(&e.id)
+                && !self.ring.iter().any(|existing| existing.id == e.id)
+                && self
+                    .ring
+                    .front()
+                    .is_none_or(|existing| existing.timestamp_ms <= e.timestamp_ms)
+        });
+        self.ring.clear();
+        for entry in entries.into_iter().rev() {
+            self.push_ring_entry(entry);
+        }
+        if let Some(entry) = newest.filter(|_| fresh) {
+            self.last_seen_copy_id = Some(entry.id.clone());
+            if !first_read && entry.source_device != self.device_id {
+                self.quick_paste = Some(entry);
+                self.seen_while_ime_open = self.ime_open;
+            }
+        }
+    }
+
+    pub fn restore_ring_cold_boot(&mut self, entries: Vec<ClipboardEntry>) {
+        self.ring.clear();
+        for entry in entries.into_iter().rev() {
+            self.push_ring_entry(entry);
+        }
+        if let Some(front) = self.ring.front() {
+            self.last_seen_copy_id = Some(front.id.clone());
+        }
+        self.quick_paste = None;
+        self.seen_while_ime_open = false;
+    }
+}

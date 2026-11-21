@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Vitral
+GenericName=Input Method Settings
+GenericName[zh_CN]=输入法设置
+Exec=vitral-desktop
+Icon=vitral
+Categories=Settings;Utility;
+StartupNotify=true

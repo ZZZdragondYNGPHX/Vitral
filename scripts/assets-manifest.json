@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "project": "Vitral",
+  "assets": [
+    {
+      "id": "rime-ice-full",
+      "group": "rime",
+      "required": true,
+      "archive_type": "zip",
+      "url": "https://github.com/iDvel/rime-ice/releases/download/2026.06.30/full.zip",
+      "filename": "rime-ice-2026.06.30-full.zip",
+      "size": 16050491,
+      "sha256": "675d23b070be00e1b800f9a6db033ef98f4493cd5b568ed8aa3b3541769c46ac",
+      "license": "GPL-3.0",
+      "stage_dir": "assets/rime",
+      "verify_files": [
+        "rime_ice.schema.yaml",
+        "double_pinyin_flypy.schema.yaml",
+        "cn_dicts/base.dict.yaml",
+        "en_dicts/en.dict.yaml"
+      ]
+    },
+    {
+      "id": "wanxiang-lts-zh-hans-gram",
+      "group": "grammar",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://github.com/amzxyz/rime-wanxiang-data/releases/download/LTS/wanxiang-lts-zh-hans.gram",
+      "filename": "wanxiang-lts-zh-hans.gram",
+      "size": 390786092,
+      "sha256": "e9ddd501b7d536bc5ea1346f8f900ae49a719a05be349e0a17cb27e717143ca5",
+      "license": "CC-BY-4.0",
+      "stage_dir": "assets/rime",
+      "stage_filename": "wanxiang-lts-zh-hans.gram",
+      "verify_files": [
+        "wanxiang-lts-zh-hans.gram"
+      ]
+    },
+    {
+      "id": "opencc-portable-data",
+      "group": "opencc",
+      "required": true,
+      "archive_type": "zip",
+      "extract_subpath": "share/opencc",
+      "url": "https://github.com/BYVoid/OpenCC/releases/download/ver.1.4.2/OpenCC-1.4.2-windows-x64-portable.zip",
+      "filename": "OpenCC-1.4.2-windows-x64-portable.zip",
+      "size": 5714827,
+      "sha256": "dab0142ff6401219a5e556cee215323753eeac38752dde4cfddf8035746605f1",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/opencc",
+      "verify_files": [
+        "s2t.json",
+        "t2s.json",
+        "STCharacters.ocd2",
+        "STPhrases.ocd2",
+        "TSCharacters.ocd2"
+      ]
+    },
+    {
+      "id": "cnn-chinese-hw-ckpt",
+      "group": "handwriting",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://raw.githubusercontent.com/mcyph/cnn_chinese_hw/83758b614a30cb608a83f0cb979ce12ca6634060/cnn_chinese_hw/data/hw_model.pt",
+      "filename": "hw_model.pt",
+      "size": 53879553,
+      "sha256": "4b3d1efbab618463b5315fa4c3415a048b3c4fc7aad9ded0f243da1bad051ea1",
+      "license": "LGPL-2.1",
+      "stage_dir": "assets/handwriting",
+      "stage_filename": "hw_model.pt",
+      "verify_files": [
+        "hw_model.pt"
+      ]
+    },
+    {
+      "id": "cnn-chinese-hw-export-py",
+      "group": "handwriting",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://raw.githubusercontent.com/mcyph/cnn_chinese_hw/83758b614a30cb608a83f0cb979ce12ca6634060/cnn_chinese_hw/recognizer/export_onnx.py",
+      "filename": "hw_export_onnx.py",
+      "size": 3753,
+      "sha256": "f1538a4baa245c60c8c5cbb020462337d31cd0251a8b758090c9e9a38d63141e",
+      "license": "LGPL-2.1",
+      "stage_dir": "assets/handwriting/scripts",
+      "stage_filename": "export_onnx.py",
+      "verify_files": [
+        "export_onnx.py"
+      ]
+    },
+    {
+      "id": "cnn-chinese-hw-model-py",
+      "group": "handwriting",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://raw.githubusercontent.com/mcyph/cnn_chinese_hw/83758b614a30cb608a83f0cb979ce12ca6634060/cnn_chinese_hw/recognizer/model.py",
+      "filename": "hw_model.py",
+      "size": 10392,
+      "sha256": "f45c7da5a13b14817e4dd7bdde21e95a9d5636d549a2f967ab20e1156f0b3727",
+      "license": "LGPL-2.1",
+      "stage_dir": "assets/handwriting/scripts",
+      "stage_filename": "model.py",
+      "verify_files": [
+        "model.py"
+      ]
+    },
+    {
+      "id": "cnn-chinese-hw-config-py",
+      "group": "handwriting",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://raw.githubusercontent.com/mcyph/cnn_chinese_hw/83758b614a30cb608a83f0cb979ce12ca6634060/cnn_chinese_hw/recognizer/config.py",
+      "filename": "hw_config.py",
+      "size": 9678,
+      "sha256": "525a1a63a034d47d937f38b02cff2a6196b64061fa70d626420c6f70720e8985",
+      "license": "LGPL-2.1",
+      "stage_dir": "assets/handwriting/scripts",
+      "stage_filename": "config.py",
+      "verify_files": [
+        "config.py"
+      ]
+    },
+    {
+      "id": "cjkvi-ids",
+      "group": "handwriting",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://raw.githubusercontent.com/cjkvi/cjkvi-ids/86b4d16159f0079437870408f0ca186e529015db/ids.txt",
+      "filename": "cjkvi_ids.txt",
+      "size": 2161631,
+      "sha256": "bfc70a8c09f9f5616ebf0543bd6681e67314e9f7ae2307e5ae8c6f15bdc5c6a6",
+      "license": "GPL-2.0",
+      "stage_dir": "assets/handwriting",
+      "stage_filename": "cjkvi_ids.txt",
+      "verify_files": [
+        "cjkvi_ids.txt"
+      ]
+    },
+    {
+      "id": "sensevoice-small-int8",
+      "group": "voice",
+      "required": true,
+      "archive_type": "tar.bz2",
+      "strip_components": 1,
+      "url": "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+      "filename": "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2",
+      "size": 163002883,
+      "sha256": "7d1efa2138a65b0b488df37f8b89e3d91a60676e416f515b952358d83dfd347e",
+      "license": "FunASR Model Open Source License Agreement v1.1 (SenseVoice-Small weights)",
+      "stage_dir": "assets/voice/sensevoice-small",
+      "verify_files": [
+        "model.int8.onnx",
+        "tokens.txt"
+      ]
+    },
+    {
+      "id": "reranker-rbt3-int8-onnx",
+      "group": "reranker",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/onnx/model_int8.onnx",
+      "filename": "rbt3-model_int8.onnx",
+      "size": 38889302,
+      "sha256": "b57bdfe6326cfffd11579dc5f35e09a898cb415988fb2ac0f2751a22e8e59e55",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/reranker",
+      "stage_filename": "model_int8.onnx",
+      "verify_files": [
+        "model_int8.onnx"
+      ]
+    },
+    {
+      "id": "reranker-rbt3-vocab",
+      "group": "reranker",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/vocab.txt",
+      "filename": "rbt3-vocab.txt",
+      "size": 109540,
+      "sha256": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/reranker",
+      "stage_filename": "vocab.txt",
+      "verify_files": [
+        "vocab.txt"
+      ]
+    },
+    {
+      "id": "reranker-rbt3-tokenizer",
+      "group": "reranker",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/tokenizer.json",
+      "filename": "rbt3-tokenizer.json",
+      "size": 439124,
+      "sha256": "7dfbf1966ebf99d471c3796e9b457329d2b2182b817e144f1e904b957745c839",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/reranker",
+      "stage_filename": "tokenizer.json",
+      "verify_files": [
+        "tokenizer.json"
+      ]
+    },
+    {
+      "id": "reranker-rbt3-tokenizer-cfg",
+      "group": "reranker",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/tokenizer_config.json",
+      "filename": "rbt3-tokenizer_config.json",
+      "size": 1249,
+      "sha256": "bc3788b020afe8d772684fc7a5f64cbb562f1b816d2585858558d3df8b95bbf7",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/reranker",
+      "stage_filename": "tokenizer_config.json",
+      "verify_files": [
+        "tokenizer_config.json"
+      ]
+    },
+    {
+      "id": "reranker-rbt3-config",
+      "group": "reranker",
+      "required": true,
+      "archive_type": "raw",
+      "url": "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/config.json",
+      "filename": "rbt3-config.json",
+      "size": 873,
+      "sha256": "d9e9e55e3c466420b3c295bcdbc5b8264a5ecda53b7ea65d88305e30c6fe72c7",
+      "license": "Apache-2.0",
+      "stage_dir": "assets/reranker",
+      "stage_filename": "config.json",
+      "verify_files": [
+        "config.json"
+      ]
+    }
+  ]
+}

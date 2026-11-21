@@ -1,0 +1,59 @@
+# Rust / Cargo
+/target/
+**/*.rs.bk
+
+# Node / pnpm / Tauri
+node_modules/
+.pnpm-store/
+apps/desktop-tauri/dist/
+apps/desktop-tauri/src-tauri/target/
+apps/desktop-tauri/src-tauri/gen/
+
+# Android / Gradle / NDK
+apps/android/.gradle/
+apps/android/build/
+apps/android/*/build/
+apps/android/.cxx/
+apps/android/local.properties
+apps/android/**/src/main/jniLibs/
+
+# Linux CMake / Fcitx5 build
+linux/fcitx5-vitral/build/
+
+# Fetched large offline assets (managed by scripts/fetch-assets.sh)
+assets/cache/
+assets/models/
+assets/rime/
+assets/opencc/
+assets/handwriting/
+assets/voice/
+assets/reranker/
+*.onnx
+*.gram
+*.pt
+*.bin
+*.tar.*
+*.zip
+
+# Python / E2E venv (keep tests/e2e/pyproject.toml, harnesses, tests)
+tests/e2e/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# OS / Editor / Logs
+.DS_Store
+*.swp
+*.log
+
+# Signing credentials and local settings
+*.jks
+*.keystore
+*.p12
+.env
+.env.local
+
+# Local validation suites and fixtures
+/tests/
+**/src/test/
+**/tests/
