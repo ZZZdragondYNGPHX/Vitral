@@ -18,12 +18,12 @@ mkdir -p "$stage/usr/share/vitral/assets"
 install -d "$stage/usr/share/doc/vitral"
 cp -a LICENSE-MIT LICENSE-APACHE licenses "$stage/usr/share/doc/vitral/"
 assets="$stage/usr/share/vitral/assets"
-cp -a assets/{rime,opencc} "$assets/"
+cp -a assets/opencc "$assets/"
+mkdir -p "$assets/rime"
+(cd assets/rime && tar --exclude='*.gram' -cf - .) | tar -xf - -C "$assets/rime"
 find "$assets" -name '.*.sha256' -delete
 install -Dm644 scripts/assets-manifest.json "$assets/assets-manifest.json"
-for entry in handwriting/{hw_model.int8.onnx,hw_model.classes.json,cjkvi_ids.txt} reranker/{model_int8.onnx,vocab.txt} voice/sensevoice-small/{model.int8.onnx,tokens.txt,LICENSE}; do
-    install -Dm644 "assets/$entry" "$assets/$entry"
-done
+install -Dm644 scripts/models-catalog.json "$assets/models-catalog.json"
 mkdir -p target/release
 tar --zstd -cf "$stage/Vitral-linux-x86_64.tar.zst" -C "$stage" usr
 mv "$stage/Vitral-linux-x86_64.tar.zst" target/release/

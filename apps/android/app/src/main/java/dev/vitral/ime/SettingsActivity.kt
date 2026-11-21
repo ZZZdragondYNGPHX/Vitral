@@ -33,6 +33,7 @@ import dev.vitral.ime.theme.VitralTokens as T
 import java.io.File
 import java.util.Locale
 import kotlin.math.roundToInt
+import kotlinx.coroutines.delay
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -262,6 +263,16 @@ class SettingsActivity : ComponentActivity() {
                 var clipLearn by remember {
                     mutableStateOf(config.optBoolean("learn_from_clipboard", true))
                 }
+                var predictionEnabled by remember {
+                    mutableStateOf(config.optBoolean("prediction_enabled", true))
+                }
+                var profileDistillEnabled by remember {
+                    mutableStateOf(config.optBoolean("profile_distill_enabled", true))
+                }
+                var aiPreferLocal by remember {
+                    mutableStateOf(config.optBoolean("ai_prefer_local", true))
+                }
+                var profileState by remember { mutableStateOf<JSONObject?>(null) }
                 var size by remember {
                     mutableFloatStateOf(
                         config
@@ -273,6 +284,46 @@ class SettingsActivity : ComponentActivity() {
                     mutableFloatStateOf(config.optInt("clipboard_ring_capacity", 50).toFloat())
                 }
                 var source by remember { mutableStateOf("") }
+                var modelsState by remember { mutableStateOf<JSONObject?>(null) }
+                var confirmDeleteModelId by remember { mutableStateOf<String?>(null) }
+
+                fun refreshModels(silent: Boolean = true) {
+                    Core.call(this@SettingsActivity, "models-state", background = true) { r ->
+                        r.onSuccess { value ->
+                            modelsState = value as? JSONObject
+                            if (!silent) notice = "已刷新模型状态"
+                        }.onFailure {
+                            if (!silent) notice = it.message.orEmpty()
+                        }
+                    }
+                }
+
+                LaunchedEffect(section) {
+                    if (section == 0) {
+                        Core.call(this@SettingsActivity, "profile-state", background = true) { r ->
+                            r.onSuccess { profileState = it as? JSONObject }
+                        }
+                    } else if (section == 1) {
+                        refreshModels(true)
+                    }
+                }
+
+                LaunchedEffect(section, modelsState) {
+                    if (section != 1) return@LaunchedEffect
+                    val arr = modelsState?.optJSONArray("models") ?: return@LaunchedEffect
+                    var downloading = false
+                    for (i in 0 until arr.length()) {
+                        val dl = arr.optJSONObject(i)?.optJSONObject("download")
+                        if (dl?.optString("status") == "downloading") {
+                            downloading = true
+                            break
+                        }
+                    }
+                    if (downloading) {
+                        delay(700)
+                        refreshModels(true)
+                    }
+                }
 
                 Scaffold(
                     containerColor = MaterialTheme.colorScheme.background,
@@ -310,6 +361,9 @@ class SettingsActivity : ComponentActivity() {
                                             .put("pure_offline", offline)
                                             .put("adaptive_learning", adaptive)
                                             .put("learn_from_clipboard", clipLearn)
+                                            .put("prediction_enabled", predictionEnabled)
+                                            .put("profile_distill_enabled", profileDistillEnabled)
+                                            .put("ai_prefer_local", aiPreferLocal)
                                             .put("candidate_font_px", size.roundToInt())
                                             .put("clipboard_ring_capacity", capacity.roundToInt())
                                         busy = true
@@ -371,17 +425,18 @@ class SettingsActivity : ComponentActivity() {
                             }
                         }
 
-                        TabRow(
+                        ScrollableTabRow(
                             selectedTabIndex = section,
                             containerColor = Color.Transparent,
+                            edgePadding = 0.dp,
                         ) {
-                            listOf("输入", "同步", "语音与AI", "快捷键").forEachIndexed { i, s ->
+                            listOf("输入", "模型", "同步", "语音与AI", "快捷键").forEachIndexed { i, s ->
                                 Tab(section == i, { section = i }, text = { Text(s) })
                             }
                         }
 
                         when (section) {
-                            3 -> ShortcutSettings(config) { notice = it }
+                            4 -> ShortcutSettings(config) { notice = it }
                             0 -> {
                                 // Live candidate font preview
                                 SectionCard("候选字号预览", "拖动下方滑块实时查看效果") {
@@ -484,34 +539,361 @@ class SettingsActivity : ComponentActivity() {
                                 }
 
                                 SectionCard(
-                                    "懂你引擎 · 个性化舒适输入",
-                                    "本地专属排序模型与语义记忆，可选加密云同步，随时可清空",
+                                    "懂你引擎 · 预测输入与本地画像",
+                                    "本地专属排序、Codex 风格预测与脱敏用户画像蒸馏，随时可清空",
                                 ) {
                                     Check("个人专属排序与上下文学习", adaptive) { adaptive = it }
                                     Check("剪贴板静默识词（自动跳过密码与网址）", clipLearn) { clipLearn = it }
-                                    OutlinedButton(
-                                        enabled = !busy,
-                                        onClick = {
-                                            busy = true
-                                            Core.call(
-                                                this@SettingsActivity,
-                                                "personalization-clear",
-                                                background = true,
-                                            ) { r ->
-                                                busy = false
-                                                notice =
-                                                    r.fold(
-                                                        { "已清空个人习惯记忆" },
-                                                        { it.message.orEmpty() },
-                                                    )
-                                            }
+                                    Check("本地语境预测输入（空闲候选栏显示建议）", predictionEnabled) {
+                                        predictionEnabled = it
+                                    }
+                                    Check("本地用户画像蒸馏", profileDistillEnabled) {
+                                        profileDistillEnabled = it
+                                    }
+                                    val prof = profileState?.optJSONObject("profile")
+                                    val summary = prof?.optString("summary").orEmpty()
+                                    val accepted = prof?.optLong("accepted_count", 0L) ?: 0L
+                                    val dismissed = prof?.optLong("dismissed_count", 0L) ?: 0L
+                                    Text(
+                                        if (summary.isNotBlank()) {
+                                            "画像摘要：$summary（采纳 $accepted · 忽略 $dismissed）"
+                                        } else {
+                                            "尚未生成画像摘要（采纳 $accepted · 忽略 $dismissed）"
                                         },
-                                    ) {
-                                        Text("清空习惯记忆")
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        FilledTonalButton(
+                                            enabled = !busy,
+                                            onClick = {
+                                                busy = true
+                                                Core.call(
+                                                    this@SettingsActivity,
+                                                    "profile-distill",
+                                                    background = true,
+                                                ) { r ->
+                                                    busy = false
+                                                    r.onSuccess {
+                                                        profileState = it as? JSONObject
+                                                        notice = "已完成本地用户画像蒸馏"
+                                                    }.onFailure { notice = it.message.orEmpty() }
+                                                }
+                                            },
+                                        ) {
+                                            Text("立即蒸馏画像")
+                                        }
+                                        OutlinedButton(
+                                            enabled = !busy,
+                                            onClick = {
+                                                busy = true
+                                                Core.call(
+                                                    this@SettingsActivity,
+                                                    "personalization-clear",
+                                                    background = true,
+                                                ) { r ->
+                                                    busy = false
+                                                    notice =
+                                                        r.fold(
+                                                            {
+                                                                profileState = null
+                                                                "已清空个人习惯与画像"
+                                                            },
+                                                            { it.message.orEmpty() },
+                                                        )
+                                                }
+                                            },
+                                        ) {
+                                            Text("清空习惯与画像")
+                                        }
                                     }
                                 }
                             }
                             1 -> {
+                                val state = modelsState
+                                val totalRamMb = state?.optLong("total_ram_mb", 0L) ?: 0L
+                                val ramTier = state?.optString("ram_tier", "unknown").orEmpty()
+                                val tierLabel =
+                                    when (ramTier) {
+                                        "low" -> "轻量档位"
+                                        "standard" -> "标准档位"
+                                        "high" -> "高性能档位"
+                                        else -> "内存未知"
+                                    }
+                                val ramSummary =
+                                    if (totalRamMb > 0L) {
+                                        String.format(
+                                            Locale.US,
+                                            "本机内存 %.1f GB · %s",
+                                            totalRamMb / 1024.0,
+                                            tierLabel,
+                                        )
+                                    } else {
+                                        "正在检测本机内存档位…"
+                                    }
+
+                                SectionCard("本机模型中心", ramSummary) {
+                                    Text(
+                                        if (offline) {
+                                            "纯离线模式已开启：暂停联网下载与目录更新，已下载模型可离线启停或删除。"
+                                        } else {
+                                            "语法、手写、重排与离线语音按需下载，下载后立即热加载生效。"
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                    Field(config, "model_catalog_url", "自定义模型目录地址（可选）")
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        OutlinedButton(
+                                            enabled = !busy,
+                                            onClick = { refreshModels(false) },
+                                        ) {
+                                            Text("刷新状态")
+                                        }
+                                        FilledTonalButton(
+                                            enabled = !busy && !offline,
+                                            onClick = {
+                                                busy = true
+                                                val url = config.optString("model_catalog_url").trim()
+                                                val payload =
+                                                    if (url.isNotEmpty()) json("url" to url)
+                                                    else JSONObject()
+                                                Core.call(
+                                                    this@SettingsActivity,
+                                                    "models-refresh-catalog",
+                                                    payload,
+                                                    true,
+                                                ) { r ->
+                                                    busy = false
+                                                    r.onSuccess { value ->
+                                                        modelsState = value as? JSONObject
+                                                        notice = "模型目录已更新"
+                                                    }.onFailure {
+                                                        notice = it.message.orEmpty()
+                                                    }
+                                                }
+                                            },
+                                        ) {
+                                            Text("检查目录更新")
+                                        }
+                                    }
+                                }
+
+                                val models = state?.optJSONArray("models")
+                                if (models == null || models.length() == 0) {
+                                    SectionCard("可用模型", "正在读取本机模型列表…") {}
+                                } else {
+                                    for (idx in 0 until models.length()) {
+                                        val m = models.getJSONObject(idx)
+                                        val id = m.getString("id")
+                                        val name = m.getString("name")
+                                        val desc = m.optString("description")
+                                        val version = m.optString("version")
+                                        val fit = m.optString("fit")
+                                        val installed = m.optBoolean("installed")
+                                        val bundled = m.optBoolean("bundled")
+                                        val enabled = m.optBoolean("enabled")
+                                        val active = m.optBoolean("active")
+                                        val minRam = m.optLong("min_ram_mb", 0L)
+                                        val recRam = m.optLong("recommended_ram_mb", 0L)
+                                        val files = m.optJSONArray("files")
+                                        var totalBytes = 0L
+                                        if (files != null) {
+                                            for (fi in 0 until files.length()) {
+                                                totalBytes += files.getJSONObject(fi).optLong("size", 0L)
+                                            }
+                                        }
+                                        val dl = m.optJSONObject("download")
+                                        val dlStatus = dl?.optString("status").orEmpty()
+                                        val downloading = dlStatus == "downloading"
+                                        val fitLabel =
+                                            when (fit) {
+                                                "recommended" -> "内存推荐"
+                                                "compatible" -> "内存兼容"
+                                                "exceeds_ram" -> "超出推荐内存"
+                                                else -> fit
+                                            }
+                                        val statusLabel =
+                                            when {
+                                                downloading -> "下载中"
+                                                active && installed -> "已下载 · 已启用"
+                                                active && bundled -> "本地内置 · 已启用"
+                                                installed -> "已下载 · 未启用"
+                                                bundled -> "本地内置 · 未启用"
+                                                else -> "未下载"
+                                            }
+
+                                        SectionCard(name, desc) {
+                                            Text(
+                                                "版本 $version · ${formatBytes(totalBytes)} · $fitLabel · $statusLabel",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color =
+                                                    if (fit == "exceeds_ram") MaterialTheme.colorScheme.error
+                                                    else MaterialTheme.colorScheme.primary,
+                                            )
+                                            Text(
+                                                String.format(
+                                                    Locale.US,
+                                                    "内存要求：最低 %.1f GB · 推荐 %.1f GB",
+                                                    minRam / 1024.0,
+                                                    recRam / 1024.0,
+                                                ),
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                            )
+
+                                            if (downloading && dl != null) {
+                                                val dlTotal = dl.optLong("total_bytes", totalBytes).coerceAtLeast(1L)
+                                                val dlDone = dl.optLong("downloaded_bytes", 0L).coerceIn(0L, dlTotal)
+                                                val progress = dlDone.toFloat() / dlTotal.toFloat()
+                                                LinearProgressIndicator(
+                                                    progress = { progress },
+                                                    modifier = Modifier.fillMaxWidth(),
+                                                )
+                                                Text(
+                                                    "${formatBytes(dlDone)} / ${formatBytes(dlTotal)} (${(progress * 100).roundToInt()}%)",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                )
+                                            } else if (dlStatus == "failed") {
+                                                val err = dl?.optString("error").orEmpty()
+                                                if (err.isNotBlank()) {
+                                                    Text(
+                                                        "下载失败：$err",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.error,
+                                                    )
+                                                }
+                                            }
+
+                                            Row(
+                                                Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically,
+                                            ) {
+                                                Text(
+                                                    if (installed || bundled) {
+                                                        if (enabled) "功能已启用" else "已暂停使用"
+                                                    } else {
+                                                        "下载后可启用"
+                                                    },
+                                                    style = MaterialTheme.typography.bodyMedium,
+                                                )
+                                                Switch(
+                                                    checked = enabled && (installed || bundled),
+                                                    enabled = !busy && !downloading && (installed || bundled),
+                                                    onCheckedChange = { next ->
+                                                        busy = true
+                                                        Core.call(
+                                                            this@SettingsActivity,
+                                                            "models-set-enabled",
+                                                            json("id" to id, "enabled" to next),
+                                                            true,
+                                                        ) { r ->
+                                                            busy = false
+                                                            r.onSuccess { value ->
+                                                                modelsState = value as? JSONObject
+                                                                notice =
+                                                                    if (next) "已启用「$name」"
+                                                                    else "已停用「$name」"
+                                                            }.onFailure {
+                                                                notice = it.message.orEmpty()
+                                                            }
+                                                        }
+                                                    },
+                                                    modifier = Modifier.semantics { contentDescription = "启用$name" },
+                                                )
+                                            }
+
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                if (downloading) {
+                                                    OutlinedButton(
+                                                        enabled = !busy,
+                                                        onClick = {
+                                                            Core.call(
+                                                                this@SettingsActivity,
+                                                                "models-cancel",
+                                                                json("id" to id),
+                                                                true,
+                                                            ) { r ->
+                                                                r.onSuccess { value ->
+                                                                    modelsState = value as? JSONObject
+                                                                    notice = "已取消下载「$name」"
+                                                                }.onFailure {
+                                                                    notice = it.message.orEmpty()
+                                                                }
+                                                            }
+                                                        },
+                                                    ) {
+                                                        Text("取消下载")
+                                                    }
+                                                } else if (!installed) {
+                                                    FilledTonalButton(
+                                                        enabled = !busy && !offline,
+                                                        onClick = {
+                                                            busy = true
+                                                            Core.call(
+                                                                this@SettingsActivity,
+                                                                "models-download",
+                                                                json("id" to id),
+                                                                true,
+                                                            ) { r ->
+                                                                busy = false
+                                                                r.onSuccess { value ->
+                                                                    modelsState = value as? JSONObject
+                                                                    notice = "开始下载「$name」…"
+                                                                }.onFailure {
+                                                                    notice = it.message.orEmpty()
+                                                                }
+                                                            }
+                                                        },
+                                                    ) {
+                                                        Text(
+                                                            when {
+                                                                dlStatus == "failed" -> "重试下载"
+                                                                fit == "exceeds_ram" -> "仍要下载"
+                                                                else -> "下载并启用"
+                                                            }
+                                                        )
+                                                    }
+                                                }
+
+                                                if (installed && !downloading) {
+                                                    OutlinedButton(
+                                                        enabled = !busy,
+                                                        onClick = {
+                                                            if (confirmDeleteModelId != id) {
+                                                                confirmDeleteModelId = id
+                                                                notice = "再次点击「确认删除」以清理「$name」"
+                                                                return@OutlinedButton
+                                                            }
+                                                            confirmDeleteModelId = null
+                                                            busy = true
+                                                            Core.call(
+                                                                this@SettingsActivity,
+                                                                "models-delete",
+                                                                json("id" to id),
+                                                                true,
+                                                            ) { r ->
+                                                                busy = false
+                                                                r.onSuccess { value ->
+                                                                    modelsState = value as? JSONObject
+                                                                    notice = "已删除「$name」"
+                                                                }.onFailure {
+                                                                    notice = it.message.orEmpty()
+                                                                }
+                                                            }
+                                                        },
+                                                    ) {
+                                                        Text(if (confirmDeleteModelId == id) "确认删除" else "删除模型")
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            2 -> {
                                 SectionCard("网络模式", "纯离线模式下物理阻断局域网与外部网络请求") {
                                     Check("纯离线模式", offline) { offline = it }
                                 }
@@ -685,8 +1067,11 @@ class SettingsActivity : ComponentActivity() {
                                     }
                                 }
                             }
-                            2 -> {
-                                SectionCard("AI 服务配置", "可选配置 Ollama 或 OpenAI 兼容接口") {
+                            3 -> {
+                                SectionCard("AI 服务配置", "支持本地 Qwen3 纯离线执行，也可选配远端接口") {
+                                    Check("优先使用已下载的本地 Qwen3 模型", aiPreferLocal) {
+                                        aiPreferLocal = it
+                                    }
                                     Field(config, "ai_endpoint", "服务地址")
                                     Field(config, "ai_model", "模型")
                                     Field(config, "ai_api_key", "API 密钥", true)
@@ -699,7 +1084,7 @@ class SettingsActivity : ComponentActivity() {
                                     }
                                 }
 
-                                SectionCard("本机离线录音与文本处理", "SenseVoice-Small 本地语音转写") {
+                                SectionCard("本机离线录音与文本处理", "SenseVoice / Qwen3-ASR 语音转写 · 本地 Qwen3 纯离线文本处理") {
                                     OutlinedTextField(
                                         source,
                                         { source = it },
@@ -751,7 +1136,7 @@ class SettingsActivity : ComponentActivity() {
                                         listOf("translate" to "译英", "polish" to "润色", "summary" to "摘要")
                                             .forEach { (mode, label) ->
                                                 TextButton(
-                                                    enabled = !busy && !offline && source.isNotBlank(),
+                                                    enabled = !busy && source.isNotBlank(),
                                                     onClick = {
                                                         busy = true
                                                         Core.call(

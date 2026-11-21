@@ -69,6 +69,7 @@ pub struct RimeGramDb {
 static GRAM_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<RimeGramDb>>>> = OnceLock::new();
 
 impl RimeGramDb {
+    pub fn clear_cache() { if let Some(c) = GRAM_CACHE.get() { c.lock().clear(); } }
     pub fn open_cached(path: &Path) -> Result<Arc<Self>, VitralError> {
         let canon = path.to_path_buf();
         let cache = GRAM_CACHE.get_or_init(|| Mutex::new(HashMap::new()));

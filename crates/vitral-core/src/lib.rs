@@ -12,10 +12,13 @@ pub mod hw;
 pub mod imp;
 pub mod lan;
 mod local;
+pub mod models;
 pub mod offline_guard;
 #[cfg(any(feature = "native-voice", feature = "native-onnx"))]
 mod onnx_env;
 pub mod ret;
+pub mod profile;
+pub mod predict;
 pub mod sync;
 pub mod shortcuts;
 
@@ -58,6 +61,7 @@ pub struct InputState {
     pub engine: EngineState,
     pub hw: HandwritingSession,
     pub retention: RetentionEngine,
+    pub profile: profile::ProfileEngine,
     pub voice: VoiceSession,
 }
 
@@ -81,8 +85,14 @@ pub struct VitralCore {
     ai: RwLock<Arc<AiClient>>,
     offline_guard: OfflineGuard,
     imported_lexicon: Arc<RwLock<ImportedLexiconIndex>>,
-    input: Mutex<InputState>,
+    input: Arc<Mutex<InputState>>,
+    models: models::ModelManager,
+    prediction: predict::PredictEngine,
     sync: Mutex<SyncState>,
+}
+
+impl Drop for VitralCore {
+    fn drop(&mut self) { self.prediction.cancel(); }
 }
 
 impl VitralCore {
@@ -124,7 +134,12 @@ impl VitralCore {
         let imported_lexicon = Arc::new(RwLock::new(ImportedLexiconIndex::new(
             engine.resolved_assets_dir.as_deref(),
         )));
-        let hw = HandwritingSession::with_assets_dir(engine.resolved_assets_dir.as_deref());
+        let models = models::ModelManager::new(&engine.config, engine.resolved_assets_dir.as_deref())?;
+        engine.model_paths = models.paths();
+        engine.pure_rust.set_model_paths(&engine.model_paths);
+        let mut hw = HandwritingSession::with_assets_dir(engine.resolved_assets_dir.as_deref());
+        hw.set_model_paths(engine.model_paths.clone());
+        let voice = VoiceSession { model_paths: engine.model_paths.clone(), ..Default::default() };
 
         let local_dir = (!engine.config.data_dir.is_empty()).then(|| std::path::PathBuf::from(&engine.config.data_dir));
         let mut retention = RetentionEngine::with_half_life(half_life_sec);
@@ -156,19 +171,23 @@ impl VitralCore {
             Some(dir) => local::load(dir, "clipboard-changes.json")?.unwrap_or_default(),
             None => Default::default(),
         };
+        let profile = profile::ProfileEngine::new(local_dir.clone())?;
         Ok(Self {
+            prediction: predict::PredictEngine::default(),
             local_dir,
             clipboard_io:Mutex::new(()),
             lan_session: Mutex::new(None),
             ai: RwLock::new(Arc::new(ai)),
             offline_guard: OfflineGuard::new(pure_offline),
             imported_lexicon,
-            input: Mutex::new(InputState {
+            models,
+            input: Arc::new(Mutex::new(InputState {
                 engine,
                 hw,
                 retention,
-                voice: VoiceSession::default(),
-            }),
+                profile,
+                voice,
+            })),
             sync: Mutex::new(SyncState {
                 clipboard,
                 devices,
@@ -312,6 +331,9 @@ impl VitralCore {
 
     /// Apply settings without replacing composing, clipboard or retention state.
     pub fn apply_preferences(&self, mut cfg: EngineConfig) -> Result<(), VitralError> {
+        cfg.validate_prediction()?;
+        self.prediction.clear_cache();
+        if let Some(url) = cfg.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { models::validate_url(url)?; }
         shortcuts::normalize(&mut cfg.shortcuts).map_err(VitralError::InvalidArgument)?;
         if !(20..=200).contains(&cfg.clipboard_ring_capacity) {
             return Err(VitralError::InvalidArgument("clipboard capacity must be 20..200".into()));
@@ -340,9 +362,13 @@ impl VitralCore {
         *self.ai.write() = Arc::new(AiClient::from(&cfg));
         if st.engine.config.shortcuts != cfg.shortcuts { st.engine.clear_composition_state(); }
         let active = &mut st.engine.config;
+        active.model_catalog_url = cfg.model_catalog_url.clone();
         active.shortcuts = cfg.shortcuts;
         active.linux_english_mode = cfg.linux_english_mode;
         active.adaptive_learning = cfg.adaptive_learning;
+        active.prediction_enabled = cfg.prediction_enabled;
+        active.prediction_delay_ms = cfg.prediction_delay_ms;
+        active.profile_distill_enabled = cfg.profile_distill_enabled;
         active.learn_from_clipboard = cfg.learn_from_clipboard;
         active.schema = cfg.schema;
         active.opencc_mode = cfg.opencc_mode;
@@ -353,6 +379,7 @@ impl VitralCore {
         active.koofr_root = cfg.koofr_root;
         active.sync_key = cfg.sync_key;
         active.ai_tier3_enabled = cfg.ai_tier3_enabled;
+        active.ai_prefer_local = cfg.ai_prefer_local;
         Ok(())
     }
 
@@ -387,18 +414,53 @@ impl VitralCore {
     }
 
     pub fn reload_assets(&self) -> Result<ReloadReport, VitralError> {
-        let rep = {
-            let mut st = self.input.lock();
-            let rep = st.engine.reload_assets()?;
-            let dir = st.engine.resolved_assets_dir.clone();
-            st.hw.set_assets_dir(dir.as_deref());
-            rep
-        };
+        self.prediction.clear_cache();
+        let rep = Self::reload_input(&self.input)?;
         self.sync_tier1_best_effort();
         Ok(rep)
     }
 
+    fn reload_input(input: &Mutex<InputState>) -> Result<ReloadReport, VitralError> {
+        let mut st = input.lock();
+        crate::eng::gram::RimeGramDb::clear_cache();
+        crate::hw::onnx_models::HwOnnxBundle::clear_cache();
+        crate::hw::ids_exta::IdsIndex::clear_cache();
+        ai::clear_model_cache();
+        let rep = st.engine.reload_assets()?;
+        let paths = st.engine.model_paths.clone();
+        let assets = st.engine.resolved_assets_dir.clone();
+        st.hw.set_assets_dir(assets.as_deref());
+        st.hw.set_model_paths(paths.clone());
+        st.voice.model_paths = paths;
+        Ok(rep)
+    }
+
+    pub fn models_state(&self) -> models::ModelsState { self.models.models_state() }
+    pub fn models_download(&self, id: &str) -> Result<models::ModelsState, VitralError> {
+        let input = Arc::clone(&self.input);
+        self.models.start_download(id, &self.offline_guard, move || Self::reload_input(&input).map(|_| ()))
+    }
+    pub fn models_cancel(&self, id: &str) -> Result<models::ModelsState, VitralError> {
+        self.models.cancel_download(id)?; Ok(self.models_state())
+    }
+    pub fn models_set_enabled(&self, id: &str, enabled: bool) -> Result<models::ModelsState, VitralError> {
+        self.models.set_enabled(id, enabled)?; self.reload_assets()?; Ok(self.models_state())
+    }
+    pub fn models_delete(&self, id: &str) -> Result<models::ModelsState, VitralError> {
+        // Release cached mappings/sessions before deleting files (Windows).
+        self.models.cancel_download(id)?;
+        self.models.set_enabled(id, false)?; self.reload_assets()?;
+        self.models.delete_model(id)?; self.reload_assets()?; Ok(self.models_state())
+    }
+    pub fn models_refresh_catalog(&self, url: Option<&str>) -> Result<models::ModelsState, VitralError> {
+        let configured = self.input.lock().engine.config.model_catalog_url.clone();
+        self.offline_guard.require_online("models_refresh_catalog")?;
+        let url = url.filter(|s| !s.is_empty()).or(configured.as_deref().filter(|s| !s.is_empty())).unwrap_or(models::DEFAULT_CATALOG_URL);
+        self.models.refresh_catalog(url, &self.offline_guard)
+    }
+
     pub fn on_app_focus(&self, app_id: &str) -> Result<AppFocusState, VitralError> {
+        self.prediction.cancel();
         let mut st = self.input.lock();
         st.engine.on_app_focus(app_id)
     }
@@ -502,6 +564,7 @@ impl VitralCore {
         if seq_changed {
             self.sync_tier1_best_effort();
         }
+        if let Some(text) = act.commit_text.as_deref() { self.record_profile_commit(text); }
         Ok(act)
     }
 
@@ -549,6 +612,7 @@ impl VitralCore {
         if seq_changed {
             self.sync_tier1_best_effort();
         }
+        if let Some(text) = act.commit_text.as_deref() { self.record_profile_commit(text); }
         Ok(act)
     }
 
@@ -599,12 +663,7 @@ impl VitralCore {
         pen_up: bool,
     ) -> Result<HandwritingPayload, VitralError> {
         let mut st = self.input.lock();
-        let gram = st.engine.resolved_assets_dir.as_ref().and_then(|d| {
-            crate::eng::gram::RimeGramDb::open_cached(
-                &d.join("rime").join("wanxiang-lts-zh-hans.gram"),
-            )
-            .ok()
-        });
+        let gram = st.engine.model_paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
         let imported = self.imported_lexicon.read();
         let InputState {
             ref mut hw,
@@ -624,11 +683,9 @@ impl VitralCore {
     pub fn hw_end(&self) -> Result<HandwritingPayload, VitralError> {
         let (payload, revision, refine) = {
             let mut st = self.input.lock();
-            let gram = st.engine.resolved_assets_dir.as_ref().and_then(|d| {
-                crate::eng::gram::RimeGramDb::open_cached(&d.join("rime/wanxiang-lts-zh-hans.gram")).ok()
-            });
+            let gram = st.engine.model_paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
             let imported = self.imported_lexicon.read();
-            let refine = st.engine.config.ai_tier3_enabled && !self.is_pure_offline();
+            let refine = st.engine.config.ai_tier3_enabled && (!self.is_pure_offline() || ai::local_llm::LocalLlmEngine::available(st.engine.model_paths.local_llm.as_ref()));
             let InputState { hw, retention, .. } = &mut *st;
             let ctx = HwDecodeContext {imported:&imported,gram:gram.as_deref(),retention,tier3:None,offline_guard:Some(&self.offline_guard)};
             let payload = hw.end_with_context(&ctx)?;
@@ -641,13 +698,15 @@ impl VitralCore {
         };
         let HandwritingPayload::Mode2(local) = &payload else { return Ok(payload) };
         let mut choices = Vec::new();
+        let local_llm = self.input.lock().engine.model_paths.local_llm.clone();
+        let ai = Arc::clone(&self.ai.read());
+        let local_refine = ai.uses_local(&self.offline_guard, local_llm.as_ref());
         if refine {
-            let ai = Arc::clone(&self.ai.read());
             for slot in local.slots.iter().filter(|s| !s.locked_by_entropy && !s.manually_locked && s.top8.len() > 1) {
                 let options:Vec<_> = slot.top8.iter().map(|c| c.ch.as_str()).collect();
                 let prompt = "Choose one character from these handwriting candidates. Return JSON with slot_index equal to its zero-based array index. Preserve the local choice if uncertain.";
-                let question = serde_json::json!({"candidates":options,"local_choice":slot.ch});
-                let choice = ai.chat(&self.offline_guard, prompt, &question.to_string()).ok()
+                let question = serde_json::json!({"candidates":options,"local_choice":slot.ch,"text":local.composing_text,"position":slot.slot_idx});
+                let choice = ai.chat_with_local(&self.offline_guard, local_llm.as_ref(), prompt, &question.to_string()).ok()
                     .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
                     .and_then(|v| v["slot_index"].as_u64())
                     .and_then(|i| usize::try_from(i).ok())
@@ -669,7 +728,7 @@ impl VitralCore {
                     "handwriting changed during recognition".into(),
                 ));
             }
-            if !hw.confirmed_since_edit && !self.is_pure_offline() {
+            if !hw.confirmed_since_edit && (!self.is_pure_offline() || local_refine) {
                 for (i,ch) in choices {
                     let slot=&mut hw.last_slots[i];
                     slot.changed_retroactively |= slot.ch != ch;
@@ -682,6 +741,7 @@ impl VitralCore {
             (snapshot, newly_confirmed && committed.is_some())
         };
         if confirmed {
+            if let HandwritingPayload::Mode2(result) = &payload { self.record_profile_commit(&result.composing_text); }
             self.sync_tier1_best_effort();
         }
         Ok(payload)
@@ -753,6 +813,7 @@ impl VitralCore {
                 .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))?
         };
         self.sync_tier1_best_effort();
+        self.record_profile_commit(&committed);
         Ok(committed)
     }
 
@@ -884,14 +945,94 @@ impl VitralCore {
         }
     }
 
+    fn record_profile_commit(&self, text: &str) {
+        let mut st = self.input.lock();
+        if !st.engine.config.adaptive_learning || !st.engine.config.profile_distill_enabled { return; }
+        let app = st.engine.active_app_id.clone().unwrap_or_else(|| "unknown".into());
+        st.profile.record(&app, text);
+        if st.profile.needs_distill {
+            let InputState { profile, retention, .. } = &mut *st;
+            // The bounded statistical pass does no model inference or disk I/O on keys.
+            profile.statistical(retention);
+            let snapshot = profile.clone();
+            let input = self.input.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = snapshot.persist() { input.lock().profile.last_reason = Some(e.to_string()); }
+            });
+        }
+    }
+
+    pub fn profile_state(&self) -> serde_json::Value {
+        let st = self.input.lock();
+        serde_json::json!({"profile":st.profile.profile,"needs_distill":st.profile.needs_distill,"reason":st.profile.last_reason,
+            "prediction_enabled":st.engine.config.prediction_enabled,"prediction_delay_ms":st.engine.config.prediction_delay_ms,"profile_distill_enabled":st.engine.config.profile_distill_enabled})
+    }
+    pub fn profile_update(&self, update: profile::ProfileUpdate) -> Result<(), VitralError> {
+        self.prediction.clear_cache(); self.input.lock().profile.update_profile(update)
+    }
+    pub fn profile_clear(&self) -> Result<(), VitralError> {
+        self.prediction.clear_cache(); self.input.lock().profile.clear_profile()
+    }
+    pub fn profile_distill(&self) -> Result<(), VitralError> {
+        let (mut snapshot, ret, model, revision) = {
+            let st = self.input.lock();
+            if !st.engine.config.profile_distill_enabled { return Ok(()); }
+            (st.profile.detached(), st.retention.clone(), st.engine.model_paths.local_llm.clone(), st.profile.profile.revision)
+        };
+        snapshot.distill(&ret, model.as_ref(), ai::local_engine())?;
+        let mut st = self.input.lock();
+        // A manual edit or clear wins over a late distillation result.
+        if st.profile.profile.revision == revision && st.engine.config.profile_distill_enabled {
+            snapshot.profile.accepted_count = st.profile.profile.accepted_count;
+            snapshot.profile.dismissed_count = st.profile.profile.dismissed_count;
+            st.profile.profile = snapshot.profile;
+            st.profile.last_reason = snapshot.last_reason;
+            st.profile.persist()?;
+            self.prediction.clear_cache();
+        }
+        Ok(())
+    }
+    pub fn predict_request(&self, request: predict::PredictRequest) -> predict::PredictResult {
+        let generation = self.prediction.cancel().id;
+        let st = self.input.lock();
+        let clipboard = self.sync.lock().clipboard.current().current_copy.as_ref().map(|c| c.content.clone()).unwrap_or_default();
+        // Host claims cannot bypass the core composition gate.
+        let mut request = request;
+        request.is_composing |= !st.engine.raw_input.is_empty() || !st.engine.composing.is_empty();
+        self.prediction.request(request.clone(), &st.engine.config, &st.profile.profile, st.profile.latest(&request.app_id), &clipboard, &st.retention, st.engine.model_paths.local_llm.as_ref(), ai::local_engine(), Some(generation))
+    }
+    pub fn predict_poll(&self, id: Option<u64>) -> predict::PredictResult { self.prediction.poll(id) }
+    pub fn predict_cancel(&self) -> predict::PredictResult { self.prediction.cancel() }
+    pub fn predict_accept(&self, id: u64, text: &str) -> Result<bool, VitralError> {
+        let Some(request) = self.prediction.accept(id, text) else { return Ok(false); };
+        let learned = {
+            let mut st = self.input.lock();
+            let learn = st.engine.config.adaptive_learning;
+            let profile_learn = learn && st.engine.config.profile_distill_enabled;
+            st.profile.feedback(Some((&request.app_id, text)), profile_learn);
+            if learn && profile::safe_text(text) {
+                st.retention.record_contextual_selection(text, "", Some(&request.context_before), Some(&request.app_id), RetentionEngine::now_epoch_ms(), 1., true);
+            }
+            st.profile.persist()?; learn
+        };
+        if learned { self.sync_tier1_best_effort(); }
+        Ok(true)
+    }
+    pub fn predict_dismiss(&self, id: u64) -> Result<bool, VitralError> {
+        if !self.prediction.dismiss(id) { return Ok(false); }
+        let mut st = self.input.lock(); st.profile.feedback(None, false); st.profile.persist()?; Ok(true)
+    }
+
     pub fn personalization_stats(&self) -> ret::PersonalizationStats {
         self.input.lock().retention.stats()
     }
 
     pub fn clear_learned_habits(&self) -> ret::PersonalizationStats {
+        self.prediction.clear_cache();
         let stats = {
             let mut st = self.input.lock();
             st.retention.clear_learned_habits();
+            if let Err(e) = st.profile.clear_profile() { st.profile.last_reason = Some(e.to_string()); }
             st.engine.reset_commit_context();
             let imported = self.imported_lexicon.read();
             self.save_local(
@@ -933,6 +1074,7 @@ impl VitralCore {
     }
 
     pub fn on_ime_close(&self) -> QuickPasteState {
+        self.prediction.cancel();
         let mut sync_st = self.sync.lock();
         sync_st.clipboard.on_ime_close()
     }
@@ -1097,11 +1239,16 @@ impl VitralCore {
     }
 
     pub fn voice_stop(&self) -> Result<VoiceResult, VitralError> {
-        let (samples, assets) = {
+        let (samples, paths, ctx) = {
             let mut st = self.input.lock();
-            (st.voice.finish()?, st.engine.resolved_assets_dir.clone())
+            let ctx = ai::speech_context(&st.retention, st.engine.active_app_id.as_deref(), st.engine.speech_context_before());
+            (st.voice.finish()?, st.engine.model_paths.clone(), ctx)
         };
-        ai::recognize_pcm(&samples, assets.as_deref())
+        let mut result = ai::recognize_pcm(&samples, &paths, &ctx)?;
+        let gram = paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
+        result.transcript = ai::phonetic_correct_transcript(&result.transcript, &self.input.lock().retention, gram.as_deref());
+        self.record_profile_commit(&result.transcript);
+        Ok(result)
     }
 
     pub fn ai_inline(
@@ -1111,7 +1258,8 @@ impl VitralCore {
         target_lang: &str,
     ) -> Result<AiInlineResult, VitralError> {
         let ai = Arc::clone(&self.ai.read());
-        ai.run(&self.offline_guard, mode, text, target_lang)
+        let model = self.input.lock().engine.model_paths.local_llm.clone();
+        ai.run_with_local(&self.offline_guard, model.as_ref(), mode, text, target_lang)
     }
 
     pub fn restore_from_koofr(&self, webdav_cfg_json: &str) -> Result<RestoreResult, VitralError> {
@@ -6110,5 +6258,55 @@ mod personalization_tests {
         assert_eq!(restored.personalization_stats().vocab_count, 0);
         assert_eq!(restored.personalization_stats().english_count, 0);
         assert_eq!(restored.personalization_stats().pinned_count, 1);
+    }
+}
+
+#[cfg(test)]
+mod prediction_integration_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn feedback_learning_clear_and_configuration_boundaries() {
+        let dir = std::env::temp_dir().join(format!("vitral-prediction-integration-{}", std::process::id()));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup { fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); } }
+        let _clean = Cleanup(dir.clone());
+        let core = VitralCore::init(&json!({"data_dir":dir,"assets_dir":dir.join("no-assets"),"pure_offline":true}).to_string()).unwrap();
+        core.on_app_focus("editor").unwrap();
+        core.input.lock().retention.context_bigrams.entry("你好".into()).or_default().insert("世界".into(), 1.);
+        let request = json!({"app_id":"editor","context_before":"你好","trigger":"catch_up"});
+        let ready = commands::execute(&core, "predict-request", &request).unwrap();
+        assert_eq!(ready["text"], "世界");
+        assert_eq!(commands::execute(&core,"predict-accept", &json!({"id":ready["id"],"text":"世界"})).unwrap()["accepted"], true);
+        assert_eq!(core.input.lock().profile.latest("editor"), Some("世界"));
+        assert!(core.input.lock().retention.frecency.contains_key("世界"));
+        assert_eq!(core.profile_state()["profile"]["accepted_count"], 1);
+        let again = commands::execute(&core, "predict-request", &request).unwrap();
+        assert!(core.predict_dismiss(again["id"].as_u64().unwrap()).unwrap());
+        assert!(!core.predict_dismiss(again["id"].as_u64().unwrap()).unwrap());
+        assert_eq!(core.profile_state()["profile"]["dismissed_count"], 1);
+        core.profile_update(profile::ProfileUpdate { summary: "简洁的技术表达".into(), ..Default::default() }).unwrap();
+        let revision = core.input.lock().profile.profile.revision;
+        core.clear_learned_habits();
+        assert!(core.input.lock().profile.latest("editor").is_none());
+        assert!(core.input.lock().profile.profile.summary.is_empty());
+        assert!(core.input.lock().profile.profile.revision > revision);
+        assert_eq!(core.predict_poll(None).status, "skipped");
+        assert!(profile::ProfileEngine::new(Some(dir.clone())).unwrap().profile.summary.is_empty());
+        for ms in [0,149,2001] { assert!(EngineConfig::parse_json(&json!({"prediction_delay_ms":ms}).to_string()).is_err()); }
+        for ms in [150,380,2000] { assert!(EngineConfig::parse_json(&json!({"prediction_delay_ms":ms}).to_string()).is_ok()); }
+        let cfg = EngineConfig { adaptive_learning:false, profile_distill_enabled:false, ..Default::default() };
+        core.apply_preferences(cfg).unwrap();
+        core.record_profile_commit("不应学习这句话");
+        assert!(core.input.lock().profile.latest("editor").is_none());
+        core.input.lock().retention.context_bigrams.entry("你好".into()).or_default().insert("世界".into(), 1.);
+        let ready = commands::execute(&core, "predict-request", &request).unwrap();
+        assert!(core.predict_accept(ready["id"].as_u64().unwrap(), "世界").unwrap());
+        assert!(core.input.lock().profile.latest("editor").is_none());
+        assert!(!core.input.lock().retention.frecency.contains_key("世界"));
+        assert_eq!(core.profile_state()["profile"]["accepted_count"], 1);
+        let raw = commands::execute(&core,"predict-request", &json!({"app_id":"editor","is_password":true,"context_before":"你好"})).unwrap();
+        assert_eq!(raw["status"], "skipped");
     }
 }

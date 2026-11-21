@@ -117,6 +117,12 @@ fn parse_binary_ids(seq: &str) -> Option<(IdcOp, char, char)> {
 
 impl IdsIndex {
     pub fn load_cached(assets_dir: Option<&Path>) -> Arc<Self> {
+        Self::load_dir(assets_dir.map(|p| p.join("handwriting")).as_deref())
+    }
+
+    pub fn clear_cache() { if let Some(c) = IDS_CACHE.get() { c.lock().clear(); } }
+
+    pub fn load_dir(assets_dir: Option<&Path>) -> Arc<Self> {
         let key = assets_dir
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("__empty__"));
@@ -136,7 +142,7 @@ impl IdsIndex {
             return idx;
         };
 
-        let ids_path = dir.join("handwriting").join("cjkvi_ids.txt");
+        let ids_path = dir.join("cjkvi_ids.txt");
         if let Ok(content) = fs::read_to_string(&ids_path) {
             for line in content.lines() {
                 if line.is_empty() || line.starts_with('#') {

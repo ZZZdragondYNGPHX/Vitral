@@ -111,6 +111,7 @@ public:
     QJsonObject cfg;
     if (file.open(QIODevice::ReadOnly))
       cfg = QJsonDocument::fromJson(file.readAll()).object();
+    predictionDelay_ = std::clamp(cfg["prediction_delay_ms"].toInt(380), 150, 2000);
     internalEnglish_ = cfg.value("linux_english_mode").toBool(true);
     setPanelTheme(cfg);
     const auto data =
@@ -228,6 +229,8 @@ public:
   ~Engine() override {
     if (panelPid_ > 0)
       ::kill(static_cast<pid_t>(panelPid_), SIGTERM);
+    predictionTimer_.reset();
+    command("predict-cancel");
     clipboardTimer_.reset();
     control_.reset();
     if (aiWorker_.joinable())
@@ -251,9 +254,11 @@ public:
     receiveClipboard();
     unpack(vitral_on_ime_open(core_));
     render(ic, command("candidate-state"));
+    schedulePrediction("catch_up", 1);
   }
 
   void reset(const InputMethodEntry &, InputContextEvent &event) override {
+    cancelPrediction(event.inputContext());
     if (composing_)
       unpack(
           vitral_process_key(core_, FcitxKey_Escape, 0, VITRAL_SWIPE_DIR_NONE));
@@ -279,6 +284,35 @@ public:
     auto key = event.key();
     auto sym = key.sym();
     auto *ic = event.inputContext();
+    if (!event.isRelease()) {
+      if (!composing_ && !predictionText_.isEmpty() &&
+          !key.states().test(KeyState::Ctrl) && !key.states().test(KeyState::Alt) &&
+          !key.states().test(KeyState::Shift) && !key.states().test(KeyState::Super) &&
+          sym == FcitxKey_Tab &&
+          !ic->capabilityFlags().test(CapabilityFlag::PasswordOrSensitive) &&
+          predictionContext_ == contextBefore(ic)) {
+        const auto text = predictionText_;
+        const auto id = predictionId_;
+        const auto current = command("predict-poll", {{"id", id}});
+        if (current["status"].toString() != "ready" || current["text"].toString() != text) {
+          cancelPrediction(ic);
+          return;
+        }
+        ic->commitString(text.toStdString());
+        command("predict-accept", {{"id", id}, {"text", text}});
+        cancelPrediction(ic);
+        schedulePrediction("live", predictionDelay_);
+        event.filterAndAccept();
+        return;
+      }
+      if (sym == FcitxKey_Escape && !predictionText_.isEmpty()) {
+        command("predict-dismiss", {{"id", predictionId_}});
+        cancelPrediction(ic);
+        event.filterAndAccept();
+        return;
+      }
+      cancelPrediction(ic);
+    }
     if (sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) {
       if (key.states().test(KeyState::Ctrl) ||
           key.states().test(KeyState::Alt) ||
@@ -397,6 +431,65 @@ public:
   }
 
 private:
+  QString contextBefore(InputContext *ic) const {
+    const auto &surrounding = ic->surroundingText();
+    if (!surrounding.isValid() || ic->capabilityFlags().test(CapabilityFlag::PasswordOrSensitive)) return {};
+    // Fcitx offsets count Unicode codepoints.
+    const auto points = QString::fromStdString(surrounding.text()).toUcs4();
+    const auto cursor = std::min<qsizetype>(surrounding.cursor(), points.size());
+    const auto start = std::max<qsizetype>(0, cursor - 160);
+    const std::u32string before(points.cbegin() + start, points.cbegin() + cursor);
+    return QString::fromUcs4(before.data(), before.size());
+  }
+  void cancelPrediction(InputContext *ic) {
+    predictionTimer_.reset();
+    command("predict-cancel");
+    predictionId_ = 0;
+    const bool visible = !predictionText_.isEmpty();
+    predictionText_.clear();
+    if (ic && visible) {
+      ic->inputPanel().setAuxDown(Text());
+      ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+    }
+  }
+  void schedulePrediction(const char *trigger, int delay) {
+    predictionTimer_.reset();
+    const int epoch = editor_.load();
+    predictionPolls_ = 0;
+    predictionTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + delay * 1000, 0,
+        [this, epoch, trigger](EventSourceTime *timer, uint64_t) {
+          timer->setEnabled(false);
+          auto *ic = instance_->lastFocusedInputContext();
+          if (epoch != editor_ || !active_ || composing_ || !ic || !ic->hasFocus() || instance_->inputMethod(ic) != "vitral") return true;
+          if (ic->capabilityFlags().test(CapabilityFlag::Password) || ic->capabilityFlags().test(CapabilityFlag::Sensitive)) return true;
+          QJsonObject response;
+          if (predictionPolls_ == 0) {
+            const auto before = contextBefore(ic);
+            predictionContext_ = before;
+            response = command("predict-request", {{"app_id", QString::fromStdString(ic->program().empty() ? "desktop" : ic->program())}, {"context_before", before}, {"trigger", trigger}, {"is_composing", false}, {"is_password", false}});
+            predictionId_ = response["id"].toDouble();
+          } else {
+            response = command("predict-poll", {{"id", predictionId_}});
+          }
+          ++predictionPolls_;
+          if (response["status"].toString() == "pending" && predictionPolls_ <= 25) {
+            timer->setNextInterval(120000);
+            timer->setOneShot();
+            return true;
+          }
+          if (response["status"].toString() == "pending") command("predict-cancel");
+          if (response["status"].toString() == "ready" && predictionContext_ == contextBefore(ic)) {
+            predictionText_ = response["text"].toString();
+            if (!predictionText_.isEmpty()) {
+              ic->inputPanel().setAuxDown(Text("Tab 补全：" + predictionText_.toStdString()));
+              ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+            }
+          }
+          return true;
+        });
+    predictionTimer_->setOneShot();
+  }
   bool runShortcut(InputContext *ic, const QString &key) {
     for (const auto &item : shortcuts_) {
       auto binding = item.toObject();
@@ -486,6 +579,8 @@ private:
   }
   void applyAppearance(const QJsonObject &settings) {
     setPanelTheme(settings);
+    predictionDelay_ = std::clamp(settings["prediction_delay_ms"].toInt(380), 150, 2000);
+    cancelPrediction(instance_->lastFocusedInputContext());
     internalEnglish_ = settings["linux_english_mode"].toBool(true);
     shortcuts_ = command("shortcuts-state")["bindings"].toArray();
     shiftHeld_ = false;
@@ -529,11 +624,14 @@ private:
     auto preedit = action["preedit"].toObject();
     auto text = preedit["text"].toString().toStdString();
     composing_ = !text.empty();
+    if (composing_) cancelPrediction(ic);
+    else if (!commit.isEmpty()) schedulePrediction("live", predictionDelay_);
     const auto page = action["page"].toObject();
     hasPrev_ = page["has_prev"].toBool();
     hasNext_ = page["has_next"].toBool();
     auto &panel = ic->inputPanel();
     panel.reset();
+    if (!composing_ && !predictionText_.isEmpty()) panel.setAuxDown(Text("Tab 补全：" + predictionText_.toStdString()));
     Text marked(text, TextFormatFlag::Underline);
     marked.setCursor(preedit["cursor_utf8"].toInt());
     if (ic->capabilityFlags().test(CapabilityFlag::Preedit))
@@ -580,6 +678,10 @@ private:
   EventDispatcher dispatcher_;
   std::unique_ptr<EventSourceTime> clipboardTimer_;
   QString pasteId_;
+  std::unique_ptr<EventSourceTime> predictionTimer_;
+  QString predictionText_, predictionContext_;
+  double predictionId_ = 0;
+  int predictionDelay_ = 380, predictionPolls_ = 0;
   std::unique_ptr<DesktopControl> control_;
   VitralEngine *core_ = nullptr;
   std::jthread aiWorker_;

@@ -26,7 +26,7 @@ fn model_error(e: impl std::fmt::Display) -> VitralError {
 }
 
 impl Model {
-    fn load(dir: &Path, assets: &Path) -> Result<Self, VitralError> {
+    fn load(dir: &Path, grammar: Option<&Path>) -> Result<Self, VitralError> {
         let env = get_ort_env().ok_or_else(|| model_error("ONNX Runtime unavailable"))?;
         let session = Session::builder(env)
             .map_err(model_error)?
@@ -81,7 +81,7 @@ impl Model {
             inv_stddev,
             lang_auto,
             with_itn,
-            grammar: RimeGramDb::open_cached(&assets.join("rime/wanxiang-lts-zh-hans.gram")).ok(),
+            grammar: grammar.and_then(|p| RimeGramDb::open_cached(p).ok()),
         })
     }
 
@@ -192,18 +192,20 @@ fn hanzi(token:&str)->bool {
     matches!(chars.next(),Some('\u{3400}'..='\u{9fff}')) && chars.next().is_none()
 }
 
-static MODEL: Mutex<Option<(PathBuf, Model)>> = Mutex::new(None);
+type ModelLocation = (PathBuf, Option<PathBuf>);
+static MODEL: Mutex<Option<(ModelLocation, Model)>> = Mutex::new(None);
 
 pub(super) fn transcribe(
     samples: &[i16],
-    assets: Option<&Path>,
+    dir: Option<&Path>,
+    grammar: Option<&Path>,
 ) -> Result<(String, String), VitralError> {
-    let assets=assets.ok_or_else(|| model_error("missing assets directory"))?;
-    let dir=assets.join("voice/sensevoice-small");
+    let dir=dir.ok_or_else(|| model_error("尚未下载或已禁用离线语音识别模型，请在模型中心下载并启用"))?;
     let mut cache = MODEL.lock();
-    if cache.as_ref().is_none_or(|(p, _)| p != &dir) {
-        let model = Model::load(&dir, assets)?;
-        *cache = Some((dir, model));
+    let key = (dir.to_path_buf(), grammar.map(Path::to_path_buf));
+    if cache.as_ref().is_none_or(|(p, _)| p != &key) {
+        let model = Model::load(dir, grammar)?;
+        *cache = Some((key, model));
     }
     let model=&mut cache.as_mut().unwrap().1;
     let mut best=model.decode(samples)?;
@@ -229,3 +231,5 @@ pub(super) fn transcribe(
     }
     Ok((best.0,best.1))
 }
+
+pub(super) fn clear_cache() { *MODEL.lock() = None; }

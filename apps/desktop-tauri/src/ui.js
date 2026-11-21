@@ -30,6 +30,11 @@ let confirmHabitsTimer = null;
 let recorderActive = false;
 let recordTimer = null;
 let recordStartedAt = 0;
+let modelsState = null;
+let modelsLoaded = false;
+let modelsPollTimer = null;
+let activeDownloads = new Set();
+let confirmDeleteModel = { id: null, timer: null };
 
 function setNotice(text, tone = "idle") {
   $("#notice").textContent = text;
@@ -70,7 +75,14 @@ function updateRangeFill(input) {
   const pct = max > min ? ((val - min) / (max - min)) * 100 : 0;
   input.style.setProperty("--pct", `${pct}%`);
   const out = input.nextElementSibling;
-  if (out) out.value = `${val}${input.name === "candidate_font_px" ? " px" : " 条"}`;
+  if (out) {
+    out.value =
+      input.name === "candidate_font_px"
+        ? `${val} px`
+        : input.name === "prediction_delay_ms"
+          ? `${val} ms`
+          : `${val} 条`;
+  }
 }
 
 function syncSegmented(name, value) {
@@ -116,6 +128,8 @@ function preview() {
   document.body.classList.toggle("is-offline", offline);
   $("#mode-pill").hidden = !offline;
   $("#offline-card").classList.toggle("is-offline", offline);
+  const modelsOffline = $("#models-offline-hint");
+  if (modelsOffline) modelsOffline.hidden = !offline;
   const badge = $("#offline-badge");
   badge.textContent = offline ? "网络已阻断" : "协同就绪";
   badge.className = `badge ${offline ? "is-warn" : "is-ok"}`;
@@ -123,6 +137,7 @@ function preview() {
   all(".online").forEach(el => {
     el.disabled = busy || offline;
   });
+  if (modelsLoaded) renderModels();
 }
 
 function updateEngineStatus(connected) {
@@ -218,6 +233,9 @@ function switchTab(tabId) {
   if (!dirty) setNotice("");
   if (tabId === "library" && invoke && !clipboardLoaded) {
     loadClipboard(true);
+  }
+  if (tabId === "models") {
+    loadModels(true);
   }
 }
 
@@ -991,6 +1009,434 @@ window.addEventListener("blur", () => {
   if (recordingShortcut) finishShortcut(null);
 });
 
+// ================= MODEL CENTER =================
+const CAPABILITY_LABELS = {
+  grammar: "语法增强",
+  handwriting: "手写识别",
+  reranker: "语义重排",
+  voice: "离线语音",
+  local_llm: "本地智能",
+};
+
+const RAM_TIER_LABELS = {
+  low: "轻量档位",
+  standard: "标准档位",
+  high: "高性能档位",
+  unknown: "内存未知",
+};
+
+function formatRam(mb) {
+  const n = Number(mb) || 0;
+  if (n <= 0) return "未知";
+  return n >= 1024 ? `${(n / 1024).toFixed(n % 1024 === 0 ? 0 : 1)} GB` : `${n} MB`;
+}
+
+function modelTotalBytes(model) {
+  return (model.files || []).reduce((sum, f) => sum + (Number(f.size) || 0), 0);
+}
+
+function stopModelsPolling() {
+  if (modelsPollTimer) {
+    clearInterval(modelsPollTimer);
+    modelsPollTimer = null;
+  }
+}
+
+function syncModelsPolling(state) {
+  const models = state?.models || [];
+  const nextDownloading = new Set();
+  for (const m of models) {
+    const status = m.download?.status;
+    if (status === "downloading") {
+      nextDownloading.add(m.id);
+    } else if (activeDownloads.has(m.id)) {
+      if (status === "completed") {
+        setNotice(`模型「${m.name}」已下载并热加载启用`, "ok");
+      } else if (status === "failed") {
+        setNotice(`模型「${m.name}」下载失败：${m.download?.error || "未知错误"}`, "error");
+      } else if (status === "cancelled") {
+        setNotice(`已取消下载「${m.name}」`, "idle");
+      }
+    }
+  }
+  activeDownloads = nextDownloading;
+
+  if (activeDownloads.size > 0 && invoke) {
+    if (!modelsPollTimer) {
+      modelsPollTimer = setInterval(() => {
+        api("models-state")
+          .then(next => {
+            modelsState = next;
+            modelsLoaded = true;
+            renderModels();
+            syncModelsPolling(next);
+          })
+          .catch(() => stopModelsPolling());
+      }, 600);
+    }
+  } else {
+    stopModelsPolling();
+  }
+}
+
+function renderModels() {
+  const list = $("#models-list");
+  const empty = $("#models-empty");
+  const ramBadge = $("#ram-tier-badge");
+  const storeSub = $("#models-store-sub");
+  if (!list || !empty) return;
+
+  if (!modelsState) {
+    list.replaceChildren();
+    empty.hidden = false;
+    empty.textContent = invoke ? "尚未读取到模型状态，请确认输入服务已运行后点击「刷新状态」" : "界面预览模式";
+    return;
+  }
+
+  const tier = modelsState.ram_tier || "unknown";
+  const ramText = modelsState.total_ram_mb > 0 ? formatRam(modelsState.total_ram_mb) : "";
+  ramBadge.textContent = ramText ? `${RAM_TIER_LABELS[tier] || tier} · ${ramText}` : (RAM_TIER_LABELS[tier] || tier);
+  ramBadge.className = `badge ${tier === "low" ? "is-warn" : tier === "high" ? "is-ok" : "is-accent"}`;
+
+  if (modelsState.store_root) {
+    storeSub.textContent = `存储目录：${modelsState.store_root} · 下载完成或切换开关后自动热加载生效`;
+  }
+
+  const offline = $("[name=pure_offline]").checked;
+  const models = modelsState.models || [];
+  list.replaceChildren();
+  empty.hidden = models.length > 0;
+  if (!models.length) {
+    empty.textContent = "模型目录为空";
+    return;
+  }
+
+  for (const m of models) {
+    const card = document.createElement("article");
+    card.className = `model-card${m.active ? " is-active" : ""}`;
+    const dl = m.download;
+    const isDownloading = dl?.status === "downloading";
+    const totalBytes = modelTotalBytes(m);
+
+    const head = document.createElement("div");
+    head.className = "model-head";
+
+    const titleGroup = document.createElement("div");
+    titleGroup.className = "model-title-group";
+
+    const titleLine = document.createElement("div");
+    titleLine.className = "model-title-line";
+    const title = document.createElement("span");
+    title.className = "model-title";
+    title.textContent = m.name;
+    titleLine.append(title);
+
+    const capTag = document.createElement("span");
+    capTag.className = "badge is-accent";
+    capTag.textContent = CAPABILITY_LABELS[m.capability] || m.capability;
+    titleLine.append(capTag);
+
+    const fitTag = document.createElement("span");
+    if (m.fit === "recommended") {
+      fitTag.className = "badge is-ok";
+      fitTag.textContent = "内存推荐";
+    } else if (m.fit === "compatible") {
+      fitTag.className = "badge";
+      fitTag.textContent = "内存兼容";
+    } else {
+      fitTag.className = "badge is-warn";
+      fitTag.textContent = `超出推荐内存（最低 ${formatRam(m.min_ram_mb)}）`;
+    }
+    titleLine.append(fitTag);
+
+    const desc = document.createElement("p");
+    desc.className = "model-desc";
+    desc.textContent = m.description;
+
+    const meta = document.createElement("div");
+    meta.className = "model-meta";
+    meta.textContent = [
+      `版本 ${m.version}`,
+      `体积 ${formatBytes(totalBytes)}`,
+      `内存要求 ${formatRam(m.min_ram_mb)} / 推荐 ${formatRam(m.recommended_ram_mb)}`,
+      m.license,
+    ].filter(Boolean).join(" · ");
+
+    titleGroup.append(titleLine, desc, meta);
+
+    const statusBadge = document.createElement("span");
+    if (isDownloading) {
+      statusBadge.className = "badge is-accent";
+      statusBadge.textContent = "下载中";
+    } else if (m.active) {
+      statusBadge.className = "badge is-ok";
+      statusBadge.textContent = m.installed ? "已下载 · 已启用" : "本地内置 · 已启用";
+    } else if (m.installed || m.bundled) {
+      statusBadge.className = "badge";
+      statusBadge.textContent = m.installed ? "已下载 · 未启用" : "本地内置 · 未启用";
+    } else {
+      statusBadge.className = "badge";
+      statusBadge.textContent = "未下载";
+    }
+
+    head.append(titleGroup, statusBadge);
+    card.append(head);
+
+    if (isDownloading) {
+      const box = document.createElement("div");
+      box.className = "model-progress";
+      const dlTotal = Number(dl.total_bytes) || totalBytes || 1;
+      const dlDone = Math.min(Number(dl.downloaded_bytes) || 0, dlTotal);
+      const pct = Math.min(100, Math.round((dlDone / dlTotal) * 100));
+
+      const top = document.createElement("div");
+      top.className = "model-progress-top";
+      const fileLabel = document.createElement("span");
+      fileLabel.textContent = dl.current_file ? `正在下载 ${dl.current_file}` : "正在校验与下载…";
+      const bytesLabel = document.createElement("span");
+      bytesLabel.textContent = `${formatBytes(dlDone)} / ${formatBytes(dlTotal)} (${pct}%)`;
+      top.append(fileLabel, bytesLabel);
+
+      const bar = document.createElement("div");
+      bar.className = "model-bar";
+      const fill = document.createElement("div");
+      fill.className = "model-bar-fill";
+      fill.style.width = `${pct}%`;
+      bar.append(fill);
+
+      box.append(top, bar);
+      card.append(box);
+    } else if (dl?.status === "failed" && dl.error) {
+      const err = document.createElement("div");
+      err.className = "model-error";
+      err.textContent = `上次下载失败：${dl.error}`;
+      card.append(err);
+    }
+
+    const foot = document.createElement("div");
+    foot.className = "model-foot";
+
+    const toggleWrap = document.createElement("label");
+    toggleWrap.className = "model-toggle";
+    const toggle = document.createElement("input");
+    toggle.type = "checkbox";
+    toggle.className = "switch";
+    toggle.checked = Boolean(m.enabled && (m.installed || m.bundled));
+    toggle.disabled = busy || isDownloading || (!m.installed && !m.bundled);
+    toggle.setAttribute("aria-label", `启用${m.name}`);
+    toggle.onchange = () => {
+      const nextEnabled = toggle.checked;
+      run(async () => {
+        modelsState = await api("models-set-enabled", { id: m.id, enabled: nextEnabled });
+        renderModels();
+        syncModelsPolling(modelsState);
+        setNotice(nextEnabled ? `已启用「${m.name}」并完成热加载` : `已停用「${m.name}」并释放缓存`, "ok");
+      });
+    };
+    const toggleText = document.createElement("span");
+    toggleText.textContent = m.installed || m.bundled ? (m.enabled ? "功能已启用" : "已暂停使用") : "下载后可启用";
+    toggleWrap.append(toggle, toggleText);
+
+    const actions = document.createElement("div");
+    actions.className = "model-actions";
+
+    if (isDownloading) {
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.className = "btn-danger-ghost";
+      cancelBtn.textContent = "取消下载";
+      cancelBtn.onclick = () =>
+        run(async () => {
+          modelsState = await api("models-cancel", { id: m.id });
+          renderModels();
+          syncModelsPolling(modelsState);
+          setNotice(`已取消下载「${m.name}」`, "idle");
+        });
+      actions.append(cancelBtn);
+    } else if (!m.installed) {
+      const dlBtn = document.createElement("button");
+      dlBtn.type = "button";
+      dlBtn.className = "online btn-accent-soft";
+      dlBtn.disabled = busy || offline;
+      dlBtn.textContent =
+        dl?.status === "failed"
+          ? "重试下载"
+          : m.fit === "exceeds_ram"
+            ? "仍要下载"
+            : m.bundled
+              ? "下载到用户目录"
+              : "下载并启用";
+      dlBtn.onclick = () =>
+        run(async () => {
+          modelsState = await api("models-download", { id: m.id });
+          renderModels();
+          syncModelsPolling(modelsState);
+          setNotice(`开始下载「${m.name}」…`, "busy");
+        });
+      actions.append(dlBtn);
+    }
+
+    if (m.installed && !isDownloading) {
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      const confirming = confirmDeleteModel.id === m.id;
+      delBtn.className = "btn-danger-ghost";
+      delBtn.disabled = busy;
+      delBtn.textContent = confirming ? "确认删除文件" : "删除模型";
+      delBtn.onclick = () => {
+        if (confirmDeleteModel.id !== m.id) {
+          clearTimeout(confirmDeleteModel.timer);
+          confirmDeleteModel = {
+            id: m.id,
+            timer: setTimeout(() => {
+              confirmDeleteModel = { id: null, timer: null };
+              renderModels();
+            }, 3500),
+          };
+          renderModels();
+          return;
+        }
+        clearTimeout(confirmDeleteModel.timer);
+        confirmDeleteModel = { id: null, timer: null };
+        run(async () => {
+          modelsState = await api("models-delete", { id: m.id });
+          renderModels();
+          syncModelsPolling(modelsState);
+          setNotice(`已删除「${m.name}」并释放空间`, "ok");
+        });
+      };
+      actions.append(delBtn);
+    }
+
+    foot.append(toggleWrap, actions);
+    card.append(foot);
+    list.append(card);
+  }
+}
+
+async function loadModels(silent = false) {
+  if (!invoke) {
+    modelsState = {
+      total_ram_mb: 16384,
+      ram_tier: "high",
+      store_root: "~/.local/share/vitral/model_store",
+      models: [
+        {
+          id: "wanxiang-grammar",
+          capability: "grammar",
+          name: "万象中文语法模型",
+          description: "提升全拼与双拼长句解码及语境排序准确度",
+          version: "LTS",
+          license: "CC-BY-4.0",
+          min_ram_mb: 2048,
+          recommended_ram_mb: 4096,
+          files: [{ size: 390786092 }],
+          fit: "recommended",
+          installed: false,
+          bundled: false,
+          enabled: false,
+          active: false,
+          download: null,
+        },
+      ],
+    };
+    modelsLoaded = true;
+    renderModels();
+    return;
+  }
+  await run(
+    async () => {
+      modelsState = await api("models-state");
+      modelsLoaded = true;
+      renderModels();
+      syncModelsPolling(modelsState);
+      if (!silent) setNotice("已刷新模型状态", "ok");
+    },
+    { silent }
+  );
+}
+
+$("#models-refresh")?.addEventListener("click", () => loadModels(false));
+$("#models-update-catalog")?.addEventListener("click", () =>
+  run(async () => {
+    const customUrl = $("#model-catalog-url")?.value.trim() || "";
+    const payload = customUrl ? { url: customUrl } : {};
+    modelsState = await api("models-refresh-catalog", payload);
+    modelsLoaded = true;
+    renderModels();
+    syncModelsPolling(modelsState);
+    setNotice("模型目录已更新", "ok");
+  })
+);
+
+// ================= LOCAL USER PROFILE =================
+function splitTags(raw) {
+  return String(raw || "")
+    .split(/[,，、;；]/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function renderProfile(state) {
+  const p = state?.profile;
+  const badge = $("#profile-source-badge");
+  const meta = $("#profile-meta");
+  if (!badge || !meta) return;
+  if (!p) return;
+
+  const distilled = p.distilled_at_ms > 0 || p.revision > 0;
+  badge.textContent = !distilled
+    ? "尚未蒸馏"
+    : p.source === "local_qwen"
+      ? "本地 Qwen 蒸馏"
+      : "本地统计画像";
+  badge.className = `badge ${distilled ? (p.source === "local_qwen" ? "is-ok" : "is-accent") : ""}`;
+
+  const bits = [`采纳 ${p.accepted_count || 0} 次`, `忽略 ${p.dismissed_count || 0} 次`];
+  if (p.distilled_at_ms) bits.push(`更新于 ${formatTime(p.distilled_at_ms)}`);
+  if (state?.needs_distill) bits.push("有新习惯可蒸馏");
+  meta.textContent = bits.join(" · ");
+
+  $("#profile-summary").value = p.summary || "";
+  $("#profile-domains").value = (p.domains || []).join(", ");
+  $("#profile-entities").value = (p.entities || []).join(", ");
+  $("#profile-traits").value = (p.style_traits || []).join(", ");
+}
+
+$("#btn-profile-distill")?.addEventListener("click", () =>
+  run(async () => {
+    const state = await api("profile-distill");
+    renderProfile(state);
+    setNotice(
+      state?.profile?.source === "local_qwen"
+        ? "已完成本地 Qwen 画像蒸馏"
+        : "已完成本地统计画像蒸馏",
+      "ok"
+    );
+  })
+);
+
+$("#btn-profile-save")?.addEventListener("click", () =>
+  run(async () => {
+    const state = await api("profile-update", {
+      summary: $("#profile-summary").value.trim(),
+      domains: splitTags($("#profile-domains").value),
+      entities: splitTags($("#profile-entities").value),
+      style_traits: splitTags($("#profile-traits").value),
+    });
+    renderProfile(state);
+    setNotice("个人画像已保存并即时生效", "ok");
+  })
+);
+
+$("#btn-profile-clear")?.addEventListener("click", () =>
+  run(async () => {
+    const state = await api("profile-clear");
+    renderProfile(state);
+    setNotice("个人画像已清空", "ok");
+  })
+);
+
 // ================= BOOT =================
 if (invoke) {
   invoke("get_settings")
@@ -1000,6 +1446,7 @@ if (invoke) {
         .then(stats => {
           updateEngineStatus(true);
           renderHabitStats(stats);
+          api("profile-state").then(renderProfile).catch(() => {});
         })
         .catch(() => updateEngineStatus(false));
     })

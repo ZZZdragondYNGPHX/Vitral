@@ -69,6 +69,12 @@ pub enum SwipeDir {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    #[serde(default = "default_enabled")]
+    pub prediction_enabled: bool,
+    #[serde(default = "default_prediction_delay")]
+    pub prediction_delay_ms: u64,
+    #[serde(default = "default_enabled")]
+    pub profile_distill_enabled: bool,
     #[serde(default = "crate::shortcuts::defaults")]
     pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
     #[serde(default = "default_enabled")]
@@ -85,6 +91,8 @@ pub struct EngineConfig {
     pub assets_dir: String,
     #[serde(default)]
     pub tokens_path: String,
+    #[serde(default)]
+    pub model_catalog_url: Option<String>,
     #[serde(default)]
     pub state_dir: Option<String>,
     #[serde(default = "default_schema")]
@@ -129,11 +137,20 @@ pub struct EngineConfig {
     pub ai_timeout_ms: Option<u64>,
     #[serde(default)]
     pub ai_tier3_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub ai_prefer_local: bool,
     #[serde(default)]
     pub known_devices: Vec<RelayDevice>,
 }
 
 impl EngineConfig {
+    pub fn validate_prediction(&self) -> Result<(), VitralError> {
+        if !(150..=2000).contains(&self.prediction_delay_ms) {
+            return Err(VitralError::InvalidArgument("prediction_delay_ms must be 150..2000".into()));
+        }
+        Ok(())
+    }
+
     pub fn shortcut_enabled(&self, action: crate::shortcuts::ShortcutAction) -> bool {
         !(cfg!(target_os = "linux") && !self.linux_english_mode && action == crate::shortcuts::ShortcutAction::ToggleLanguage)
     }
@@ -148,7 +165,10 @@ impl EngineConfig {
                 crate::sync::merge_alias(device,"usage_count","transfer_count")?;
             }
         }
-        serde_json::from_value(value).map_err(|e| VitralError::Parse(e.to_string()))
+        let config: Self = serde_json::from_value(value).map_err(|e| VitralError::Parse(e.to_string()))?;
+        if let Some(url) = config.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { crate::models::validate_url(url)?; }
+        config.validate_prediction()?;
+        Ok(config)
     }
 }
 
@@ -184,6 +204,8 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+fn default_prediction_delay() -> u64 { 380 }
+
 fn default_enabled() -> bool { true }
 
 fn default_schema() -> SchemaKind {
@@ -208,6 +230,9 @@ fn default_ring_capacity() -> usize {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            prediction_enabled: true,
+            prediction_delay_ms: default_prediction_delay(),
+            profile_distill_enabled: true,
             shortcuts: crate::shortcuts::defaults(),
             linux_english_mode: true,
             adaptive_learning: true,
@@ -216,6 +241,7 @@ impl Default for EngineConfig {
             cache_dir: String::new(),
             assets_dir: String::new(),
             tokens_path: String::new(),
+            model_catalog_url: None,
             state_dir: None,
             schema: default_schema(),
             opencc_mode: default_opencc(),
@@ -238,6 +264,7 @@ impl Default for EngineConfig {
             ai_api_key: None,
             ai_timeout_ms: None,
             ai_tier3_enabled: false,
+            ai_prefer_local: true,
             known_devices: Vec::new(),
         }
     }
@@ -364,6 +391,7 @@ impl CandidateOrigin {
 pub struct EngineState {
     pub config: EngineConfig,
     pub resolved_assets_dir: Option<PathBuf>,
+    pub model_paths: crate::models::ModelPaths,
     pub schema: SchemaKind,
     pub opencc_mode: OpenCcMode,
     pub lang_mode: LangMode,
@@ -448,6 +476,7 @@ impl EngineState {
         Self {
             schema: config.schema,
             opencc_mode: config.opencc_mode,
+            model_paths: crate::models::ModelPaths::bundled(resolved_assets_dir.as_deref()),
             resolved_assets_dir,
             config,
             lang_mode: LangMode::Zh,
@@ -504,6 +533,8 @@ impl EngineState {
         }
         self.process_key_pure_rust(0, clipboard, imported, retention)
     }
+
+    pub(crate) fn speech_context_before(&self) -> String { self.context_window.iter().collect() }
 
     pub(crate) fn reset_commit_context(&mut self) {
         self.context_window.clear();
@@ -696,10 +727,8 @@ impl EngineState {
         if !self.config.adaptive_learning || self.context_window.is_empty() {
             return;
         }
-        if self.resolved_assets_dir.is_some() && self.context_window.len() >= 2 {
-            let bundle = crate::hw::onnx_models::HwOnnxBundle::load_cached(
-                self.resolved_assets_dir.as_deref(),
-            );
+        if self.model_paths.reranker.is_some() && self.context_window.len() >= 2 {
+            let bundle = crate::hw::onnx_models::HwOnnxBundle::load_paths(&self.model_paths);
             if bundle.has_reranker_onnx() {
                 if let Some((vector, priors)) = bundle.encode_rbt3_context(&self.context_window) {
                     self.cached_context_vec = Some(vector);
@@ -891,6 +920,12 @@ impl EngineState {
             }
         }
         self.pure_rust.reload_assets(self.resolved_assets_dir.as_deref());
+        self.model_paths = crate::models::ModelPaths::from_config(&self.config, self.resolved_assets_dir.as_deref())?;
+        self.pure_rust.set_model_paths(&self.model_paths);
+        self.cached_context_vec = None;
+        self.cached_mlm_priors.clear();
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        { self.rime_session_id = None; rime_ffi::clear_runtime(); }
 
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         if let Some(root) = self.resolved_assets_dir.clone() {

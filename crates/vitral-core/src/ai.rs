@@ -4,7 +4,42 @@ use crate::offline_guard::OfflineGuard;
 mod sensevoice;
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+pub mod local_llm;
+#[cfg(feature = "native-voice")]
+mod qwen3_asr;
+pub mod qwen_bpe;
+#[cfg(any(feature = "native-onnx", feature = "native-voice"))]
+mod qwen_onnx;
+
+#[derive(Debug, Clone, Default)]
+pub struct SpeechContext {
+    pub hotwords: Vec<String>,
+    pub context_before: String,
+}
+
+pub struct SpeechRecognizer;
+impl SpeechRecognizer {
+    pub fn transcribe(
+        samples: &[i16],
+        paths: &crate::models::ModelPaths,
+        ctx: &SpeechContext,
+    ) -> Result<(String, String), VitralError> {
+        #[cfg(feature = "native-voice")]
+        {
+            if let Some(dir) = &paths.voice_qwen3_asr {
+                return qwen3_asr::transcribe(samples, dir, ctx);
+            }
+            if let Some(dir) = &paths.voice {
+                return sensevoice::transcribe(samples, Some(dir), paths.grammar.as_deref());
+            }
+        }
+        #[cfg(not(feature = "native-voice"))]
+        let _ = (samples, paths, ctx);
+        Err(VitralError::ModelUnavailable(
+            "尚未下载或已禁用离线语音识别模型，请在模型中心下载并启用".into(),
+        ))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +69,7 @@ pub struct AiInlineResult {
 pub struct VoiceSession {
     pub active: bool,
     pub samples: Vec<i16>,
+    pub model_paths: crate::models::ModelPaths,
 }
 
 impl VoiceSession {
@@ -52,8 +88,7 @@ impl VoiceSession {
 
     pub fn stop(&mut self) -> Result<VoiceResult, VitralError> {
         let samples = self.finish()?;
-        let assets = crate::eng::resolve_assets_dir("");
-        recognize_pcm(&samples, assets.as_deref())
+        recognize_pcm(&samples, &self.model_paths, &SpeechContext::default())
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<i16>, VitralError> {
@@ -67,7 +102,8 @@ impl VoiceSession {
 
 pub(crate) fn recognize_pcm(
     samples: &[i16],
-    assets: Option<&Path>,
+    paths: &crate::models::ModelPaths,
+    ctx: &SpeechContext,
 ) -> Result<VoiceResult, VitralError> {
     let mut result = VoiceResult {
         transcript: String::new(),
@@ -80,7 +116,7 @@ pub(crate) fn recognize_pcm(
         if chunk.len() < 400 || chunk.iter().all(|s| s.unsigned_abs() < 64) {
             continue;
         }
-        let (text, lang) = transcribe(chunk, assets)?;
+        let (text, lang) = SpeechRecognizer::transcribe(chunk, paths, ctx)?;
         if !text.is_empty() {
             if result
                 .transcript
@@ -98,22 +134,13 @@ pub(crate) fn recognize_pcm(
     Ok(result)
 }
 
-#[cfg(feature = "native-voice")]
-use sensevoice::transcribe;
-
-#[cfg(not(feature = "native-voice"))]
-fn transcribe(_: &[i16], _: Option<&Path>) -> Result<(String, String), VitralError> {
-    Err(VitralError::ModelUnavailable(
-        "SenseVoice requires native-voice".into(),
-    ))
-}
-
 #[derive(Default)]
 pub struct AiClient {
     pub endpoint: Option<String>,
     pub model: Option<String>,
     pub api_key: Option<String>,
     pub timeout_ms: Option<u64>,
+    pub prefer_local: bool,
 }
 
 impl From<&crate::eng::EngineConfig> for AiClient {
@@ -123,6 +150,7 @@ impl From<&crate::eng::EngineConfig> for AiClient {
             model: cfg.ai_model.clone(),
             api_key: cfg.ai_api_key.clone(),
             timeout_ms: cfg.ai_timeout_ms,
+            prefer_local: cfg.ai_prefer_local,
         }
     }
 }
@@ -135,7 +163,17 @@ impl AiClient {
         text: &str,
         target_lang: &str,
     ) -> Result<AiInlineResult, VitralError> {
-        guard.require_online("ai_inline")?;
+        self.run_with_local(guard, None, mode, text, target_lang)
+    }
+
+    pub(crate) fn run_with_local(
+        &self,
+        guard: &OfflineGuard,
+        model: Option<&crate::models::LocalLlmModel>,
+        mode: AiMode,
+        text: &str,
+        target_lang: &str,
+    ) -> Result<AiInlineResult, VitralError> {
         if text.trim().is_empty() {
             return Err(VitralError::InvalidArgument("text cannot be empty".into()));
         }
@@ -144,13 +182,45 @@ impl AiClient {
             AiMode::Polish => "Polish the user's spoken text into clear written prose in its original language. Return only the edited text.".into(),
             AiMode::Summary => "Summarize the transcript as a numbered list in its original language.".into(),
         };
-        let output_text = self.chat(guard, &prompt, text)?;
+        let output_text = self.chat_with_local(guard, model, &prompt, text)?;
         Ok(AiInlineResult {
             mode,
             source_text: text.into(),
             output_text,
             target_lang: target_lang.into(),
         })
+    }
+
+    pub(crate) fn uses_local(
+        &self,
+        guard: &OfflineGuard,
+        model: Option<&crate::models::LocalLlmModel>,
+    ) -> bool {
+        local_llm::LocalLlmEngine::available(model)
+            && (guard.is_pure_offline()
+                || self.prefer_local
+                || self.endpoint.as_ref().is_none_or(|s| s.trim().is_empty()))
+    }
+    pub(crate) fn chat_with_local(
+        &self,
+        guard: &OfflineGuard,
+        model: Option<&crate::models::LocalLlmModel>,
+        system: &str,
+        prompt: &str,
+    ) -> Result<String, VitralError> {
+        if self.uses_local(guard, model) {
+            return local_engine().generate(
+                model.unwrap(),
+                &local_llm::LocalLlmRequest {
+                    system: system.into(),
+                    prompt: prompt.into(),
+                    max_new_tokens: 512,
+                    stop: vec!["<|im_end|>".into()],
+                    cancel: None,
+                },
+            );
+        }
+        self.chat(guard, system, prompt)
     }
 
     pub(crate) fn chat(
@@ -233,4 +303,252 @@ pub fn run_ai_inline(
     target_lang: &str,
 ) -> Result<AiInlineResult, VitralError> {
     AiClient::default().run(guard, mode, text, target_lang)
+}
+
+pub(crate) fn clear_model_cache() {
+    #[cfg(feature = "native-voice")]
+    {
+        sensevoice::clear_cache();
+        qwen3_asr::clear_cache();
+    }
+    unload_local_llm();
+}
+
+pub(crate) fn local_engine() -> &'static local_llm::LocalLlmEngine {
+    static ENGINE: std::sync::OnceLock<local_llm::LocalLlmEngine> = std::sync::OnceLock::new();
+    ENGINE.get_or_init(local_llm::LocalLlmEngine::default)
+}
+pub fn unload_local_llm() {
+    local_engine().unload();
+}
+
+pub fn speech_context(
+    retention: &crate::ret::RetentionEngine,
+    app: Option<&str>,
+    context_before: String,
+) -> SpeechContext {
+    let mut words: Vec<String> = retention.pinned_words.iter().cloned().collect();
+    words.sort();
+    let top = |map: &std::collections::HashMap<String, f64>, n: usize| {
+        let mut entries: Vec<_> = map
+            .iter()
+            .filter(|(_, s)| s.is_finite() && **s > 0.0)
+            .collect();
+        entries.sort_by(|a, b| b.1.total_cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        entries
+            .into_iter()
+            .take(n)
+            .map(|(w, _)| w.clone())
+            .collect::<Vec<_>>()
+    };
+    if let Some(map) =
+        app.and_then(|app| retention.app_frecency.get(&app.trim().to_ascii_lowercase()))
+    {
+        words.extend(top(map, 32));
+    }
+    words.extend(top(&retention.frecency, 32));
+    let mut english: Vec<_> = retention.user_english.values().cloned().collect();
+    english.sort();
+    english.dedup();
+    english.sort_by(|a, b| {
+        retention
+            .frecency
+            .get(b)
+            .unwrap_or(&0.0)
+            .total_cmp(retention.frecency.get(a).unwrap_or(&0.0))
+            .then_with(|| a.cmp(b))
+    });
+    words.extend(english.into_iter().take(16));
+    let mut seen = std::collections::HashSet::new();
+    words.retain(|w| !w.trim().is_empty() && seen.insert(w.clone()));
+    SpeechContext {
+        hotwords: words,
+        context_before,
+    }
+}
+
+/// Conservative PY-GEC: personal 2–6 Hanzi phrases only, exact full pinyin,
+/// no overlaps and at most 25% changed Hanzi over the complete transcript.
+pub fn phonetic_correct_transcript(
+    text: &str,
+    retention: &crate::ret::RetentionEngine,
+    gram: Option<&crate::eng::gram::RimeGramDb>,
+) -> String {
+    use pinyin::ToPinyin;
+    let phonetic = |chars: &[char]| -> Option<Vec<String>> {
+        chars
+            .iter()
+            .map(|c| c.to_pinyin().map(|p| p.plain().to_owned()))
+            .collect()
+    };
+    let mut phrases: Vec<_> = retention
+        .pinned_words
+        .iter()
+        .chain(
+            retention
+                .frecency
+                .iter()
+                .filter(|(_, s)| **s >= 3.0)
+                .map(|(w, _)| w),
+        )
+        .collect();
+    phrases.sort();
+    phrases.dedup();
+    let mut phrases: Vec<_> = phrases
+        .into_iter()
+        .filter_map(|w| {
+            let chars: Vec<_> = w.chars().collect();
+            if !(2..=6).contains(&chars.len()) {
+                return None;
+            }
+            let py = phonetic(&chars)?;
+            Some((w, chars, py))
+        })
+        .collect();
+    phrases.sort_by(|a, b| {
+        b.1.len()
+            .cmp(&a.1.len())
+            .then_with(|| {
+                retention
+                    .pinned_words
+                    .contains(b.0)
+                    .cmp(&retention.pinned_words.contains(a.0))
+            })
+            .then_with(|| {
+                retention
+                    .frecency
+                    .get(b.0)
+                    .unwrap_or(&0.0)
+                    .total_cmp(retention.frecency.get(a.0).unwrap_or(&0.0))
+            })
+            .then_with(|| a.0.cmp(b.0))
+    });
+    let mut chars: Vec<_> = text.chars().collect();
+    let total = chars.iter().filter(|c| c.to_pinyin().is_some()).count();
+    let budget = total / 4;
+    let mut edits = 0;
+    let mut at = 0;
+    while at < chars.len() {
+        let mut replaced = false;
+        for (word, replacement, py) in &phrases {
+            let n = replacement.len();
+            if at + n > chars.len() {
+                continue;
+            }
+            let source = &chars[at..at + n];
+            let diff = source
+                .iter()
+                .zip(replacement)
+                .filter(|(a, b)| a != b)
+                .count();
+            if diff == 0 || edits + diff > budget || phonetic(source).as_ref() != Some(py) {
+                continue;
+            }
+            let original: String = source.iter().collect();
+            if retention.pinned_words.contains(&original) {
+                continue;
+            }
+            if let Some(gram) = gram {
+                let context: String = chars[..at]
+                    .iter()
+                    .rev()
+                    .take(3)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                if let (Some(old), Some(new)) = (
+                    gram.lookup(&context, &original),
+                    gram.lookup(&context, word),
+                ) {
+                    if old > new + 2.0 {
+                        continue;
+                    }
+                }
+            }
+            chars[at..at + n].copy_from_slice(replacement);
+            edits += diff;
+            at += n;
+            replaced = true;
+            break;
+        }
+        if !replaced {
+            at += 1;
+        }
+    }
+    chars.into_iter().collect()
+}
+
+#[cfg(test)]
+mod qwen_tests {
+    use super::*;
+    #[test]
+    fn personal_homophones_and_edit_gate() {
+        let mut r = crate::ret::RetentionEngine::default();
+        r.pinned_words.insert("维创".into());
+        assert_eq!(
+            phonetic_correct_transcript("明天联系伟创讨论项目", &r, None),
+            "明天联系维创讨论项目"
+        );
+        assert_eq!(phonetic_correct_transcript("伟创", &r, None), "伟创");
+        assert_eq!(
+            phonetic_correct_transcript("明天联系微软讨论项目", &r, None),
+            "明天联系微软讨论项目"
+        );
+        assert_eq!(
+            phonetic_correct_transcript("伟创伟创伟创伟创", &r, None),
+            "维创维创伟创伟创"
+        );
+    }
+    #[test]
+    fn speech_hotwords_use_current_app_and_personal_vocabulary() {
+        let mut r = crate::ret::RetentionEngine::default();
+        r.pinned_words.insert("置顶".into());
+        r.app_frecency.insert(
+            "editor".into(),
+            std::collections::HashMap::from([("当前项目".into(), 9.0)]),
+        );
+        r.frecency.insert("全局常用".into(), 5.0);
+        r.user_english.insert("vitral".into(), "Vitral".into());
+        let ctx = speech_context(&r, Some("Editor"), "前文".into());
+        assert_eq!(ctx.hotwords, vec!["置顶", "当前项目", "全局常用", "Vitral"]);
+        assert_eq!(ctx.context_before, "前文");
+    }
+    #[test]
+    fn offline_local_route() {
+        let c = AiClient::from(&crate::eng::EngineConfig::default());
+        let guard = OfflineGuard::new(true);
+        assert!(!c.uses_local(&guard, None));
+        let model = crate::models::LocalLlmModel {
+            id: "qwen".into(),
+            dir: "missing".into(),
+            model_file: "missing".into(),
+            is_fp16_kv: false,
+        };
+        assert_eq!(
+            c.uses_local(&guard, Some(&model)),
+            cfg!(feature = "native-onnx")
+        );
+        let remote = AiClient {
+            endpoint: Some("https://example.test/v1".into()),
+            prefer_local: false,
+            ..Default::default()
+        };
+        assert!(!remote.uses_local(&OfflineGuard::new(false), Some(&model)));
+        assert_eq!(
+            remote.uses_local(&guard, Some(&model)),
+            cfg!(feature = "native-onnx")
+        );
+        let unconfigured = AiClient::default();
+        assert_eq!(
+            unconfigured.uses_local(&OfflineGuard::new(false), Some(&model)),
+            cfg!(feature = "native-onnx")
+        );
+        #[cfg(feature = "native-onnx")]
+        assert!(matches!(
+            c.run_with_local(&guard, Some(&model), AiMode::Translate, "你好", "en"),
+            Err(VitralError::Parse(_))
+        ));
+    }
 }

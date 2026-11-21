@@ -1,12 +1,13 @@
 use serde_json::{json, Value};
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     ffi::c_void,
     mem::ManuallyDrop,
     os::windows::ffi::OsStringExt,
     path::PathBuf,
     ptr,
-    rc::Rc,
+    rc::{Rc, Weak},
     sync::atomic::{AtomicU32, Ordering},
 };
 use windows::{
@@ -14,7 +15,11 @@ use windows::{
     Win32::{
         Foundation::*,
         System::Com::*,
-        UI::{Input::KeyboardAndMouse::*, TextServices::*},
+        UI::{
+            Input::KeyboardAndMouse::*,
+            TextServices::*,
+            WindowsAndMessaging::{KillTimer, SetTimer},
+        },
     },
 };
 
@@ -122,6 +127,9 @@ struct View {
     active: bool,
     english: bool,
     paste_id: String,
+    prediction_id: u64,
+    prediction_text: String,
+    context_before: String,
     mode: i32,
     caret: RECT,
     selected: usize,
@@ -139,6 +147,33 @@ struct Editor {
     panel: Cell<*mut c_void>,
     view: RefCell<View>,
     shift_held: Cell<bool>,
+    prediction_timer: Cell<usize>,
+    prediction_polls: Cell<u32>,
+    prediction_trigger: Cell<bool>,
+}
+thread_local! {
+    static PREDICTION_TIMERS: RefCell<BTreeMap<usize, Weak<Editor>>> = const { RefCell::new(BTreeMap::new()) };
+}
+unsafe extern "system" fn prediction_tick(_: HWND, _: u32, timer: usize, _: u32) {
+    let owner = PREDICTION_TIMERS.with(|timers| timers.borrow_mut().remove(&timer));
+    let _ = KillTimer(None, timer);
+    if let Some(editor) = owner.and_then(|owner| owner.upgrade()) {
+        editor.prediction_timer.set(0);
+        editor.poll_prediction();
+    }
+}
+impl Drop for Editor {
+    fn drop(&mut self) {
+        let timer = self.prediction_timer.replace(0);
+        if timer != 0 {
+            unsafe {
+                let _ = KillTimer(None, timer);
+            }
+            let _ = PREDICTION_TIMERS.try_with(|timers| {
+                timers.borrow_mut().remove(&timer);
+            });
+        }
+    }
 }
 impl Editor {
     fn call(&self, name: &str, v: Value) -> Result<Value> {
@@ -147,8 +182,15 @@ impl Editor {
     }
     fn draw(&self, glow: bool, activity: bool) {
         let v = self.view.borrow();
-        let strings: Vec<Vec<u16>> = v
-            .words
+        let words = if !v.prediction_text.is_empty()
+            && self.composition.borrow().is_none()
+            && v.mode == 0
+        {
+            vec![format!("Tab 补全：{}", v.prediction_text)]
+        } else {
+            v.words.clone()
+        };
+        let strings: Vec<Vec<u16>> = words
             .iter()
             .map(|s| s.encode_utf16().chain(Some(0)).collect())
             .collect();
@@ -168,6 +210,104 @@ impl Editor {
             )
         }
     }
+    fn cancel_prediction(&self, dismissed: bool) {
+        let timer = self.prediction_timer.replace(0);
+        if timer != 0 {
+            unsafe {
+                let _ = KillTimer(None, timer);
+            }
+            PREDICTION_TIMERS.with(|timers| {
+                timers.borrow_mut().remove(&timer);
+            });
+        }
+        let id = self.view.borrow().prediction_id;
+        let visible = !self.view.borrow().prediction_text.is_empty();
+        let _ = self.call(
+            if dismissed {
+                "predict-dismiss"
+            } else {
+                "predict-cancel"
+            },
+            json!({"id":id}),
+        );
+        let mut v = self.view.borrow_mut();
+        v.prediction_id = 0;
+        v.prediction_text.clear();
+        drop(v);
+        if visible {
+            self.draw(false, true);
+        }
+    }
+    fn arm_prediction(self: &Rc<Self>, delay: u32) {
+        let timer = unsafe { SetTimer(None, 0, delay, Some(prediction_tick)) };
+        if timer != 0 {
+            self.prediction_timer.set(timer);
+            PREDICTION_TIMERS.with(|timers| {
+                timers.borrow_mut().insert(timer, Rc::downgrade(self));
+            });
+        }
+    }
+    fn schedule_prediction(self: &Rc<Self>, catch_up: bool) {
+        self.cancel_prediction(false);
+        if !self.view.borrow().active
+            || self.composition.borrow().is_some()
+            || self.view.borrow().mode != 0
+        {
+            return;
+        }
+        self.prediction_polls.set(0);
+        self.prediction_trigger.set(catch_up);
+        let state = self.call("profile-state", json!({})).unwrap_or_default();
+        if state["prediction_enabled"] == false {
+            return;
+        }
+        let delay = if catch_up {
+            1
+        } else {
+            state["prediction_delay_ms"]
+                .as_u64()
+                .unwrap_or(380)
+                .clamp(150, 2000) as u32
+        };
+        self.arm_prediction(delay);
+    }
+    fn poll_prediction(self: &Rc<Self>) {
+        if !self.view.borrow().active
+            || self.composition.borrow().is_some()
+            || self.view.borrow().mode != 0
+        {
+            return;
+        }
+        let polls = self.prediction_polls.get();
+        let r = if polls == 0 {
+            let app = std::env::current_exe()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let context = self.view.borrow().context_before.clone();
+            self.call("predict-request", json!({"app_id":app,"context_before":context,"trigger":if self.prediction_trigger.get() {"catch_up"} else {"live"},"is_composing":false,"is_password":false}))
+        } else {
+            self.call(
+                "predict-poll",
+                json!({"id":self.view.borrow().prediction_id}),
+            )
+        };
+        let Ok(r) = r else {
+            return;
+        };
+        self.view.borrow_mut().prediction_id = r["id"].as_u64().unwrap_or(0);
+        if r["status"] == "pending" {
+            if polls >= 25 {
+                self.cancel_prediction(false);
+                return;
+            }
+            self.prediction_polls.set(polls + 1);
+            self.arm_prediction(120);
+        } else if r["status"] == "ready" {
+            self.view.borrow_mut().prediction_text = r["text"].as_str().unwrap_or("").into();
+            self.draw(false, false);
+        }
+    }
     fn on_ime_open(&self) -> Result<Value> {
         let app = std::env::current_exe().unwrap_or_default();
         self.call("on-ime-open", json!({"app_id":app}))
@@ -175,7 +315,7 @@ impl Editor {
     fn on_ime_close(&self) {
         let _ = self.call("on-ime-close", json!({}));
     }
-    fn focus(&self, open: bool) {
+    fn focus(self: &Rc<Self>, open: bool) {
         if self.view.borrow().active == open {
             return;
         }
@@ -202,7 +342,10 @@ impl Editor {
                 }
                 v.english = r["lang_mode"] == "en";
             }
+            drop(v);
+            self.schedule_prediction(true);
         } else {
+            self.cancel_prediction(false);
             self.shift_held.set(false);
             self.view.replace(View::default());
             self.on_ime_close();
@@ -272,6 +415,9 @@ impl Service {
                 panel: Cell::new(ptr::null_mut()),
                 view: Default::default(),
                 shift_held: Cell::new(false),
+                prediction_timer: Cell::new(0),
+                prediction_polls: Cell::new(0),
+                prediction_trigger: Cell::new(false),
             }),
             _live: Live::new(),
         })
@@ -415,6 +561,27 @@ impl Service_Impl {
         if !view.active {
             return None;
         }
+        if !composing
+            && !view.prediction_text.is_empty()
+            && !down(0x10)
+            && !down(0x11)
+            && !down(0x12)
+            && !down(0x5b)
+            && !down(0x5c)
+        {
+            if code == u32::from(VK_TAB.0) {
+                return Some(Action::new(
+                    "prediction-accept",
+                    json!({"id":view.prediction_id,"text":view.prediction_text}),
+                ));
+            }
+            if code == 27 {
+                return Some(Action::new(
+                    "prediction-dismiss",
+                    json!({"id":view.prediction_id}),
+                ));
+            }
+        }
         if let Some(key) = Self::shortcut_name(code) {
             if self
                 .editor
@@ -545,7 +712,14 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         if !matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
             self.editor.shift_held.set(false);
         }
-        Ok((ctx.is_some() && self.key(w, l).is_some()).into())
+        let action = self.key(w, l);
+        if !action
+            .as_ref()
+            .is_some_and(|a| matches!(a.cmd, "prediction-accept" | "prediction-dismiss"))
+        {
+            self.editor.cancel_prediction(false);
+        }
+        Ok((ctx.is_some() && action.is_some()).into())
     }
     fn OnKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
         if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
@@ -612,7 +786,19 @@ impl ITfEditSession_Impl for Edit_Impl {
             self.handled.set(true);
             return Ok(());
         }
-        let r = if a.cmd == "insert" {
+        if a.cmd == "prediction-dismiss" {
+            ed.cancel_prediction(true);
+            self.handled.set(true);
+            return Ok(());
+        }
+        let r = if a.cmd == "prediction-accept" {
+            let current = ed.call("predict-poll", json!({"id":a.args["id"]}))?;
+            if current["status"] != "ready" || current["text"] != a.args["text"] {
+                ed.cancel_prediction(false);
+                return Ok(());
+            }
+            json!({"commit_text":a.args["text"]})
+        } else if a.cmd == "insert" {
             a.args.clone()
         } else {
             ed.call(a.cmd, a.args.clone())?
@@ -694,7 +880,26 @@ impl ITfEditSession_Impl for Edit_Impl {
                 }
             }
         }
+        if a.cmd == "prediction-accept" && commit.is_some() {
+            ed.call(
+                "predict-accept",
+                json!({"id":a.args["id"],"text":a.args["text"]}),
+            )?;
+            ed.cancel_prediction(false);
+        }
         let mut v = ed.view.borrow_mut();
+        if let Some(text) = commit {
+            v.context_before.push_str(text);
+            v.context_before = v
+                .context_before
+                .chars()
+                .rev()
+                .take(160)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+        }
         if let Some(lang) = r["lang_mode"].as_str() {
             v.english = lang == "en";
         }
@@ -750,6 +955,9 @@ impl ITfEditSession_Impl for Edit_Impl {
             }
             _ => {}
         }
+        if commit.is_some() && ed.composition.borrow().is_none() {
+            ed.schedule_prediction(false);
+        }
         ed.draw(glow, true);
         self.handled.set(true);
         Ok(())
@@ -792,6 +1000,13 @@ unsafe extern "C" fn panel_event(
             Action::new(
                 "hw-override-slot",
                 json!({"slot_idx":index,"candidate_idx":(current+1)%alts.len()}),
+            )
+        }
+        0 if !ed.view.borrow().prediction_text.is_empty() && ed.composition.borrow().is_none() => {
+            let v = ed.view.borrow();
+            Action::new(
+                "prediction-accept",
+                json!({"id":v.prediction_id,"text":v.prediction_text}),
             )
         }
         0 => Action::new("select-candidate", json!({"idx":index})),
@@ -846,6 +1061,9 @@ unsafe extern "C" fn panel_event(
         }
         _ => return,
     };
+    if action.cmd != "prediction-accept" {
+        ed.cancel_prediction(false);
+    }
     let mgr = ed.mgr.borrow().clone();
     if let Some(ctx) = mgr
         .and_then(|m| m.GetFocus().ok())

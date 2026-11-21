@@ -92,6 +92,7 @@ pub struct HandwritingSession {
     pub last_slots: Vec<Mode2Slot>,
     pub last_mode1: Vec<Mode1Candidate>,
     pub assets_dir: Option<PathBuf>,
+    model_paths: Option<crate::models::ModelPaths>,
     slot_span_bounds: Vec<(usize, usize)>,
     manual_locked_by_span: HashMap<(usize, usize), String>,
     baseline_char_by_span: HashMap<(usize, usize), String>,
@@ -111,6 +112,12 @@ impl HandwritingSession {
 
     pub fn set_assets_dir(&mut self, assets_dir: Option<&Path>) {
         self.assets_dir = assets_dir.map(PathBuf::from);
+        self.model_paths = None;
+    }
+
+    pub fn set_model_paths(&mut self, paths: crate::models::ModelPaths) {
+        self.model_paths = Some(paths);
+        self.clear();
     }
 
     pub fn begin(&mut self, mode: HwMode) {
@@ -284,8 +291,9 @@ impl HandwritingSession {
             .assets_dir
             .clone()
             .or_else(crate::imp::polyphone::default_assets_dir_candidates);
-        let bundle = HwOnnxBundle::load_cached(assets.as_deref());
-        let ids = IdsIndex::load_cached(assets.as_deref());
+        let paths = self.model_paths.clone().unwrap_or_else(|| crate::models::ModelPaths::bundled(assets.as_deref()));
+        let bundle = HwOnnxBundle::load_paths(&paths);
+        let ids = IdsIndex::load_dir(paths.handwriting.as_deref());
 
         match mode {
             HwMode::PhoneticLookup => {
@@ -497,7 +505,7 @@ fn decode_mode1(
         }
     } else {
         return Err(VitralError::ModelUnavailable(
-            "handwriting ONNX model (hw_model.onnx / hw_model.int8.onnx) is unavailable for multi-stroke recognition".into(),
+            "尚未下载或已禁用离线手写识别模型，请在模型中心下载并启用".into(),
         ));
     }
 

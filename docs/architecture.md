@@ -25,7 +25,7 @@
 | F09 | 笔迹切分、Top-8 混淆集、重排和手动锁字 | `hw/lattice.rs`、`hw/rerank.rs` |
 | F10 | 个人词频、置顶、简码和按应用记忆 | `vitral-core/src/ret.rs`、`eng/` |
 | F11 | 快捷粘贴、持久化历史、设备同步与文件传输 | `clip.rs`、`sync.rs`、`dav.rs`、`lan.rs` |
-| F12 | 本地语音识别和纯离线开关 | `vitral-core/src/ai`、`ai.rs` |
+| F12 | 本地模型中心、RAM 分档、语音识别（SenseVoice / Qwen3-ASR）、本地 Qwen3、预测输入、用户画像蒸馏与纯离线开关 | `vitral-core/src/models.rs`、`ai/`、`ai.rs`、`predict.rs`、`profile.rs`、`scripts/models-catalog.json` |
 | F13 | Fcitx5 输入上下文、候选窗和状态面板 | `linux/fcitx5-vitral` |
 | F14 | 桌面管理中心、词库和外观设置 | `apps/desktop-tauri` |
 | F15 | Android 键盘布局、手势、停靠和悬浮 | `apps/android/app/src/main` |

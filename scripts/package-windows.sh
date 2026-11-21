@@ -35,13 +35,14 @@ with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=5) as
     out.write(Path("apps/desktop-tauri/src-tauri") / target / "vitral-desktop.exe", "vitral-desktop.exe")
     out.write("docs/windows.md", "README.md")
     out.write("scripts/assets-manifest.json", "assets/assets-manifest.json")
+    out.write("scripts/models-catalog.json", "assets/models-catalog.json")
     assets = Path("assets")
     for name in ("rime/cn_dicts/8105.dict.yaml", "rime/cn_dicts/41448.dict.yaml",
                  "rime/cn_dicts/base.dict.yaml", "rime/cn_dicts/ext.dict.yaml", "rime/cn_dicts/others.dict.yaml",
-                 "rime/LICENSE", "rime/wanxiang-lts-zh-hans.gram", "handwriting/hw_model.int8.onnx",
-                 "handwriting/hw_model.classes.json", "handwriting/cjkvi_ids.txt",
-                 "reranker/model_int8.onnx", "reranker/vocab.txt", "voice/sensevoice-small/model.int8.onnx",
-                 "voice/sensevoice-small/tokens.txt", "voice/sensevoice-small/LICENSE"):
+                 "rime/LICENSE"):
         out.write(assets / name)
+    for source in sorted((assets / "opencc").rglob("*")):
+        if source.is_file() and not source.name.startswith("."):
+            out.write(source)
 PY
 mv "$stage/Vitral-windows-x86_64.zip" target/release/

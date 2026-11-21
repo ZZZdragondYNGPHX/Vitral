@@ -110,7 +110,7 @@ impl std::fmt::Debug for HwOnnxBundle {
     }
 }
 
-static BUNDLE_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<HwOnnxBundle>>>> = OnceLock::new();
+static BUNDLE_CACHE: OnceLock<Mutex<HashMap<crate::models::ModelPaths, Arc<HwOnnxBundle>>>> = OnceLock::new();
 
 pub fn resolve_reranker_dir(assets_dir: &Path) -> Option<PathBuf> {
     let primary = assets_dir.join("reranker");
@@ -129,20 +129,24 @@ pub fn resolve_reranker_dir(assets_dir: &Path) -> Option<PathBuf> {
 
 impl HwOnnxBundle {
     pub fn load_cached(assets_dir: Option<&Path>) -> Arc<Self> {
-        let key = assets_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("__no_assets__"));
+        Self::load_paths(&crate::models::ModelPaths::bundled(assets_dir))
+    }
+
+    pub fn clear_cache() { if let Some(c) = BUNDLE_CACHE.get() { c.lock().clear(); } }
+
+    pub fn load_paths(paths: &crate::models::ModelPaths) -> Arc<Self> {
+        let key = paths.clone();
         let cache = BUNDLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = cache.lock();
         if let Some(b) = guard.get(&key) {
             return Arc::clone(b);
         }
-        let built = Arc::new(Self::load(assets_dir));
+        let built = Arc::new(Self::load(paths));
         guard.insert(key, Arc::clone(&built));
         built
     }
 
-    fn load(assets_dir: Option<&Path>) -> Self {
+    fn load(paths: &crate::models::ModelPaths) -> Self {
         let mut hw_classes = Vec::new();
         let mut hw_class_set = HashSet::new();
         let mut tokenizer = None;
@@ -151,8 +155,8 @@ impl HwOnnxBundle {
         #[cfg(feature = "native-onnx")]
         let mut rerank_session = None;
 
-        if let Some(dir) = assets_dir {
-            let classes_path = dir.join("handwriting").join("hw_model.classes.json");
+        if let Some(dir) = paths.handwriting.as_ref() {
+            let classes_path = dir.join("hw_model.classes.json");
             if let Ok(raw) = fs::read_to_string(&classes_path) {
                 if let Ok(ords) = serde_json::from_str::<Vec<u32>>(&raw) {
                     hw_classes.reserve(ords.len());
@@ -166,22 +170,16 @@ impl HwOnnxBundle {
                 }
             }
 
-            let rerank_dir = resolve_reranker_dir(dir);
-            if let Some(ref rdir) = rerank_dir {
+        }
+        let rerank_dir = paths.reranker.as_ref();
+        {
+            if let Some(rdir) = rerank_dir {
                 tokenizer = BertTokenizer::from_vocab_file(&rdir.join("vocab.txt"));
             }
 
             #[cfg(feature = "native-onnx")]
             if let Some(env) = get_ort_env() {
-                let int8_hw = dir.join("handwriting").join("hw_model.int8.onnx");
-                let fp32_hw = dir.join("handwriting").join("hw_model.onnx");
-                let chosen_hw = if int8_hw.is_file() {
-                    Some(int8_hw)
-                } else if fp32_hw.is_file() {
-                    Some(fp32_hw)
-                } else {
-                    None
-                };
+                let chosen_hw = paths.handwriting.as_ref().map(|dir| dir.join("hw_model.int8.onnx"));
                 if let Some(hw_path) = chosen_hw {
                     if !hw_classes.is_empty() {
                         if let Ok(builder) = Session::builder(env) {
@@ -194,7 +192,7 @@ impl HwOnnxBundle {
                     }
                 }
 
-                if let Some(ref rdir) = rerank_dir {
+                if let Some(rdir) = rerank_dir {
                     let rbt3_path = rdir.join("model_int8.onnx");
                     if rbt3_path.is_file() && tokenizer.is_some() {
                         if let Ok(builder) = Session::builder(env) {

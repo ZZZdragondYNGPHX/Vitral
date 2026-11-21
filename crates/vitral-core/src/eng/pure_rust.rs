@@ -12,6 +12,7 @@ use vitral_tokens::TOKENS;
 #[derive(Debug)]
 pub struct PureRustEngine {
     assets_dir: Option<PathBuf>,
+    grammar_path: Option<PathBuf>,
     corpus: OnceLock<Arc<RimeDictCorpus>>,
     gram: OnceLock<Option<Arc<RimeGramDb>>>,
     pub page_index: usize,
@@ -22,6 +23,7 @@ impl PureRustEngine {
     pub fn new(assets_dir: Option<&Path>) -> Self {
         Self {
             assets_dir: assets_dir.map(PathBuf::from),
+            grammar_path: crate::models::ModelPaths::bundled(assets_dir).grammar,
             corpus: OnceLock::new(),
             gram: OnceLock::new(),
             page_index: 0,
@@ -31,7 +33,13 @@ impl PureRustEngine {
 
     pub fn reload_assets(&mut self, assets_dir: Option<&Path>) {
         self.assets_dir = assets_dir.map(PathBuf::from);
+        self.grammar_path = crate::models::ModelPaths::bundled(assets_dir).grammar;
         self.corpus = OnceLock::new();
+        self.gram = OnceLock::new();
+    }
+
+    pub fn set_model_paths(&mut self, paths: &crate::models::ModelPaths) {
+        self.grammar_path = paths.grammar.clone();
         self.gram = OnceLock::new();
     }
 
@@ -43,9 +51,7 @@ impl PureRustEngine {
     pub(super) fn get_gram(&self) -> Option<&RimeGramDb> {
         self.gram
             .get_or_init(|| {
-                self.assets_dir
-                    .as_deref()
-                    .map(|d| d.join("rime").join("wanxiang-lts-zh-hans.gram"))
+                self.grammar_path.clone()
                     .filter(|p| p.is_file())
                     .and_then(|p| RimeGramDb::open_cached(&p).ok())
             })

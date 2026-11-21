@@ -8,6 +8,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.inputmethodservice.InputMethodService
+import android.text.InputType
 import android.os.Build
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -39,6 +40,14 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var inlineRequest = 0
     private var english = false
     private var composing = false
+    private var passwordEditor = false
+    private var predictionEnabled = true
+    private var predictionDelay = 380L
+    private var predictionEpoch = 0
+    private var predictionId = 0L
+    private var predictionText = ""
+    private var predictionContext = ""
+    private var predictionTask: Runnable? = null
     private var pasteId = ""
     private var hasPreviousPage = false
     private var hasNextPage = false
@@ -118,7 +127,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         hasNextPage = false
         pasteId = ""
         composing = false
+        val inputType = info?.inputType ?: 0
+        val variation = inputType and InputType.TYPE_MASK_VARIATION
+        passwordEditor = when (inputType and InputType.TYPE_MASK_CLASS) {
+            InputType.TYPE_CLASS_TEXT -> variation in setOf(InputType.TYPE_TEXT_VARIATION_PASSWORD, InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD, InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)
+            InputType.TYPE_CLASS_NUMBER -> variation == InputType.TYPE_NUMBER_VARIATION_PASSWORD
+            else -> false
+        }
         val cfg = Core.settings(this)
+        predictionEnabled = cfg.optBoolean("prediction_enabled", true)
+        predictionDelay = cfg.optLong("prediction_delay_ms", 380).coerceIn(150, 2000)
         shortcutKeys =
             cfg.optJSONArray("shortcuts")?.let { rows ->
                 (0 until rows.length())
@@ -132,6 +150,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         call("on-app-focus", json("app_id" to (info?.packageName ?: "android"))) {
             english = it.optString("lang_mode") == "en"
             render()
+            schedulePrediction("catch_up", 0)
         }
         call("on-ime-open") { updatePaste(it) }
         onPrimaryClipChanged()
@@ -143,6 +162,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     override fun onFinishInputView(finishingInput: Boolean) {
         invalidateEditor()
         Core.call(this, "on-ime-close")
+        Core.call(this, "llm-unload", background = true)
         super.onFinishInputView(finishingInput)
     }
 
@@ -152,7 +172,14 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         super.onFinishInput()
     }
 
+    override fun onTrimMemory(level: Int) {
+        cancelPrediction()
+        Core.call(this, "llm-unload", background = true)
+        super.onTrimMemory(level)
+    }
+
     private fun invalidateEditor() {
+        cancelPrediction()
         hardwareShift = false
         handledHardwareKeys.clear()
         inlineRequest++
@@ -160,6 +187,78 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         editor++
         canvasGeneration++
         microphone.cancel()
+    }
+
+    private fun cancelPrediction() {
+        predictionEpoch++
+        predictionTask?.let { main.removeCallbacks(it) }
+        predictionTask = null
+        val visible = predictionText.isNotEmpty()
+        predictionText = ""
+        predictionId = 0
+        Core.call(this, "predict-cancel")
+        if (visible) candidates()
+    }
+
+    private fun schedulePrediction(trigger: String, delay: Long = predictionDelay) {
+        cancelPrediction()
+        if (!active || composing || passwordEditor || !predictionEnabled || mode != "keys") return
+        val epoch = predictionEpoch
+        val session = editor
+        val task = Runnable {
+            if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor) return@Runnable
+            // Never request surrounding text from a password editor.
+            val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
+            predictionContext = before
+            call("predict-request", json("app_id" to (currentInputEditorInfo?.packageName ?: "android"), "context_before" to before, "trigger" to trigger, "is_composing" to false, "is_password" to false)) {
+                receivePrediction(it, epoch, session, 0)
+            }
+        }
+        predictionTask = task
+        main.postDelayed(task, delay)
+    }
+
+    private fun receivePrediction(r: JSONObject, epoch: Int, session: Int, polls: Int) {
+        if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor || mode != "keys") return
+        predictionId = r.optLong("id")
+        when (r.optString("status")) {
+            "pending" -> {
+                if (polls >= 25) { cancelPrediction(); return }
+                val task = Runnable {
+                    if (session == editor && epoch == predictionEpoch && !composing && !passwordEditor)
+                        call("predict-poll", json("id" to predictionId)) { receivePrediction(it, epoch, session, polls + 1) }
+                }
+                predictionTask = task
+                main.postDelayed(task, 120)
+            }
+            "ready" -> {
+                // Cursor movement and application edits also invalidate late results.
+                if (currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext) { cancelPrediction(); return }
+                predictionText = r.optString("text")
+                candidates()
+            }
+        }
+    }
+
+    private fun acceptPrediction() {
+        if (passwordEditor || composing || predictionText.isEmpty()) return
+        val ic = currentInputConnection ?: return
+        if (ic.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext) { cancelPrediction(); return }
+        val text = predictionText
+        val id = predictionId
+        val epoch = predictionEpoch
+        call("predict-poll", json("id" to id)) { current ->
+            if (epoch != predictionEpoch || predictionId != id || passwordEditor || composing) return@call
+            if (current.optString("status") != "ready" || current.optString("text") != text ||
+                currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext) {
+                cancelPrediction()
+                return@call
+            }
+            if (currentInputConnection?.commitText(text, 1) != true) return@call
+            Core.call(this, "predict-accept", json("id" to id, "text" to text))
+            cancelPrediction()
+            schedulePrediction("live")
+        }
     }
 
     private fun hardwareShortcut(code: Int, event: KeyEvent): String? {
@@ -191,6 +290,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (currentInputConnection == null) return super.onKeyDown(keyCode, event)
         if (!active) startEditor(currentInputEditorInfo)
+        if (!composing && predictionText.isNotEmpty() && keyCode == KeyEvent.KEYCODE_TAB && !event.isShiftPressed && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+            acceptPrediction()
+            handledHardwareKeys.add(keyCode)
+            return true
+        }
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE && predictionText.isNotEmpty()) {
+            Core.call(this, "predict-dismiss", json("id" to predictionId))
+            cancelPrediction()
+            handledHardwareKeys.add(keyCode)
+            return true
+        }
+        cancelPrediction()
         val shortcut = hardwareShortcut(keyCode, event)
         if (keyCode == KeyEvent.KEYCODE_SHIFT_LEFT || keyCode == KeyEvent.KEYCODE_SHIFT_RIGHT) {
             hardwareShift = shortcut == "Shift" && shortcutKeys.contains("Shift")
@@ -704,6 +815,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun switch(next: String) {
+        cancelPrediction()
         inlineRequest++
         canvasGeneration++
         mode = next
@@ -741,6 +853,14 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     }
                 )
             return
+        }
+        if (!composing && !passwordEditor && mode == "keys" && predictionText.isNotEmpty()) {
+            bar.addView(label("✨ $predictionText", highlight = true) { acceptPrediction() }.apply {
+                setSingleLine(true)
+                maxWidth = resources.displayMetrics.widthPixels * 3 / 4
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                contentDescription = "预测补全：$predictionText"
+            })
         }
         for (i in 0 until shown.length()) {
             val item = shown.getJSONObject(i)
@@ -1092,6 +1212,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun key(label: String) {
+        cancelPrediction()
         inlineRequest++
         val ic = currentInputConnection ?: return
         val vibrator = getSystemService(Vibrator::class.java)
@@ -1122,6 +1243,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
             "delete-word" -> {
                 if (composing) call("process-key", json("keycode" to "Escape")) { applyAction(it) }
+                else if (passwordEditor) ic.deleteSurroundingTextInCodePoints(1, 0)
                 else {
                     val before = ic.getTextBeforeCursor(96, 0)?.toString().orEmpty()
                     val n = before.takeLastWhile { it.isLetterOrDigit() }.length.coerceAtLeast(1)
@@ -1164,6 +1286,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (pre.isNotEmpty()) ic.setComposingText(pre, 1)
         else if (composing && r.isNull("commit_text")) ic.setComposingText("", 1)
         composing = pre.isNotEmpty()
+        if (composing) cancelPrediction()
+        else if (r.optString("commit_text").isNotEmpty() && !r.isNull("commit_text")) schedulePrediction("live")
         val previousEnglish = english
         english = r.optString("lang_mode") == "en"
         shown = r.optJSONArray("candidates") ?: JSONArray()
@@ -1202,7 +1326,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         microphone.start(this) { result ->
             if (active && id == editor)
                 result
-                    .onSuccess { if (it.isNotEmpty()) currentInputConnection?.commitText(it, 1) }
+                    .onSuccess { if (it.isNotEmpty()) { currentInputConnection?.commitText(it, 1); schedulePrediction("live") } }
                     .onFailure { message(it.message.orEmpty()) }
         }
     }

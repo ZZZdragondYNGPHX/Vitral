@@ -46,6 +46,10 @@
           <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H9a5 5 0 0 1-.8-9.94A6.5 6.5 0 0 1 20.6 11a4 4 0 0 1-3.1 8z"/></svg>
           <span>同步与闪传</span>
         </button>
+        <button type="button" data-tab="models">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3 3.5 7.5 12 12l8.5-4.5L12 3z"/><path d="M3.5 12.5 12 17l8.5-4.5"/><path d="M3.5 17 12 21.5 20.5 17"/></svg>
+          <span>模型中心</span>
+        </button>
         <button type="button" data-tab="tools">
           <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0"/><path d="M12 18v3"/></svg>
           <span>语音与 AI</span>
@@ -193,6 +197,72 @@
             </div>
             <div class="row-ctrl">
               <input id="clip-learn-toggle" class="switch" name="learn_from_clipboard" type="checkbox" checked>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="prediction-toggle">Codex 风格本地预测输入</label>
+              <p class="help">在非组词停顿或切回输入框时异步预测下一句，按 <kbd>Tab</kbd> 接受为可编辑草稿，继续打字立即取消；密码框自动跳过。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="prediction-toggle" class="switch" name="prediction_enabled" type="checkbox" checked>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="prediction-delay-range">预测触发停顿</label>
+              <p class="help">上屏后停顿多长时间触发本地预测（150–2000 ms，默认 380 ms）</p>
+            </div>
+            <div class="row-ctrl range-group">
+              <input id="prediction-delay-range" type="range" min="150" max="2000" step="10" value="380" name="prediction_delay_ms">
+              <output class="range-val">380 ms</output>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="profile-distill-toggle">本地用户画像蒸馏</label>
+              <p class="help">仅在本地将脱敏高频词、应用语气与采纳习惯蒸馏为紧凑画像卡，供本地预测精准命中需求。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="profile-distill-toggle" class="switch" name="profile_distill_enabled" type="checkbox" checked>
+            </div>
+          </div>
+
+          <div class="profile-box" id="profile-box">
+            <div class="profile-head">
+              <div>
+                <strong>个人画像卡</strong>
+                <span class="badge" id="profile-source-badge">未蒸馏</span>
+              </div>
+              <div class="btn-cluster">
+                <button type="button" class="btn-accent-soft" id="btn-profile-distill">立即蒸馏画像</button>
+                <button type="button" class="btn-ghost" id="btn-profile-save">保存画像编辑</button>
+                <button type="button" class="btn-danger-ghost" id="btn-profile-clear">清空画像</button>
+              </div>
+            </div>
+            <p class="help" id="profile-meta">采纳 0 次 · 忽略 0 次</p>
+            <div class="profile-form">
+              <label class="profile-field">
+                <span>风格摘要</span>
+                <input id="profile-summary" type="text" placeholder="蒸馏后自动生成，也可手动补充你的表达习惯…">
+              </label>
+              <div class="profile-grid">
+                <label class="profile-field">
+                  <span>关注领域（逗号分隔）</span>
+                  <input id="profile-domains" type="text" placeholder="例如：Rust, Linux, 产品设计">
+                </label>
+                <label class="profile-field">
+                  <span>高频专名与实体（逗号分隔）</span>
+                  <input id="profile-entities" type="text" placeholder="例如：Vitral, Fcitx5, Qwen3">
+                </label>
+              </div>
+              <label class="profile-field">
+                <span>表达口癖与风格（逗号分隔）</span>
+                <input id="profile-traits" type="text" placeholder="例如：结论先行, 简短直接">
+              </label>
             </div>
           </div>
         </article>
@@ -405,7 +475,43 @@
         </article>
       </section>
 
-      <!-- ================= TAB 5: VOICE & AI ================= -->
+      <!-- ================= TAB 5: MODEL CENTER ================= -->
+      <section id="models" hidden>
+        <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <div class="title-with-badge">
+                <h2>本机模型中心</h2>
+                <span class="badge" id="ram-tier-badge">检测内存中…</span>
+              </div>
+              <span class="card-sub" id="models-store-sub">基础拼音词库已内置；语法、手写、重排与语音模型按需下载，下载后立即热加载生效。</span>
+            </div>
+            <div class="btn-cluster">
+              <button type="button" class="btn-ghost" id="models-refresh">刷新状态</button>
+              <button type="button" class="online btn-accent-soft" id="models-update-catalog">检查目录更新</button>
+            </div>
+          </div>
+
+          <div id="models-offline-hint" class="inline-alert is-info" hidden>
+            纯离线模式已开启：联网下载与目录更新已暂停，已下载的本地模型仍可自由启用、停用或删除。
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="model-catalog-url">自定义模型目录地址（可选）</label>
+              <p class="help">留空使用官方目录；填入自定义 JSON 地址并保存后，可用于私服镜像或测试新模型</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="model-catalog-url" name="model_catalog_url" type="url" placeholder="https://…/models-catalog.json（留空为默认）">
+            </div>
+          </div>
+        </article>
+
+        <div id="models-list" class="model-list" aria-live="polite"></div>
+        <div id="models-empty" class="empty-state" hidden>正在读取本地模型状态…</div>
+      </section>
+
+      <!-- ================= TAB 6: VOICE & AI ================= -->
       <section id="tools" hidden>
         <article class="card online-card">
           <div class="card-head">
@@ -432,6 +538,15 @@
           </div>
           <div class="row">
             <div class="row-copy">
+              <label for="ai-prefer-local">优先使用本地 Qwen3 模型</label>
+              <p class="help">在「模型中心」下载 Qwen3-0.6B / 1.7B 后，翻译、润色、摘要与手写消歧可在纯离线模式下直接本机执行</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="ai-prefer-local" class="switch" name="ai_prefer_local" type="checkbox" checked>
+            </div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
               <label for="ai-tier3">允许 AI 辅助连续手写消歧</label>
               <p class="help">仅在已有模糊字位候选中择优，不会凭空改写清晰字</p>
             </div>
@@ -445,7 +560,7 @@
           <div class="card-head row-head">
             <div>
               <h2>本机离线录音与文本工作台</h2>
-              <span class="card-sub">SenseVoice-Small 本地转写 · 可选一键翻译、润色或提炼摘要</span>
+              <span class="card-sub">SenseVoice / Qwen3-ASR 本地转写（支持个人词库热词偏置）· 本地 Qwen3 纯离线翻译、润色与摘要</span>
             </div>
             <span class="rec-timer" id="rec-timer" hidden><span class="rec-dot"></span><span id="rec-elapsed">00:00</span></span>
           </div>
@@ -462,9 +577,9 @@
                 </select>
                 <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
               </div>
-              <button type="button" class="online btn-ghost" data-ai="translate">翻译</button>
-              <button type="button" class="online btn-ghost" data-ai="polish">润色</button>
-              <button type="button" class="online btn-ghost" data-ai="summary">摘要</button>
+              <button type="button" class="btn-ghost" data-ai="translate">翻译</button>
+              <button type="button" class="btn-ghost" data-ai="polish">润色</button>
+              <button type="button" class="btn-ghost" data-ai="summary">摘要</button>
             </div>
             <span class="char-count" id="source-count">0 字</span>
           </div>

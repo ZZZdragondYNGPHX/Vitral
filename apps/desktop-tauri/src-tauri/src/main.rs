@@ -34,10 +34,19 @@ fn public_settings(mut cfg: Value) -> Value {
     if cfg.get("shortcuts").is_none() {
         cfg["shortcuts"] = json!(shortcuts::defaults());
     }
-    for key in ["adaptive_learning", "learn_from_clipboard"] {
+    for key in [
+        "adaptive_learning",
+        "learn_from_clipboard",
+        "prediction_enabled",
+        "profile_distill_enabled",
+        "ai_prefer_local",
+    ] {
         if cfg.get(key).is_none() {
             cfg[key] = json!(true);
         }
+    }
+    if cfg.get("prediction_delay_ms").is_none() {
+        cfg["prediction_delay_ms"] = json!(380);
     }
     cfg["shortcut_defaults"] = json!(shortcuts::defaults());
     cfg["shortcut_actions"] = json!(shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()})));
@@ -95,7 +104,7 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                     fields.insert(key.clone(), json!(bindings));
                     continue;
                 }
-                "adaptive_learning" | "learn_from_clipboard" => {
+                "adaptive_learning" | "learn_from_clipboard" | "prediction_enabled" | "profile_distill_enabled" => {
                     if !value.is_boolean() {
                         return Err("学习设置应为开启或关闭".into());
                     }
@@ -105,13 +114,19 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                         return Err("输入法内英文模式应为开启或关闭".into());
                     }
                 }
+                "prediction_delay_ms" if !(150..=2000).contains(&value.as_u64().unwrap_or(0)) => {
+                    return Err("预测延迟应在 150–2000 ms 之间".into())
+                }
                 "candidate_font_px" if !(13..=22).contains(&value.as_u64().unwrap_or(0)) => {
                     return Err("候选字号应在 13–22 px 之间".into())
                 }
                 "clipboard_ring_capacity" if !(20..=200).contains(&value.as_u64().unwrap_or(0)) => {
                     return Err("剪贴板容量应在 20–200 条之间".into())
                 }
-                "koofr_endpoint" | "ai_endpoint"
+                "model_catalog_url" if !value.is_null() && !value.is_string() => {
+                    return Err("模型目录地址应为 HTTP 或 HTTPS 地址".into());
+                }
+                "koofr_endpoint" | "ai_endpoint" | "model_catalog_url"
                     if value.as_str().is_some_and(|s| !s.is_empty()) =>
                 {
                     let url = url::Url::parse(value.as_str().unwrap())
@@ -123,12 +138,14 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                 "frecency_half_life_sec" if value.as_u64().is_none_or(|s| s == 0) => {
                     return Err("请输入正数秒".into())
                 }
-                "frecency_half_life_sec"
+                "prediction_delay_ms"
+                | "frecency_half_life_sec"
                 | "schema"
                 | "opencc_mode"
                 | "theme"
                 | "candidate_font_px"
                 | "clipboard_ring_capacity"
+                | "model_catalog_url"
                 | "koofr_endpoint"
                 | "koofr_username"
                 | "koofr_password"
@@ -138,6 +155,7 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                 | "ai_model"
                 | "pure_offline"
                 | "ai_tier3_enabled"
+                | "ai_prefer_local"
                 | "toolbar" => (),
                 _ => return Err(format!("未知设置 {key}")),
             }

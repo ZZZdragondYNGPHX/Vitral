@@ -1265,7 +1265,7 @@ fn valid_english(raw: &str) -> bool {
         && !secret_line(raw)
 }
 
-fn secret_line(line: &str) -> bool {
+pub(crate) fn secret_line(line: &str) -> bool {
     let lower = line.to_ascii_lowercase();
     [
         "sk-", "gho_", "ghp_", "bearer ", "password", "passwd", "token=", "secret=", "密码",

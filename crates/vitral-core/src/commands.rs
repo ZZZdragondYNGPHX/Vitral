@@ -50,6 +50,15 @@ fn keycode(key: &str) -> Result<u32> {
 
 pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
     Ok(match cmd {
+        "predict-request" => to_value(core.predict_request(serde_json::from_value(v.clone())?))?,
+        "predict-poll" => to_value(core.predict_poll(v.get("id").map(|_| arg(v, "id")).transpose()?))?,
+        "predict-cancel" => to_value(core.predict_cancel())?,
+        "predict-accept" => json!({"accepted":core.predict_accept(arg(v, "id")?, string(v, "text")?)?}),
+        "predict-dismiss" => json!({"dismissed":core.predict_dismiss(arg(v, "id")?)?}),
+        "profile-state" => core.profile_state(),
+        "profile-distill" => { core.profile_distill()?; core.profile_state() },
+        "profile-update" => { core.profile_update(serde_json::from_value(v.clone())?)?; core.profile_state() },
+        "profile-clear" => { core.profile_clear()?; core.profile_state() },
         "configure" => {
             core.apply_preferences(serde_json::from_value(v.clone())?)?;
             json!({"ok":true,"shortcuts":core.input.lock().engine.config.shortcuts})
@@ -70,6 +79,12 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             core.set_opencc_mode(arg(v, "mode")?);
             json!({"mode":v["mode"]})
         }
+        "models-state" => to_value(core.models_state())?,
+        "models-download" => to_value(core.models_download(string(v, "id")?)?)?,
+        "models-cancel" => to_value(core.models_cancel(string(v, "id")?)?)?,
+        "models-set-enabled" => to_value(core.models_set_enabled(string(v, "id")?, arg(v, "enabled")?)?)?,
+        "models-delete" => to_value(core.models_delete(string(v, "id")?)?)?,
+        "models-refresh-catalog" => to_value(core.models_refresh_catalog(v.get("url").filter(|v| !v.is_null()).map(|_| string(v, "url")).transpose()?)?)?,
         "reload-assets" => to_value(core.reload_assets()?)?,
         "on-app-focus" => to_value(core.on_app_focus(string(v, "app_id")?)?)?,
         "process-key" => {
@@ -191,6 +206,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             json!({"sample_count":samples.len()})
         }
         "voice-stop" => to_value(core.voice_stop()?)?,
+        "llm-unload" => { core.predict_cancel(); crate::ai::unload_local_llm(); json!({"ok":true}) },
         "ai-inline" => to_value(core.ai_inline(
             arg(v, "mode")?,
             string(v, "text")?,

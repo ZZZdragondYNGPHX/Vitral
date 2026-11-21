@@ -298,6 +298,17 @@ unsafe impl Send for RimeRuntime {}
 
 static RIME_RUNTIME: OnceLock<Mutex<Option<RimeRuntime>>> = OnceLock::new();
 
+pub fn clear_runtime() {
+    if let Some(cell) = RIME_RUNTIME.get() {
+        if let Some(rt) = cell.lock().take() {
+            unsafe {
+                if let Some(join) = (*rt.api).join_maintenance_thread { join(); }
+                if let Some(finalize) = (*rt.api).finalize { finalize(); }
+            }
+        }
+    }
+}
+
 fn c_data_size<T>() -> c_int {
     (std::mem::size_of::<T>() - std::mem::size_of::<c_int>()) as c_int
 }
@@ -364,7 +375,7 @@ fn resolve_cache_root(config_cache_dir: &str, config_data_dir: &str) -> (PathBuf
     (user_data_dir, staging_dir)
 }
 
-fn stage_user_data_dir(assets_dir: &Path, user_data_dir: &Path) -> Result<(), VitralError> {
+fn stage_user_data_dir(assets_dir: &Path, user_data_dir: &Path, grammar: Option<&Path>) -> Result<bool, VitralError> {
     fs::create_dir_all(user_data_dir).map_err(|e| VitralError::Io(e.to_string()))?;
     fs::create_dir_all(user_data_dir.join("logs")).map_err(|e| VitralError::Io(e.to_string()))?;
 
@@ -389,6 +400,14 @@ fn stage_user_data_dir(assets_dir: &Path, user_data_dir: &Path) -> Result<(), Vi
   "translator/max_homographs": 7
 "#;
 
+    let grammar_patch = if grammar.is_some() { grammar_patch } else { "patch:\n  \"translator/contextual_suggestions\": false\n" };
+    let patch_changed = fs::read_to_string(user_data_dir.join("rime_ice.custom.yaml")).ok().as_deref() != Some(grammar_patch);
+    let gram_link = user_data_dir.join("wanxiang-lts-zh-hans.gram");
+    if gram_link.symlink_metadata().is_ok() { fs::remove_file(&gram_link).map_err(|e| VitralError::Io(e.to_string()))?; }
+    if let Some(path) = grammar {
+        let source = fs::canonicalize(path).map_err(|e| VitralError::Io(e.to_string()))?;
+        std::os::unix::fs::symlink(source, &gram_link).map_err(|e| VitralError::Io(e.to_string()))?;
+    }
     write_if_changed(&user_data_dir.join("default.custom.yaml"), default_custom)?;
     write_if_changed(&user_data_dir.join("rime_ice.custom.yaml"), grammar_patch)?;
     write_if_changed(
@@ -421,7 +440,7 @@ fn stage_user_data_dir(assets_dir: &Path, user_data_dir: &Path) -> Result<(), Vi
         }
     }
 
-    Ok(())
+    Ok(patch_changed)
 }
 
 fn write_if_changed(path: &Path, content: &str) -> Result<(), VitralError> {
@@ -447,7 +466,9 @@ fn init_runtime(
     }
 
     let (user_data_dir, staging_dir) = resolve_cache_root(cache_dir, data_dir);
-    stage_user_data_dir(assets_dir, &user_data_dir)?;
+    let config = super::EngineConfig { data_dir: data_dir.into(), cache_dir: cache_dir.into(), ..Default::default() };
+    let paths = crate::models::ModelPaths::from_config(&config, Some(assets_dir))?;
+    let patch_changed = stage_user_data_dir(assets_dir, &user_data_dir, paths.grammar.as_deref())?;
     fs::create_dir_all(&staging_dir).map_err(|e| VitralError::Io(e.to_string()))?;
 
     let api = unsafe { rime_get_api() };
@@ -494,7 +515,7 @@ fn init_runtime(
         let has_compiled_tables = staging_dir.join("rime_ice.table.bin").is_file()
             && staging_dir.join("double_pinyin_flypy.prism.bin").is_file()
             && staging_dir.join("rime_ice.schema.yaml").is_file();
-        let full_check = if has_compiled_tables { 0 } else { 1 };
+        let full_check = if has_compiled_tables && !patch_changed { 0 } else { 1 };
         if let Some(maint) = api_ref.start_maintenance {
             let started = maint(full_check);
             if started != 0 {
@@ -787,5 +808,31 @@ impl RimeRuntime {
             has_next,
             candidates,
         })
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+
+    #[test]
+    fn grammar_patch_and_symlink_follow_enable_state() {
+        struct Temp(PathBuf);
+        impl Drop for Temp {
+            fn drop(&mut self) { fs::remove_dir_all(&self.0).unwrap(); }
+        }
+        let temp = Temp(std::env::temp_dir().join(format!("vitral-rime-model-stage-{}", std::process::id())));
+        fs::create_dir_all(&temp.0).unwrap();
+        let model = temp.0.join("model.gram");
+        fs::write(&model, b"grammar fixture").unwrap();
+        let user = temp.0.join("user");
+        let assets = temp.0.join("assets");
+        assert!(stage_user_data_dir(&assets, &user, Some(&model)).unwrap());
+        assert!(fs::read_to_string(user.join("rime_ice.custom.yaml")).unwrap().contains("grammar:"));
+        assert_eq!(fs::read_link(user.join("wanxiang-lts-zh-hans.gram")).unwrap(), model);
+        assert!(!stage_user_data_dir(&assets, &user, Some(&model)).unwrap());
+        assert!(stage_user_data_dir(&assets, &user, None).unwrap());
+        assert!(!fs::read_to_string(user.join("rime_ice.custom.yaml")).unwrap().contains("grammar:"));
+        assert!(user.join("wanxiang-lts-zh-hans.gram").symlink_metadata().is_err());
     }
 }

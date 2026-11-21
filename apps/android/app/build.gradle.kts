@@ -8,13 +8,12 @@ val bundledModels = tasks.register<Sync>("bundleModels") {
     from(rootProject.file("../../assets")) {
         include("rime/cn_dicts/8105.dict.yaml", "rime/cn_dicts/41448.dict.yaml",
             "rime/cn_dicts/base.dict.yaml", "rime/cn_dicts/ext.dict.yaml", "rime/cn_dicts/others.dict.yaml",
-            "rime/LICENSE", "rime/*.gram", "handwriting/hw_model.int8.onnx", "handwriting/hw_model.classes.json",
-            "handwriting/cjkvi_ids.txt", "reranker/model_int8.onnx", "reranker/vocab.txt",
-            "voice/sensevoice-small/model.int8.onnx", "voice/sensevoice-small/tokens.txt", "voice/sensevoice-small/LICENSE")
+            "rime/LICENSE", "opencc/**")
+        exclude("**/.*.sha256")
     }
     from(rootProject.file("../../licenses")) { into("licenses") }
     from(rootProject.files("../../LICENSE-MIT", "../../LICENSE-APACHE")) { into("licenses") }
-    from(rootProject.file("../../scripts/assets-manifest.json"))
+    from(rootProject.files("../../scripts/assets-manifest.json", "../../scripts/models-catalog.json"))
     into(layout.buildDirectory.dir("generated/assets/models"))
 }
 
@@ -37,7 +36,6 @@ android {
     }
     kotlinOptions { jvmTarget = "17" }
     sourceSets["main"].assets.srcDir(layout.buildDirectory.dir("generated/assets"))
-    androidResources { noCompress += listOf("onnx", "gram") }
 }
 tasks.named("preBuild") { dependsOn(bundledModels) }
 

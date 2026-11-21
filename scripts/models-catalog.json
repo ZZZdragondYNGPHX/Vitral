@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "wanxiang-grammar",
+      "capability": "grammar",
+      "name": "万象中文语法模型",
+      "description": "提升全拼与双拼长句解码及语境排序准确度",
+      "version": "LTS",
+      "engine": "gram",
+      "license": "CC-BY-4.0",
+      "min_ram_mb": 2048,
+      "recommended_ram_mb": 4096,
+      "files": [
+        {
+          "rel_path": "rime/wanxiang-lts-zh-hans.gram",
+          "size": 390786092,
+          "sha256": "e9ddd501b7d536bc5ea1346f8f900ae49a719a05be349e0a17cb27e717143ca5",
+          "urls": [
+            "https://github.com/amzxyz/rime-wanxiang-data/releases/download/LTS/wanxiang-lts-zh-hans.gram"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "handwriting-cnn",
+      "capability": "handwriting",
+      "name": "离线手写识别模型",
+      "description": "启用单字手写查音与连续手写识别（含生僻字部件索引）",
+      "version": "v1",
+      "engine": "onnx",
+      "license": "LGPL-2.1 / GPL-2.0",
+      "min_ram_mb": 1024,
+      "recommended_ram_mb": 2048,
+      "files": [
+        {
+          "rel_path": "handwriting/hw_model.int8.onnx",
+          "size": 15317011,
+          "sha256": "593f93cc37cb888c0e5c2e65c5bbdd3deec112bb26f81f1c1f0b91ca08b11871",
+          "urls": [
+            "https://github.com/ZZZdragondYNGPHX/Vitral/releases/download/models-v1/hw_model.int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "handwriting/hw_model.classes.json",
+          "size": 105992,
+          "sha256": "d9ad40d4b0200595cb468267cd6fa8da6ff7570370581a9a0a715bc583a5048a",
+          "urls": [
+            "https://github.com/ZZZdragondYNGPHX/Vitral/releases/download/models-v1/hw_model.classes.json"
+          ]
+        },
+        {
+          "rel_path": "handwriting/cjkvi_ids.txt",
+          "size": 2161631,
+          "sha256": "bfc70a8c09f9f5616ebf0543bd6681e67314e9f7ae2307e5ae8c6f15bdc5c6a6",
+          "urls": [
+            "https://raw.githubusercontent.com/cjkvi/cjkvi-ids/86b4d16159f0079437870408f0ca186e529015db/ids.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reranker-rbt3",
+      "capability": "reranker",
+      "name": "本地语义重排模型 (rbt3)",
+      "description": "用于连续手写模糊字位重排与语义记忆增强",
+      "version": "int8",
+      "engine": "onnx",
+      "license": "Apache-2.0",
+      "min_ram_mb": 2048,
+      "recommended_ram_mb": 4096,
+      "files": [
+        {
+          "rel_path": "reranker/model_int8.onnx",
+          "size": 38889302,
+          "sha256": "b57bdfe6326cfffd11579dc5f35e09a898cb415988fb2ac0f2751a22e8e59e55",
+          "urls": [
+            "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/onnx/model_int8.onnx",
+            "https://hf-mirror.com/geofqiu0/rbt3-ONNX/resolve/main/onnx/model_int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "reranker/vocab.txt",
+          "size": 109540,
+          "sha256": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c",
+          "urls": [
+            "https://huggingface.co/geofqiu0/rbt3-ONNX/resolve/main/vocab.txt",
+            "https://hf-mirror.com/geofqiu0/rbt3-ONNX/resolve/main/vocab.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "voice-sensevoice-small",
+      "capability": "voice",
+      "name": "离线语音识别 (SenseVoice-Small)",
+      "description": "启用离线语音听写与桌面/移动端录音本地转写",
+      "version": "2024-07-17",
+      "engine": "onnx",
+      "license": "FunASR Model License v1.1",
+      "min_ram_mb": 3072,
+      "recommended_ram_mb": 6144,
+      "files": [
+        {
+          "rel_path": "voice/sensevoice-small/model.int8.onnx",
+          "size": 239233841,
+          "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51",
+          "urls": [
+            "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx",
+            "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "voice/sensevoice-small/tokens.txt",
+          "size": 315894,
+          "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+          "urls": [
+            "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt",
+            "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt"
+          ]
+        },
+        {
+          "rel_path": "voice/sensevoice-small/LICENSE",
+          "size": 71,
+          "sha256": "221c6df10b0931a5629adad671ea48fb7747e034c414b6d2bfa275bc3dd4ea17",
+          "urls": [
+            "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/LICENSE",
+            "https://hf-mirror.com/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/LICENSE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "voice-qwen3-asr-0.6b",
+      "capability": "voice",
+      "name": "Qwen3-ASR-0.6B 高精语音",
+      "description": "支持 52 种语言与 22 种中文方言，结合个人高频词与前文热词偏置显著提升识别率",
+      "version": "2026-03-25-int8",
+      "engine": "onnx",
+      "license": "Apache-2.0",
+      "min_ram_mb": 4096,
+      "recommended_ram_mb": 8192,
+      "files": [
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/conv_frontend.onnx",
+          "size": 44148281,
+          "sha256": "d22dc4423e0940e49884e903d2ea2f7e5567c14fc1aed97e4e26d6b8f208ef9e",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/conv_frontend.onnx",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/conv_frontend.onnx"
+          ]
+        },
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/encoder.int8.onnx",
+          "size": 182491662,
+          "sha256": "60748d3e6744a57c9c91e1b17424a6c2990567e8adceb0783940c03ed98fa9d9",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/encoder.int8.onnx",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/encoder.int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/decoder.int8.onnx",
+          "size": 755914231,
+          "sha256": "4f6885be5959ae26af3089d38ee7972c5fafbeeb1cf8d5e76eab6d8b61ca5771",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/decoder.int8.onnx",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/decoder.int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/tokenizer/vocab.json",
+          "size": 2776833,
+          "sha256": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/vocab.json",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/vocab.json"
+          ]
+        },
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/tokenizer/merges.txt",
+          "size": 1671853,
+          "sha256": "8831e4f1a044471340f7c0a83d7bd71306a5b867e95fd870f74d0c5308a904d5",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/merges.txt",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/merges.txt"
+          ]
+        },
+        {
+          "rel_path": "voice/qwen3-asr-0.6b/tokenizer/tokenizer_config.json",
+          "size": 12487,
+          "sha256": "4942d005604266809309cabc9f4e9cb89ce855d59b14681fdc0e1cc62ea26c4c",
+          "urls": [
+            "https://huggingface.co/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/tokenizer_config.json",
+            "https://hf-mirror.com/csukuangfj2/sherpa-onnx-qwen3-asr-0.6B-int8-2026-03-25/resolve/main/tokenizer/tokenizer_config.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "llm-qwen3-0.6b",
+      "capability": "local_llm",
+      "name": "Qwen3-0.6B 本地预测与离线 AI",
+      "description": "轻量端侧 Qwen3 量化模型，驱动本地预测输入、用户画像蒸馏与离线翻译润色摘要",
+      "version": "int8",
+      "engine": "onnx",
+      "license": "Apache-2.0",
+      "min_ram_mb": 3072,
+      "recommended_ram_mb": 6144,
+      "files": [
+        {
+          "rel_path": "llm/qwen3-0.6b/model_int8.onnx",
+          "size": 617687478,
+          "sha256": "d93222c672992a398eeea3a4a1ca025738efd9a18ba5f1691419ff8ae23a8e75",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model_int8.onnx",
+            "https://hf-mirror.com/onnx-community/Qwen3-0.6B-ONNX/resolve/main/onnx/model_int8.onnx"
+          ]
+        },
+        {
+          "rel_path": "llm/qwen3-0.6b/tokenizer.json",
+          "size": 9117040,
+          "sha256": "e7a95fce95bf5b0946d0ddb3f9d7caa030b7e850bbe92b0edb26bcf563e9f3d5",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/tokenizer.json",
+            "https://hf-mirror.com/onnx-community/Qwen3-0.6B-ONNX/resolve/main/tokenizer.json"
+          ]
+        },
+        {
+          "rel_path": "llm/qwen3-0.6b/config.json",
+          "size": 912,
+          "sha256": "8a04114ba59cc42b47d804d35d1d5c61d746ae4634f41f796768c6e302d39b9e",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-0.6B-ONNX/resolve/main/config.json",
+            "https://hf-mirror.com/onnx-community/Qwen3-0.6B-ONNX/resolve/main/config.json"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "llm-qwen3-1.7b",
+      "capability": "local_llm",
+      "name": "Qwen3-1.7B 高精预测与离线 AI",
+      "description": "高性能档位 Qwen3 量化模型，提供更精准的长句预测、画像蒸馏与离线文本处理",
+      "version": "q4f16",
+      "engine": "onnx",
+      "license": "Apache-2.0",
+      "min_ram_mb": 8192,
+      "recommended_ram_mb": 12288,
+      "files": [
+        {
+          "rel_path": "llm/qwen3-1.7b/model_q4f16.onnx",
+          "size": 1426069098,
+          "sha256": "fb85b44defdf43ace50c7a4937127e889b9f8a0483eb87a6c4151a815c5da3b5",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-1.7B-ONNX/resolve/main/onnx/model_q4f16.onnx",
+            "https://hf-mirror.com/onnx-community/Qwen3-1.7B-ONNX/resolve/main/onnx/model_q4f16.onnx"
+          ]
+        },
+        {
+          "rel_path": "llm/qwen3-1.7b/tokenizer.json",
+          "size": 9117040,
+          "sha256": "e7a95fce95bf5b0946d0ddb3f9d7caa030b7e850bbe92b0edb26bcf563e9f3d5",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-1.7B-ONNX/resolve/main/tokenizer.json",
+            "https://hf-mirror.com/onnx-community/Qwen3-1.7B-ONNX/resolve/main/tokenizer.json"
+          ]
+        },
+        {
+          "rel_path": "llm/qwen3-1.7b/config.json",
+          "size": 943,
+          "sha256": "d443f9cfc878a105bd075083230394623e477574e47061784744534361214d00",
+          "urls": [
+            "https://huggingface.co/onnx-community/Qwen3-1.7B-ONNX/resolve/main/config.json",
+            "https://hf-mirror.com/onnx-community/Qwen3-1.7B-ONNX/resolve/main/config.json"
+          ]
+        }
+      ]
+    }
+  ]
+}
