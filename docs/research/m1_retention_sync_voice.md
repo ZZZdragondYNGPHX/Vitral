@@ -2,7 +2,7 @@
 
 ## 本机输入与恢复
 
-拼音选词和手写确认共用 `RetentionEngine` 的 Frecency 词频衰减、置顶和擦除记录。Koofr 恢复先读取并解析配置、词频快照、CRDT 增量、导入词条和剪贴板历史，读取失败时返回错误。读取完成后，`VitralCore::restore_from_koofr` 在核心状态锁内应用数据。恢复剪贴板历史时清空本机 Quick Paste。Quick Paste 只存在于设备内存。
+拼音选词和手写确认共用 `RetentionEngine` 的 Frecency 词频衰减、置顶和擦除记录。从 Koofr WebDAV 恢复时，核心先读取并解析配置、词频快照、CRDT 增量、导入词条和剪贴板历史，读取失败时返回错误。读取完成后，`VitralCore::restore_from_koofr` 在核心状态锁内应用数据。恢复剪贴板历史时清空本机 Quick Paste。Quick Paste 只存在于设备内存。
 
 ## 语音输入
 
