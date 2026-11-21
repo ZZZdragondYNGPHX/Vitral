@@ -26,6 +26,7 @@ let clipboardEntries = [];
 let clipboardCapacity = 50;
 let clipboardLoaded = false;
 let confirmClearTimer = null;
+let confirmHabitsTimer = null;
 let recorderActive = false;
 let recordTimer = null;
 let recordStartedAt = 0;
@@ -441,6 +442,28 @@ function renderClipboard() {
 $("#clip-search").oninput = renderClipboard;
 
 // ================= ACTIONS =================
+function renderHabitStats(stats) {
+  const box = $("#habit-stats");
+  if (!box || !stats) return;
+  box.replaceChildren();
+  box.hidden = false;
+  const items = [
+    ["个人词频", `${stats.vocab_count || 0} 词 · ${stats.bigram_count || 0} 搭配`],
+    ["自造与识词", `${(stats.phrase_count || 0) + (stats.english_count || 0)} 项 · ${stats.app_count || 0} 应用`],
+    ["专属模型", `重排 ${stats.reranker_updates || 0} 次 · 语义记忆 ${stats.semantic_memory_count || 0} 条`],
+  ];
+  for (const [label, value] of items) {
+    const tile = document.createElement("div");
+    tile.className = "usage-tile";
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    tile.append(dt, dd);
+    box.append(tile);
+  }
+}
+
 function renderUsage(data) {
   const usage = $("#usage");
   usage.replaceChildren();
@@ -544,6 +567,23 @@ all("[data-action]").forEach(b => {
       b.textContent = "清空未置顶";
     }
 
+    // Two-step confirmation for clearing learned typing habits
+    if (cmd === "personalization-clear" && !b.classList.contains("is-confirming")) {
+      b.classList.add("is-confirming");
+      b.textContent = "再次点击确认清空";
+      clearTimeout(confirmHabitsTimer);
+      confirmHabitsTimer = setTimeout(() => {
+        b.classList.remove("is-confirming");
+        b.textContent = "清空习惯记忆";
+      }, 3500);
+      return;
+    }
+    if (cmd === "personalization-clear") {
+      clearTimeout(confirmHabitsTimer);
+      b.classList.remove("is-confirming");
+      b.textContent = "清空习惯记忆";
+    }
+
     if (cmd === "clipboard-state") {
       loadClipboard(false);
       return;
@@ -600,7 +640,16 @@ all("[data-action]").forEach(b => {
         return;
       }
 
-      if (cmd === "restore-from-koofr") {
+      if (cmd === "personalization-clear") {
+        renderHabitStats(data);
+        setNotice("已清空个人习惯记忆（置顶词已保留）", "ok");
+      } else if (cmd === "poll-services") {
+        try {
+          const usage = await api("storage");
+          renderUsage(usage);
+        } catch {}
+        setNotice("已完成与 Koofr 云端同步", "ok");
+      } else if (cmd === "restore-from-koofr") {
         setNotice(`已从云端恢复 ${data.snapshots_applied} 项数据`, "ok");
       } else if (cmd === "clipboard-clear-unpinned") {
         setNotice("已清空未置顶剪贴板记录", "ok");
@@ -947,8 +996,11 @@ if (invoke) {
   invoke("get_settings")
     .then(settings => {
       apply(settings);
-      api("is-pure-offline")
-        .then(() => updateEngineStatus(true))
+      api("personalization-stats")
+        .then(stats => {
+          updateEngineStatus(true);
+          renderHabitStats(stats);
+        })
         .catch(() => updateEngineStatus(false));
     })
     .catch(e => {

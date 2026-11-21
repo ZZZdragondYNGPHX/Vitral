@@ -327,9 +327,13 @@ impl VitralCore {
         if sync.dav_config != next {
             sync.cloud_ring_seen = false;
             sync.last_cleanup = None;
-            sync.backup_pending = false;
-            self.save_local("backup-pending.json", &false);
+            sync.backup_pending = next.is_some();
+            self.save_local("backup-pending.json", &sync.backup_pending);
             sync.clipboard_changes = Default::default();
+            if next.is_some() {
+                let cur = sync.clipboard.export_ring();
+                sync.clipboard_changes.record(&[], &cur);
+            }
             self.save_local("clipboard-changes.json", &sync.clipboard_changes);
             sync.dav_config = next;
         }
@@ -338,6 +342,8 @@ impl VitralCore {
         let active = &mut st.engine.config;
         active.shortcuts = cfg.shortcuts;
         active.linux_english_mode = cfg.linux_english_mode;
+        active.adaptive_learning = cfg.adaptive_learning;
+        active.learn_from_clipboard = cfg.learn_from_clipboard;
         active.schema = cfg.schema;
         active.opencc_mode = cfg.opencc_mode;
         active.clipboard_ring_capacity = cfg.clipboard_ring_capacity;
@@ -507,6 +513,9 @@ impl VitralCore {
             }
             let before_seq = st.retention.crdt_seq;
             let canonical = st.engine.canonical_at(index).map(str::to_string);
+            let code = st.engine.raw_input.clone();
+            let feedback = st.engine.selection_feedback(index);
+            let is_clipboard = st.engine.is_clipboard_candidate(index);
             let sync_st = self.sync.lock();
             let imported = self.imported_lexicon.read();
             let InputState {
@@ -520,10 +529,17 @@ impl VitralCore {
                 &imported,
                 retention,
             )?;
-            if let Some(ref rec_key) = canonical {
-                retention.record_selection(rec_key, 0.0, 0.001, 1.0);
-            } else if let Some(ref commit_text) = committed {
-                retention.record_selection(commit_text, 0.0, 0.001, 1.0);
+            if !is_clipboard {
+                if let Some(word) = committed.as_deref() {
+                    engine.record_candidate_commit(
+                        canonical.as_deref().unwrap_or(word),
+                        &code,
+                        feedback,
+                        &imported,
+                        retention,
+                        RetentionEngine::now_epoch_ms(),
+                    );
+                }
             }
             (
                 engine.empty_action(committed),
@@ -641,8 +657,18 @@ impl VitralCore {
         }
         let (payload, confirmed) = {
             let mut st = self.input.lock();
-            let InputState { hw, retention, .. } = &mut *st;
-            if hw.revision != revision { return Err(VitralError::InvalidArgument("handwriting changed during recognition".into())); }
+            let imported = self.imported_lexicon.read();
+            let InputState {
+                hw,
+                engine,
+                retention,
+                ..
+            } = &mut *st;
+            if hw.revision != revision {
+                return Err(VitralError::InvalidArgument(
+                    "handwriting changed during recognition".into(),
+                ));
+            }
             if !hw.confirmed_since_edit && !self.is_pure_offline() {
                 for (i,ch) in choices {
                     let slot=&mut hw.last_slots[i];
@@ -650,7 +676,10 @@ impl VitralCore {
                     slot.ch=ch;
                 }
             }
-            (hw.snapshot()?,hw.confirm_result(retention).is_some())
+            let snapshot = hw.snapshot()?;
+            let newly_confirmed = !hw.confirmed_since_edit;
+            let committed = Self::confirm_handwriting(hw, engine, retention, &imported);
+            (snapshot, newly_confirmed && committed.is_some())
         };
         if confirmed {
             self.sync_tier1_best_effort();
@@ -672,15 +701,59 @@ impl VitralCore {
         st.hw.override_slot(slot_idx, candidate_idx)
     }
 
+    fn confirm_handwriting(
+        hw: &mut HandwritingSession,
+        engine: &mut EngineState,
+        retention: &mut RetentionEngine,
+        imported: &ImportedLexiconIndex,
+    ) -> Option<String> {
+        let newly_confirmed = !hw.confirmed_since_edit;
+        let mut learned = RetentionEngine::default();
+        let committed = hw.confirm_result(&mut learned)?;
+        if newly_confirmed {
+            let code = engine.raw_input.clone();
+            engine.record_candidate_commit(
+                &committed,
+                &code,
+                None,
+                imported,
+                retention,
+                RetentionEngine::now_epoch_ms(),
+            );
+            // confirm_result also supplies the established 0.25 per-slot prior.
+            for (word, boost) in learned.frecency {
+                let slot_boost = if word == committed {
+                    boost - 1.0
+                } else {
+                    boost
+                };
+                if slot_boost > 0.0 {
+                    retention.record_selection_at(
+                        &word,
+                        RetentionEngine::now_epoch_ms(),
+                        slot_boost,
+                    );
+                }
+            }
+        }
+        Some(committed)
+    }
+
     pub fn hw_confirm(&self) -> Result<String, VitralError> {
-        let mut st = self.input.lock();
-        let InputState {
-            ref mut hw,
-            ref mut retention,
-            ..
-        } = *st;
-        hw.confirm_result(retention)
-            .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))
+        let committed = {
+            let mut st = self.input.lock();
+            let imported = self.imported_lexicon.read();
+            let InputState {
+                hw,
+                engine,
+                retention,
+                ..
+            } = &mut *st;
+            Self::confirm_handwriting(hw, engine, retention, &imported)
+                .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))?
+        };
+        self.sync_tier1_best_effort();
+        Ok(committed)
     }
 
     pub fn import_lexicon(
@@ -732,6 +805,7 @@ impl VitralCore {
     }
 
     fn clipboard_push_local(&self, mut payload: ClipboardPayload) -> ClipboardState {
+        let harvest = payload.clone();
         let mut sync = self.sync.lock();
         if payload.source_device.is_empty() {
             payload.source_device.clone_from(&sync.device_id);
@@ -742,6 +816,8 @@ impl VitralCore {
         let before = sync.clipboard.export_ring();
         let state = sync.clipboard.push(payload);
         self.record_clipboard_change(&mut sync, &before);
+        drop(sync);
+        self.harvest_clipboard_payload(&harvest);
         state
     }
 
@@ -750,11 +826,86 @@ impl VitralCore {
         payload: ClipboardPayload,
         is_cold_boot: bool,
     ) -> QuickPasteState {
+        let harvest = payload.clone();
         let mut sync_st = self.sync.lock();
         let state=sync_st.clipboard.ingest_remote(payload, is_cold_boot);
         self.save_local("clipboard-history.json",&sync_st.clipboard.export_ring());
         self.save_local("clipboard-current.json", sync_st.clipboard.current());
+        drop(sync_st);
+        self.harvest_clipboard_payload(&harvest);
         state
+    }
+
+    fn harvest_clipboard_payload(&self, payload: &ClipboardPayload) {
+        if !payload.mime_type.starts_with("text/plain") {
+            return;
+        }
+        let reset_ms = {
+            let st = self.input.lock();
+            if !st.engine.config.adaptive_learning || !st.engine.config.learn_from_clipboard {
+                return;
+            }
+            st.retention.learned_reset_ms
+        };
+        // Annotation may initialize a corpus; hold neither input nor sync while it runs.
+        let mut harvested = RetentionEngine::default();
+        harvested.harvest_clipboard_text(&payload.content, |phrase| {
+            let corpus = Arc::clone(self.imported_lexicon.read().corpus());
+            let ann = imp::polyphone::PolyphoneAnnotator::new(corpus).annotate_text(phrase);
+            (
+                ann.untoned.split_whitespace().collect(),
+                imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned),
+            )
+        });
+        if harvested.user_phrases.is_empty() && harvested.user_english.is_empty() {
+            return;
+        }
+        let changed = {
+            let mut st = self.input.lock();
+            if !st.engine.config.adaptive_learning
+                || !st.engine.config.learn_from_clipboard
+                || st.retention.learned_reset_ms != reset_ms
+            {
+                return;
+            }
+            let before = st.retention.crdt_seq;
+            st.retention
+                .harvest_clipboard_text(&payload.content, |word| {
+                    harvested
+                        .user_phrases
+                        .get(word)
+                        .map(|p| (p.quanpin.clone(), p.xiaohe.clone()))
+                        .unwrap_or_default()
+                });
+            st.retention.crdt_seq != before
+        };
+        if changed {
+            self.sync_tier1_best_effort();
+        }
+    }
+
+    pub fn personalization_stats(&self) -> ret::PersonalizationStats {
+        self.input.lock().retention.stats()
+    }
+
+    pub fn clear_learned_habits(&self) -> ret::PersonalizationStats {
+        let stats = {
+            let mut st = self.input.lock();
+            st.retention.clear_learned_habits();
+            st.engine.reset_commit_context();
+            let imported = self.imported_lexicon.read();
+            self.save_local(
+                "lexicon-state.json",
+                &LexiconSnapshotPayload {
+                    schema_version: 1,
+                    retention: st.retention.clone(),
+                    imported_entries: imported.export_entries(),
+                },
+            );
+            st.retention.stats()
+        };
+        self.sync_tier1_best_effort();
+        stats
     }
 
     pub fn clipboard_state(&self) -> ClipboardState {
@@ -993,12 +1144,9 @@ impl VitralCore {
             }
 
             if let Some(snap) = fetched.snapshot {
-                st.retention.frecency = snap.retention.frecency;
-                st.retention.frecency_updated_ms = snap.retention.frecency_updated_ms;
-                st.retention.pinned_words = snap.retention.pinned_words;
-                st.retention.erased_words = snap.retention.erased_words;
-                st.retention.set_half_life_sec(snap.retention.half_life_sec);
-                st.retention.crdt_seq = snap.retention.crdt_seq;
+                st.retention = snap.retention;
+                let half_life = st.retention.half_life_sec;
+                st.retention.set_half_life_sec(half_life);
                 imported.inject_hotwords(&snap.imported_entries);
             }
 
@@ -4093,7 +4241,16 @@ mod m1c_tests {
             let mut map = nodes.lock();
             match method.as_str() {
                 "MKCOL" => {
-                    map.entry(norm_path).or_insert(MockDavNode {
+                    if map.contains_key(&norm_path) {
+                        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    let parent = norm_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    if !map.get(parent).is_some_and(|n| n.is_dir) {
+                        let _ = stream.write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    map.insert(norm_path, MockDavNode {
                         is_dir: true,
                         data: Vec::new(),
                         mtime_secs: now_secs,
@@ -4103,6 +4260,11 @@ mod m1c_tests {
                     );
                 }
                 "PUT" => {
+                    let parent = norm_path.rsplit_once('/').map_or("", |(parent, _)| parent);
+                    if !map.get(parent).is_some_and(|n| n.is_dir) {
+                        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
                     let old = map.get(&norm_path).map(|n| format!("\"{}\"", crate::sync::sha256_hex(&n.data)));
                     if conditions.get("if-none-match").is_some_and(|v| v == "*" && old.is_some())
                         || conditions.get("if-match").is_some_and(|v| Some(v) != old.as_ref()) {
@@ -4215,6 +4377,201 @@ mod m1c_tests {
                 let _ = j.join();
             }
         }
+    }
+
+    #[test]
+    fn koofr_missing_collections_recover_from_put_404() {
+        for root_exists in [false, true] {
+            for path in [
+                "profile/config.json.enc",
+                "lexicon/crdt/device.json.enc",
+                "relay/file.enc",
+                "root-file.enc",
+                "clipboard/current.json.enc",
+                "clipboard/history_ring.jsonl.enc",
+            ] {
+                // OpenDAL can create missing children when its root already exists.
+                if root_exists && !path.starts_with("clipboard/") {
+                    continue;
+                }
+                let mock = InProcessWebDavMock::start();
+                mock.nodes.lock().retain(|path, _| {
+                    !path.starts_with("/dav/Koofr/Vitral")
+                        || (root_exists && path == "/dav/Koofr/Vitral")
+                });
+                let guard = OfflineGuard::new(false);
+                let cfg = DavConfig {
+                    endpoint: mock.koofr_endpoint(),
+                    sync_key: Some("missing-collections".into()),
+                    ..Default::default()
+                };
+                let client = dav::KoofrDavClient::connect(&guard, &cfg).unwrap();
+                let entry = clip::ClipboardEntry {
+                    id: "local-copy".into(),
+                    content: "local content".into(),
+                    mime_type: "text/plain".into(),
+                    source_device: "test".into(),
+                    timestamp_ms: 10,
+                    pinned: false,
+                    shortcut_code: None,
+                };
+                match path {
+                    "clipboard/current.json.enc" => {
+                        assert_eq!(
+                            dav::sync_current_copy(&guard, &cfg, Some(&entry)).unwrap(),
+                            Some(entry.clone())
+                        );
+                        assert_eq!(
+                            dav::sync_current_copy(&guard, &cfg, None).unwrap(),
+                            Some(entry)
+                        );
+                    }
+                    "clipboard/history_ring.jsonl.enc" => {
+                        let local = vec![entry];
+                        let mut changes = clip::RingChanges::default();
+                        changes.record(&[], &local);
+                        assert_eq!(
+                            dav::merge_clipboard_ring(&guard, &cfg, &changes, &local, 20).unwrap(),
+                            local
+                        );
+                        assert_eq!(
+                            dav::download_clipboard_ring(&guard, &cfg).unwrap(),
+                            Some(local)
+                        );
+                    }
+                    _ => {
+                        client.write_bytes(path, b"content").unwrap();
+                        assert_eq!(client.read_bytes(path).unwrap(), b"content");
+                    }
+                }
+                assert!(mock.exists(path), "missing uploaded {path}");
+                let log = mock.log();
+                let root_mkcol = log
+                    .iter()
+                    .position(|(method, path)| method == "MKCOL" && path == "/dav/Koofr/Vitral/")
+                    .unwrap();
+                if path.starts_with("clipboard/") {
+                    assert!(log[..root_mkcol].iter().any(|(method, url)| {
+                        method == "PUT" && url == &format!("/dav/Koofr/Vitral/{path}")
+                    }), "clipboard PUT must encounter the missing collection first");
+                }
+                let mut prefix = String::from("/dav/Koofr/Vitral");
+                let mut previous = root_mkcol;
+                if let Some((parent, _)) = path.rsplit_once('/') {
+                    for segment in parent.split('/') {
+                        prefix.push('/');
+                        prefix.push_str(segment);
+                        let position = log
+                            .iter()
+                            .enumerate()
+                            .find(|(i, (method, path))| {
+                                *i > previous && method == "MKCOL" && path == &format!("{prefix}/")
+                            })
+                            .map(|(i, _)| i)
+                            .unwrap();
+                        previous = position;
+                    }
+                }
+                assert!(log.iter().skip(previous + 1).any(
+                    |(method, url)| method == "PUT" && url == &format!("/dav/Koofr/Vitral/{path}")
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn apply_preferences_schedules_initial_koofr_sync() {
+        let mock = InProcessWebDavMock::start();
+        let dir = std::env::temp_dir().join(format!("vitral-koofr-preferences-{}", std::process::id()));
+        let mut cfg = EngineConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            assets_dir: "/nonexistent-vitral-assets".into(),
+            background_sync: true,
+            ..Default::default()
+        };
+        let core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let local = core
+            .clipboard_push_local(ClipboardPayload {
+                id: Some("before-configuring-koofr".into()),
+                content: "local history".into(),
+                mime_type: "text/plain".into(),
+                source_device: "test".into(),
+                timestamp_ms: 20,
+            })
+            .ring;
+        let cloud = clip::ClipboardEntry {
+            id: "cloud-copy".into(),
+            timestamp_ms: 10,
+            ..local[0].clone()
+        };
+        let cloud_bytes = crate::sync::encode_clipboard_ring_jsonl(&[cloud.clone()]).unwrap();
+        mock.write_file(
+            "clipboard/history_ring.jsonl.enc",
+            &encrypt_envelope(&cloud_bytes, None).unwrap(),
+            10,
+        );
+
+        cfg.koofr_endpoint = Some(mock.koofr_endpoint());
+        core.apply_preferences(cfg.clone()).unwrap();
+        assert_eq!(
+            local::load::<bool>(&dir, "backup-pending.json").unwrap(),
+            Some(true)
+        );
+        let changes = local::load::<clip::RingChanges>(&dir, "clipboard-changes.json")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changes.merge(vec![cloud.clone()], &local, 20),
+            vec![local[0].clone(), cloud.clone()]
+        );
+        assert!(
+            mock.log().is_empty(),
+            "saving preferences should schedule synchronization"
+        );
+        drop(core);
+
+        // Pending uploads must survive a restart before the service queue runs.
+        let core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        core.poll_services().unwrap();
+        for path in [
+            "profile/config.json.enc",
+            "lexicon/snapshot.zst.enc",
+            "clipboard/current.json.enc",
+        ] {
+            assert!(mock.exists(path), "initial synchronization missed {path}");
+        }
+        let dav_cfg = DavConfig::from_engine_config(&cfg).unwrap();
+        assert_eq!(
+            dav::download_clipboard_ring(&core.offline_guard, &dav_cfg).unwrap(),
+            Some(vec![local[0].clone(), cloud])
+        );
+        assert_eq!(
+            local::load::<bool>(&dir, "backup-pending.json").unwrap(),
+            Some(false)
+        );
+        assert!(
+            local::load::<clip::RingChanges>(&dir, "clipboard-changes.json")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+
+        cfg.koofr_endpoint = None;
+        core.apply_preferences(cfg).unwrap();
+        assert!(!core.sync.lock().backup_pending);
+        assert!(core.sync.lock().clipboard_changes.is_empty());
+        assert_eq!(
+            local::load::<bool>(&dir, "backup-pending.json").unwrap(),
+            Some(false)
+        );
+        assert!(
+            local::load::<clip::RingChanges>(&dir, "clipboard-changes.json")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -5649,5 +6006,109 @@ mod m1c_tests {
         assert!(res2.restored);
         assert_eq!(res2.snapshots_applied, 2); // crdt_b_2 + 02_imp
         assert!(dev_restore2.imported_lexicon().read().lookup_word_score("导入词乙").is_some());
+    }
+}
+
+#[cfg(test)]
+mod personalization_tests {
+    use super::*;
+
+    #[test]
+    fn phase3_click_feedback_survives_backend_clear_and_context_reset() {
+        let core = VitralCore::init(r#"{"schema":"rime_ice","pure_offline":true}"#).unwrap();
+        let type_code = |code: &str| {
+            let mut action = core.candidate_state().unwrap();
+            for ch in code.chars() { action = core.process_key(ch as u32, 0, SwipeDir::None).unwrap(); }
+            action
+        };
+        type_code("xiangmu");
+        core.select_candidate(0).unwrap();
+        let candidates = type_code("shuru");
+        let target = candidates.candidates[1].text.clone();
+        let expected = {
+            let st = core.input.lock();
+            let (chosen, skipped) = st.engine.selection_feedback(1).unwrap();
+            let mut model = st.retention.reranker.clone();
+            assert!(model.update_pairwise(&chosen, &skipped.unwrap(), RetentionEngine::now_epoch_ms()));
+            model.weights
+        };
+        assert_eq!(core.select_candidate(1).unwrap().commit_text.as_deref(), Some(target.as_str()));
+        {
+            let st = core.input.lock();
+            assert_eq!(st.retention.reranker.weights, expected);
+            assert_eq!(st.retention.reranker.updates, 1);
+            assert_eq!(st.retention.semantic_memories.len(), 1);
+            assert!(st.engine.candidate_features.is_empty());
+        }
+        let cleared = core.clear_learned_habits();
+        assert_eq!(cleared.reranker_updates, 0);
+        assert_eq!(cleared.semantic_memory_count, 0);
+        type_code("shuru");
+        core.select_candidate(0).unwrap();
+        assert_eq!(core.personalization_stats().semantic_memory_count, 0);
+    }
+
+    #[test]
+    fn clipboard_preferences_commands_and_persisted_clear() {
+        struct TempData(std::path::PathBuf);
+        impl Drop for TempData {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let data = TempData(std::env::temp_dir().join(format!(
+            "vitral-personalization-{}-{}",
+            std::process::id(),
+            RetentionEngine::now_epoch_ms()
+        )));
+        let cfg = serde_json::json!({"pure_offline":true,"data_dir":data.0,"assets_dir":"/nonexistent-vitral-assets"});
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        let payload = |text: &str| ClipboardPayload {
+            id: None,
+            content: text.into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 0,
+        };
+        core.clipboard_push_local(payload("你好 OpenAI"));
+        core.clipboard_ingest_remote(payload("中国 Vitral"), false);
+        assert!(core.personalization_stats().phrase_count >= 2);
+        assert_eq!(core.personalization_stats().english_count, 2);
+        let mut preferences = cfg.clone();
+        preferences["learn_from_clipboard"] = serde_json::json!(false);
+        core.apply_preferences(EngineConfig::parse_json(&preferences.to_string()).unwrap())
+            .unwrap();
+        core.clipboard_push_local(payload("学习 RustLang"));
+        assert!(!core
+            .input
+            .lock()
+            .retention
+            .user_phrases
+            .contains_key("学习"));
+        assert!(core
+            .input
+            .lock()
+            .retention
+            .query_user_english("rustlang")
+            .is_none());
+        {
+            let mut st = core.input.lock();
+            st.retention.pin_word("保留");
+            st.retention.erase_word("删除");
+        }
+        let stats =
+            commands::execute(&core, "personalization-stats", &serde_json::json!({})).unwrap();
+        assert_eq!(stats["english_count"], 2);
+        let cleared =
+            commands::execute(&core, "personalization-clear", &serde_json::json!({})).unwrap();
+        assert_eq!(cleared["phrase_count"], 0);
+        assert_eq!(cleared["pinned_count"], 1);
+        assert_eq!(cleared["erased_count"], 1);
+        assert!(data.0.join("lexicon-state.json").is_file());
+        drop(core);
+        let restored = VitralCore::init(&cfg.to_string()).unwrap();
+        assert_eq!(restored.personalization_stats().vocab_count, 0);
+        assert_eq!(restored.personalization_stats().english_count, 0);
+        assert_eq!(restored.personalization_stats().pinned_count, 1);
     }
 }

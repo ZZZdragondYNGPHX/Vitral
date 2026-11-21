@@ -73,6 +73,10 @@ pub struct EngineConfig {
     pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
     #[serde(default = "default_enabled")]
     pub linux_english_mode: bool,
+    #[serde(default = "default_enabled")]
+    pub adaptive_learning: bool,
+    #[serde(default = "default_enabled")]
+    pub learn_from_clipboard: bool,
     #[serde(default)]
     pub data_dir: String,
     #[serde(default)]
@@ -206,6 +210,8 @@ impl Default for EngineConfig {
         Self {
             shortcuts: crate::shortcuts::defaults(),
             linux_english_mode: true,
+            adaptive_learning: true,
+            learn_from_clipboard: true,
             data_dir: String::new(),
             cache_dir: String::new(),
             assets_dir: String::new(),
@@ -309,23 +315,42 @@ pub fn resolve_assets_dir(configured: &str) -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 enum CandidateOrigin {
     Overlay {
+        features: [f64; 9],
         canonical: String,
         commit_text: String,
         is_clipboard: bool,
     },
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
     Rime {
+        features: [f64; 9],
         canonical: String,
         commit_text: String,
         rime_page_idx: usize,
     },
     PureRust {
+        features: [f64; 9],
         canonical: String,
         commit_text: String,
     },
 }
 
 impl CandidateOrigin {
+    fn features(&self) -> &[f64; 9] {
+        match self {
+            Self::Overlay { features, .. } | Self::PureRust { features, .. } => features,
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            Self::Rime { features, .. } => features,
+        }
+    }
+
+    fn set_features(&mut self, value: [f64; 9]) {
+        match self {
+            Self::Overlay { features, .. } | Self::PureRust { features, .. } => *features = value,
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            Self::Rime { features, .. } => *features = value,
+        }
+    }
+
     fn canonical(&self) -> &str {
         match self {
             CandidateOrigin::Overlay { canonical, .. }
@@ -343,6 +368,17 @@ pub struct EngineState {
     pub opencc_mode: OpenCcMode,
     pub lang_mode: LangMode,
     pub active_app_id: Option<String>,
+    pub last_committed_word: Option<String>,
+    pub last_committed_code: Option<String>,
+    pub last_committed_ms: u64,
+    pub last_committed_char: Option<char>,
+    pub regret_backspaces: usize,
+    last_commit_context: Option<String>,
+    context_window: Vec<char>,
+    cached_context_vec: Option<[i8; 32]>,
+    cached_mlm_priors: HashMap<char, f32>,
+    pub(crate) candidate_features: Vec<[f64; 9]>,
+    last_commit_features: Option<[f64; 9]>,
     pub app_lang_memory: HashMap<String, LangMode>,
     pub composing: String,
     pub raw_input: String,
@@ -416,6 +452,17 @@ impl EngineState {
             config,
             lang_mode: LangMode::Zh,
             active_app_id: None,
+            last_committed_word: None,
+            last_committed_code: None,
+            last_committed_ms: 0,
+            last_committed_char: None,
+            regret_backspaces: 0,
+            last_commit_context: None,
+            context_window: Vec::new(),
+            cached_context_vec: None,
+            cached_mlm_priors: HashMap::new(),
+            candidate_features: Vec::new(),
+            last_commit_features: None,
             app_lang_memory: HashMap::new(),
             composing: String::new(),
             raw_input: String::new(),
@@ -458,6 +505,269 @@ impl EngineState {
         self.process_key_pure_rust(0, clipboard, imported, retention)
     }
 
+    pub(crate) fn reset_commit_context(&mut self) {
+        self.context_window.clear();
+        self.cached_context_vec = None;
+        self.cached_mlm_priors.clear();
+        self.last_commit_features = None;
+        self.last_committed_word = None;
+        self.last_committed_code = None;
+        self.last_commit_context = None;
+        self.regret_backspaces = 0;
+    }
+
+    fn previous_context(&self, now_ms: u64) -> Option<&str> {
+        (now_ms.saturating_sub(self.last_committed_ms) <= 6000)
+            .then_some(self.last_committed_word.as_deref())
+            .flatten()
+    }
+
+    pub(crate) fn is_clipboard_candidate(&self, index: usize) -> bool {
+        matches!(
+            self.candidate_origins.get(index),
+            Some(CandidateOrigin::Overlay {
+                is_clipboard: true,
+                ..
+            })
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_candidate_commit(
+        &mut self,
+        canonical: &str,
+        code: &str,
+        feedback: Option<([f64; 9], Option<[f64; 9]>)>,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+        now_ms: u64,
+    ) {
+        let prev = self.previous_context(now_ms).map(str::to_string);
+        let correction = self.config.adaptive_learning
+            && self.regret_backspaces > 0
+            && self.last_committed_code.as_deref() == Some(code)
+            && self
+                .last_committed_word
+                .as_deref()
+                .is_some_and(|w| w != canonical)
+            && now_ms.saturating_sub(self.last_committed_ms) <= 6000;
+        let chosen = feedback.map(|f| f.0).unwrap_or_else(|| {
+            retention.extract_candidate_features(
+                canonical,
+                code,
+                prev.as_deref(),
+                self.active_app_id.as_deref(),
+                now_ms,
+                self.config.adaptive_learning,
+                self.cached_context_vec.as_ref(),
+                Some(&self.cached_mlm_priors),
+                None,
+            )
+        });
+        if self.config.adaptive_learning {
+            let skipped = if correction {
+                self.last_commit_features
+            } else {
+                feedback.and_then(|f| f.1)
+            };
+            if let Some(skipped) = skipped {
+                retention.update_reranker_pairwise(&chosen, &skipped, now_ms);
+            }
+            if !canonical.is_empty() && canonical.chars().all(crate::ret::is_cjk) {
+                if let Some(vector) = self.cached_context_vec {
+                    retention.record_semantic_memory(
+                        vector,
+                        canonical,
+                        self.active_app_id.as_deref(),
+                        now_ms,
+                    );
+                }
+            }
+        }
+        if correction {
+            retention.record_correction(
+                code,
+                self.last_committed_word.as_deref().unwrap(),
+                canonical,
+                self.last_commit_context.as_deref(),
+                self.active_app_id.as_deref(),
+                now_ms,
+            );
+        } else {
+            retention.record_contextual_selection(
+                canonical,
+                code,
+                prev.as_deref(),
+                self.active_app_id.as_deref(),
+                now_ms,
+                1.0,
+                self.config.adaptive_learning,
+            );
+            if self.config.adaptive_learning
+                && self.regret_backspaces == 0
+                && now_ms.saturating_sub(self.last_committed_ms) <= 4500
+            {
+                if let Some(previous) = prev.as_deref() {
+                    let combined = format!("{previous}{canonical}");
+                    if (2..=6).contains(&combined.chars().count())
+                        && combined.chars().all(crate::ret::is_cjk)
+                    {
+                        let ann = crate::imp::polyphone::PolyphoneAnnotator::new(
+                            std::sync::Arc::clone(imported.corpus()),
+                        )
+                        .annotate_text(&combined);
+                        let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
+                        retention.observe_phrase_composition(
+                            &combined,
+                            &xiaohe,
+                            &ann.untoned,
+                            now_ms,
+                        );
+                    }
+                }
+            }
+        }
+        if self.config.adaptive_learning
+            && (2..=6).contains(&canonical.chars().count())
+            && canonical.chars().all(crate::ret::is_cjk)
+            && (retention.frecency.get(canonical).copied().unwrap_or(0.0) >= 2.0
+                || retention.pinned_words.contains(canonical))
+            && !retention
+                .user_phrases
+                .get(canonical)
+                .is_some_and(|p| p.source == "typed")
+        {
+            let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
+                imported.corpus(),
+            ))
+            .annotate_text(canonical);
+            let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
+            retention.register_typed_phrase(canonical, &ann.untoned, &xiaohe, now_ms);
+        }
+        if !correction {
+            self.last_commit_context = prev;
+        }
+        self.last_committed_word = Some(canonical.to_string());
+        self.last_committed_code = Some(code.to_string());
+        self.last_committed_ms = now_ms;
+        self.regret_backspaces = 0;
+        if !canonical.is_empty() && canonical.chars().all(crate::ret::is_cjk) {
+            self.context_window.extend(canonical.chars());
+            if self.context_window.len() > 16 {
+                self.context_window.drain(..self.context_window.len() - 16);
+            }
+            self.refresh_semantic_context();
+            self.last_commit_features = Some(chosen);
+        } else {
+            self.reset_commit_context();
+        }
+    }
+
+    fn learn_current_candidate(
+        &mut self,
+        canonical: &str,
+        selected_index: usize,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) {
+        let code = self.raw_input.clone();
+        self.record_candidate_commit(
+            canonical,
+            &code,
+            self.selection_feedback(selected_index),
+            imported,
+            retention,
+            RetentionEngine::now_epoch_ms(),
+        );
+    }
+
+    pub(crate) fn selection_feedback(&self, index: usize) -> Option<([f64; 9], Option<[f64; 9]>)> {
+        self.candidate_features.get(index).copied().map(|chosen| {
+            let skipped = (index > 0 && !self.is_clipboard_candidate(0))
+                .then(|| self.candidate_features.first().copied())
+                .flatten();
+            (chosen, skipped)
+        })
+    }
+
+    fn refresh_semantic_context(&mut self) {
+        self.cached_context_vec = None;
+        self.cached_mlm_priors.clear();
+        if !self.config.adaptive_learning || self.context_window.is_empty() {
+            return;
+        }
+        if self.resolved_assets_dir.is_some() && self.context_window.len() >= 2 {
+            let bundle = crate::hw::onnx_models::HwOnnxBundle::load_cached(
+                self.resolved_assets_dir.as_deref(),
+            );
+            if bundle.has_reranker_onnx() {
+                if let Some((vector, priors)) = bundle.encode_rbt3_context(&self.context_window) {
+                    self.cached_context_vec = Some(vector);
+                    self.cached_mlm_priors = priors;
+                    return;
+                }
+            }
+        }
+        self.cached_context_vec = Some(RetentionEngine::project_context_fallback(
+            &self.context_window.iter().collect::<String>(),
+        ));
+    }
+
+    fn features_for(
+        &self,
+        retention: &RetentionEngine,
+        word: &str,
+        now_ms: u64,
+        rank: Option<usize>,
+    ) -> [f64; 9] {
+        retention.extract_candidate_features(
+            word,
+            &self.raw_input,
+            self.previous_context(now_ms),
+            self.active_app_id.as_deref(),
+            now_ms,
+            self.config.adaptive_learning,
+            self.cached_context_vec.as_ref(),
+            Some(&self.cached_mlm_priors),
+            rank,
+        )
+    }
+
+    fn contextual_score(&self, retention: &RetentionEngine, word: &str, now_ms: u64) -> f64 {
+        retention.score_candidate_features(
+            &self.features_for(retention, word, now_ms, None),
+            self.config.adaptive_learning,
+        )
+    }
+
+    fn score_pair(
+        &self,
+        item: &mut CandidateItem,
+        origin: &mut CandidateOrigin,
+        retention: &RetentionEngine,
+        now_ms: u64,
+        rank: usize,
+    ) {
+        if matches!(
+            origin,
+            CandidateOrigin::Overlay {
+                is_clipboard: true,
+                ..
+            }
+        ) {
+            return;
+        }
+        let features = self.features_for(retention, origin.canonical(), now_ms, Some(rank));
+        let score = retention.score_candidate_features(&features, self.config.adaptive_learning);
+        if matches!(origin, CandidateOrigin::Overlay { .. }) {
+            item.frecency_score +=
+                score - self.contextual_score(retention, origin.canonical(), now_ms);
+        } else {
+            item.frecency_score = score;
+        }
+        origin.set_features(features);
+    }
+
     pub(crate) fn canonical_at(&self, index: usize) -> Option<&str> {
         self.candidate_origins.get(index).map(CandidateOrigin::canonical)
     }
@@ -473,6 +783,7 @@ impl EngineState {
         self.cursor_utf8 = 0;
         self.current_candidates.clear();
         self.candidate_origins.clear();
+        self.candidate_features.clear();
         self.current_page.page_index = 0;
         self.current_page.has_prev = false;
         self.current_page.has_next = false;
@@ -495,6 +806,10 @@ impl EngineState {
     pub fn on_app_focus(&mut self, app_id: &str) -> Result<AppFocusState, VitralError> {
         if app_id.trim().is_empty() {
             return Err(VitralError::InvalidArgument("app_id cannot be empty".into()));
+        }
+        if self.active_app_id.as_deref() != Some(app_id) {
+            self.reset_commit_context();
+            self.last_committed_char = None;
         }
         let prev_lang = self.lang_mode;
         self.active_app_id = Some(app_id.to_string());
@@ -641,6 +956,30 @@ impl EngineState {
             0xff1b => 0x1b,
             _ => keycode,
         };
+        let now_ms = RetentionEngine::now_epoch_ms();
+        if keycode == 0x1b {
+            self.reset_commit_context();
+            self.last_committed_char = None;
+        }
+        if keycode == 0x08
+            && self.raw_input.is_empty()
+            && self.last_committed_word.is_some()
+            && now_ms.saturating_sub(self.last_committed_ms) <= 5000
+        {
+            self.regret_backspaces = self.regret_backspaces.saturating_add(1);
+        }
+        if keycode == 0x0d {
+            if self.config.adaptive_learning {
+                retention.record_english_casing(&self.raw_input);
+            }
+            self.reset_commit_context();
+        }
+        if char::from_u32(keycode).is_some_and(|c| {
+            !c.is_control() && !c.is_ascii_alphanumeric() && c != '\'' && !crate::ret::is_cjk(c)
+        }) && (keycode != 0x20 || self.raw_input.is_empty())
+        {
+            self.reset_commit_context();
+        }
         if modifiers & MOD_LANG_TOGGLE != 0 {
             self.toggle_lang_mode();
             return Ok(self.empty_action(None));
@@ -689,6 +1028,13 @@ impl EngineState {
                 }
             }
             return Ok(self.empty_action(None));
+        }
+
+        if self.raw_input.is_empty() && self.composing.is_empty()
+            && matches!(keycode, 0x2e | 0x3a)
+            && self.last_committed_char.is_some_and(|c| c.is_ascii_digit())
+        {
+            return Ok(self.empty_action(char::from_u32(keycode).map(|c| c.to_string())));
         }
 
         if let Some(act) = self.handle_passthrough_or_paired_punct(keycode)? {
@@ -776,6 +1122,7 @@ impl EngineState {
             frecency_score: 0.0,
         };
         let origin = CandidateOrigin::Overlay {
+            features: [0.0; 9],
             canonical: token.clone(),
             commit_text: token,
             is_clipboard: true,
@@ -968,7 +1315,7 @@ impl EngineState {
             .filter(|(_, c)| !retention.erased_words.contains(&c.text) && imported.matches_reading(&c.text, &self.raw_input, self.schema == SchemaKind::DoublePinyinFlypy))
             .map(|(rime_idx, c)| {
                 let converted = self.convert_opencc(&c.text);
-                let frec = retention.decayed_score_at(&c.text, now_ms);
+                let frec = self.contextual_score(retention, &c.text, now_ms);
                 let pinned = retention.pinned_words.contains(&c.text);
                 let item = CandidateItem {
                     index: 0,
@@ -982,6 +1329,7 @@ impl EngineState {
                     frecency_score: frec,
                 };
                 let origin = CandidateOrigin::Rime {
+                    features: [0.0; 9],
                     canonical: c.text,
                     commit_text: converted,
                     rime_page_idx: rime_idx,
@@ -990,9 +1338,43 @@ impl EngineState {
             })
             .collect();
 
+        for (item, origin, rank) in &mut base_pairs {
+            self.score_pair(item, origin, retention, now_ms, *rank / 2);
+        }
         if snap.page_index == 0 {
             let (mut priority_overlay, mut seen) =
                 self.build_overlay_candidates(clipboard, imported, retention, true);
+            // Learned full readings share Frecency ranking with native alternatives.
+            // Automatically registered dictionary words must not become permanent
+            // priority overlays merely because they were selected twice.
+            priority_overlay.retain(|(item, origin)| {
+                if matches!(item.comment.as_str(), "习惯" | "剪贴板") {
+                    seen.remove(&item.text);
+                    let rank = base_pairs.len() * 2;
+                    base_pairs.push((item.clone(), origin.clone(), rank));
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some((mut item, mut origin)) = self.recover_transposition(
+                base_pairs
+                    .iter()
+                    .map(|(_, origin, _)| origin.canonical())
+                    .chain(
+                        priority_overlay
+                            .iter()
+                            .map(|(_, origin)| origin.canonical()),
+                    ),
+                imported,
+                retention,
+            ) {
+                self.score_pair(&mut item, &mut origin, retention, now_ms, 0);
+                base_pairs.retain(|(_, other, _)| other.canonical() != origin.canonical());
+                priority_overlay.retain(|(_, other)| other.canonical() != origin.canonical());
+                seen.insert(item.text.clone());
+                priority_overlay.push((item, origin));
+            }
 
             // Inject retention-boosted / pinned PureRust matches on page 0 so Mode-2 HW
             // confirmations (e.g. "手写中文") participate in shared Frecency ranking, and
@@ -1014,19 +1396,22 @@ impl EngineState {
             {
                 let mut seen_base: HashSet<String> =
                     base_pairs.iter().map(|(it, _, _)| it.text.clone()).collect();
-                let pr = self.pure_rust.query_all_candidates_with_canonical(
+                let pr = self.pure_rust.query_all_candidates_contextual(
                     &self.raw_input,
                     self.schema,
                     OpenCcMode::Simplified,
                     Some(imported),
                     Some(retention),
+                    self.previous_context(RetentionEngine::now_epoch_ms()),
+                    self.active_app_id.as_deref(),
+                    self.config.adaptive_learning,
                 );
                 let mut added_full_alt = 0usize;
                 for (offset, (pr_item, canonical)) in pr.into_iter().enumerate() {
                     if retention.erased_words.contains(&canonical) {
                         continue;
                     }
-                    let frec = retention.decayed_score_at(&canonical, now_ms);
+                    let frec = self.contextual_score(retention, &canonical, now_ms);
                     let pinned = retention.pinned_words.contains(&canonical);
                     let is_full_alt =
                         need_full_span_alt && added_full_alt == 0 && canonical.chars().count() >= max_rime_len;
@@ -1049,6 +1434,7 @@ impl EngineState {
                         frecency_score: frec,
                     };
                     let origin = CandidateOrigin::PureRust {
+                        features: [0.0; 9],
                         canonical,
                         commit_text: converted,
                     };
@@ -1102,9 +1488,10 @@ impl EngineState {
                                 quick_paste_id: None,
                                 function_action: None,
                                 shortcut_code: None,
-                                frecency_score: retention.decayed_score_at(&word, now_ms),
+                                frecency_score: self.contextual_score(retention, &word, now_ms),
                             },
                             CandidateOrigin::PureRust {
+                                features: [0.0; 9],
                                 canonical: word,
                                 commit_text: text,
                             },
@@ -1153,6 +1540,11 @@ impl EngineState {
                 }
             }
 
+            for (item, origin, rank) in &mut base_pairs {
+                if *origin.features() == [0.0; 9] {
+                    self.score_pair(item, origin, retention, now_ms, *rank);
+                }
+            }
             let mut pinned_base = Vec::new();
             let mut normal_base = Vec::new();
             for pair in base_pairs.drain(..) {
@@ -1164,12 +1556,19 @@ impl EngineState {
             }
             pinned_base.sort_by(|a, b| {
                 b.0.frecency_score
-                    .total_cmp(&a.0.frecency_score)
+                    .max(0.0)
+                    .total_cmp(&a.0.frecency_score.max(0.0))
                     .then_with(|| a.2.cmp(&b.2))
             });
             normal_base.sort_by(|a, b| {
-                full_span.contains(b.1.canonical()).cmp(&full_span.contains(a.1.canonical()))
-                    .then_with(|| b.0.frecency_score.total_cmp(&a.0.frecency_score))
+                full_span
+                    .contains(b.1.canonical())
+                    .cmp(&full_span.contains(a.1.canonical()))
+                    .then_with(|| {
+                        b.0.frecency_score
+                            .max(0.0)
+                            .total_cmp(&a.0.frecency_score.max(0.0))
+                    })
                     .then_with(|| a.2.cmp(&b.2))
             });
 
@@ -1196,12 +1595,14 @@ impl EngineState {
             }
             pinned_base.sort_by(|a, b| {
                 b.0.frecency_score
-                    .total_cmp(&a.0.frecency_score)
+                    .max(0.0)
+                    .total_cmp(&a.0.frecency_score.max(0.0))
                     .then_with(|| a.2.cmp(&b.2))
             });
             normal_base.sort_by(|a, b| {
                 b.0.frecency_score
-                    .total_cmp(&a.0.frecency_score)
+                    .max(0.0)
+                    .total_cmp(&a.0.frecency_score.max(0.0))
                     .then_with(|| a.2.cmp(&b.2))
             });
             let ordered: Vec<(CandidateItem, CandidateOrigin)> = pinned_base
@@ -1237,8 +1638,10 @@ impl EngineState {
     fn set_current_candidates(&mut self, pairs: Vec<(CandidateItem, CandidateOrigin)>) {
         self.current_candidates.clear();
         self.candidate_origins.clear();
+        self.candidate_features.clear();
         for (i, (mut item, orig)) in pairs.into_iter().enumerate() {
             item.index = i;
+            self.candidate_features.push(*orig.features());
             self.current_candidates.push(item);
             self.candidate_origins.push(orig);
         }
@@ -1289,9 +1692,10 @@ impl EngineState {
                         canonical,
                         commit_text,
                         is_clipboard,
+                        ..
                     } => {
                         if !is_clipboard {
-                            retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                            self.learn_current_candidate(&canonical, 0, imported, retention);
                         }
                         let prefix = self.confirmed_non_ascii_prefix();
                         let final_commit = if !is_clipboard && !prefix.is_empty() {
@@ -1305,8 +1709,9 @@ impl EngineState {
                     CandidateOrigin::PureRust {
                         canonical,
                         commit_text,
+                        ..
                     } => {
-                        retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                        self.learn_current_candidate(&canonical, 0, imported, retention);
                         let prefix = self.confirmed_non_ascii_prefix();
                         let final_commit = if !prefix.is_empty() {
                             format!("{}{}", self.convert_opencc(&prefix), commit_text)
@@ -1327,7 +1732,7 @@ impl EngineState {
                             &self.config.data_dir,
                             |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
                         )?;
-                        retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                        self.learn_current_candidate(&canonical, 0, imported, retention);
                         return Ok(self.apply_rime_snapshot(
                             snap, is_return, false, clipboard, imported, retention,
                         ));
@@ -1349,9 +1754,15 @@ impl EngineState {
                                     canonical,
                                     commit_text,
                                     is_clipboard,
+                                    ..
                                 } => {
                                     if !is_clipboard {
-                                        retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                                        self.learn_current_candidate(
+                                            &canonical,
+                                            digit - 1,
+                                            imported,
+                                            retention,
+                                        );
                                     }
                                     let prefix = self.confirmed_non_ascii_prefix();
                                     let final_commit = if !is_clipboard && !prefix.is_empty() {
@@ -1373,7 +1784,12 @@ impl EngineState {
                                         &self.config.data_dir,
                                         |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
                                     )?;
-                                    retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                                    self.learn_current_candidate(
+                                        &canonical,
+                                        digit - 1,
+                                        imported,
+                                        retention,
+                                    );
                                     return Ok(self.apply_rime_snapshot(
                                         snap, false, false, clipboard, imported, retention,
                                     ));
@@ -1381,8 +1797,14 @@ impl EngineState {
                                 CandidateOrigin::PureRust {
                                     canonical,
                                     commit_text,
+                                    ..
                                 } => {
-                                    retention.record_selection(&canonical, 0.0, 0.001, 1.0);
+                                    self.learn_current_candidate(
+                                        &canonical,
+                                        digit - 1,
+                                        imported,
+                                        retention,
+                                    );
                                     let prefix = self.confirmed_non_ascii_prefix();
                                     let final_commit = if !prefix.is_empty() {
                                         format!("{}{}", self.convert_opencc(&prefix), commit_text)
@@ -1468,7 +1890,7 @@ impl EngineState {
                         }
                     );
                     if !is_clip {
-                        retention.record_selection(origin.canonical(), 0.0, 0.001, 1.0);
+                        self.learn_current_candidate(origin.canonical(), 0, imported, retention);
                     }
                 }
                 let commit = self
@@ -1513,7 +1935,12 @@ impl EngineState {
                                 }
                             );
                             if !is_clip {
-                                retention.record_selection(origin.canonical(), 0.0, 0.001, 1.0);
+                                self.learn_current_candidate(
+                                    origin.canonical(),
+                                    digit - 1,
+                                    imported,
+                                    retention,
+                                );
                             }
                         }
                         self.clear_composition_state();
@@ -1521,7 +1948,12 @@ impl EngineState {
                     }
                 }
             } else if !ch.is_control() && self.raw_input.is_empty() {
-                return Ok(self.empty_action(Some(ch.to_string())));
+                let text = match ch {
+                    '.' => "。".into(),
+                    ':' => "：".into(),
+                    _ => ch.to_string(),
+                };
+                return Ok(self.empty_action(Some(text)));
             }
         }
 
@@ -1530,29 +1962,80 @@ impl EngineState {
             return Ok(self.empty_action(None));
         }
 
-        let base_pairs = self.pure_rust.query_all_candidates_with_canonical(
+        let base_pairs = self.pure_rust.query_all_candidates_contextual(
             &self.raw_input,
             self.schema,
             self.opencc_mode,
             Some(imported),
             Some(retention),
+            self.previous_context(RetentionEngine::now_epoch_ms()),
+            self.active_app_id.as_deref(),
+            self.config.adaptive_learning,
         );
 
         let (mut merged, mut seen) =
             self.build_overlay_candidates(clipboard, imported, retention, false);
-        for (item, canonical) in base_pairs {
+        let now_ms = RetentionEngine::now_epoch_ms();
+        for (base_rank, (item, canonical)) in base_pairs.into_iter().enumerate() {
             let converted = self.convert_opencc(&canonical);
             if seen.insert(converted.clone()) {
                 let mut item = item;
                 item.text = converted.clone();
                 let origin = CandidateOrigin::PureRust {
+                    features: [0.0; 9],
                     canonical,
                     commit_text: converted,
                 };
+                let mut origin = origin;
+                self.score_pair(&mut item, &mut origin, retention, now_ms, base_rank);
                 merged.push((item, origin));
             }
         }
 
+        merged.sort_by(|a, b| {
+            // Negative personal scores remove a boost; dictionary order remains the tie-breaker.
+            // Functional commands, macros and explicit paste shortcuts retain their order.
+            let priority = |origin: &CandidateOrigin| {
+                matches!(
+                    origin,
+                    CandidateOrigin::Overlay {
+                        is_clipboard: true,
+                        ..
+                    }
+                )
+            };
+            match (priority(&a.1), priority(&b.1)) {
+                (true, true) => std::cmp::Ordering::Equal,
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                (false, false) => b.0.pinned.cmp(&a.0.pinned).then_with(|| {
+                    b.0.frecency_score
+                        .max(0.0)
+                        .total_cmp(&a.0.frecency_score.max(0.0))
+                }),
+            }
+        });
+        if let Some(mut pair) = self.recover_transposition(
+            merged.iter().map(|(_, origin)| origin.canonical()),
+            imported,
+            retention,
+        ) {
+            self.score_pair(&mut pair.0, &mut pair.1, retention, now_ms, 0);
+            merged.retain(|(_, origin)| origin.canonical() != pair.1.canonical());
+            let first_word = merged
+                .iter()
+                .take_while(|(_, origin)| {
+                    matches!(
+                        origin,
+                        CandidateOrigin::Overlay {
+                            is_clipboard: true,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            merged.insert(first_word, pair);
+        }
         let total_pages = merged.len().div_ceil(page_size).max(1);
         if self.pure_rust.page_index >= total_pages {
             self.pure_rust.page_index = 0;
@@ -1574,6 +2057,109 @@ impl EngineState {
         Ok(self.empty_action(None))
     }
 
+    fn matches_full_reading(
+        &self,
+        word: &str,
+        code: &str,
+        imported: &ImportedLexiconIndex,
+        retention: &RetentionEngine,
+    ) -> bool {
+        if word.chars().count() < 2
+            || !word.chars().all(crate::ret::is_cjk)
+            || !imported.matches_reading(word, code, self.schema == SchemaKind::DoublePinyinFlypy)
+        {
+            return false;
+        }
+        let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
+        if retention.user_phrases.get(word).is_some_and(|p| {
+            (if flypy { &p.xiaohe } else { &p.quanpin }) == code || p.acronym == code
+        }) {
+            return true;
+        }
+        let imported_matches = if flypy {
+            imported.query_xiaohe(code)
+        } else {
+            imported.query_quanpin(code)
+        };
+        if imported_matches.iter().any(|p| p.text == word) {
+            return true;
+        }
+        let matches = |pinyin: &str| {
+            if flypy {
+                crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin) == code
+            } else {
+                pinyin.split_whitespace().collect::<String>() == code
+            }
+        };
+        if let Some((syllables, _)) = imported.corpus().word_readings.get(word) {
+            return matches(&syllables.join(" "));
+        }
+        let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
+            imported.corpus(),
+        ))
+        .annotate_text(word);
+        matches(&ann.untoned)
+    }
+
+    fn recover_transposition<'a>(
+        &self,
+        current_words: impl Iterator<Item = &'a str>,
+        imported: &ImportedLexiconIndex,
+        retention: &RetentionEngine,
+    ) -> Option<(CandidateItem, CandidateOrigin)> {
+        if !self.config.adaptive_learning
+            || self.raw_input.len() < 4
+            || !self.raw_input.bytes().all(|b| b.is_ascii_lowercase())
+            || current_words
+                .into_iter()
+                .any(|word| self.matches_full_reading(word, &self.raw_input, imported, retention))
+        {
+            return None;
+        }
+        let mut swapped = self.raw_input.as_bytes().to_vec();
+        let mut best: Option<(CandidateItem, String, f64)> = None;
+        let mut attempts = 0;
+        for i in 0..swapped.len() - 1 {
+            if swapped[i] == swapped[i + 1] {
+                continue;
+            }
+            if attempts == 12 {
+                break;
+            }
+            attempts += 1;
+            swapped.swap(i, i + 1);
+            // All bytes are lowercase ASCII, including after the swap.
+            let code = std::str::from_utf8(&swapped).expect("ASCII pinyin");
+            let recovered = self
+                .pure_rust
+                .query_correction_candidates(code, self.schema, imported, retention)
+                .into_iter()
+                .next();
+            if let Some((item, canonical, score)) = recovered {
+                if best.as_ref().is_none_or(|(old, _, old_score)| {
+                    (item.pinned && !old.pinned)
+                        || (item.pinned == old.pinned && score > *old_score)
+                }) {
+                    best = Some((item, canonical, score));
+                }
+            }
+            swapped.swap(i, i + 1);
+        }
+        best.map(|(mut item, canonical, _)| {
+            let commit_text = self.convert_opencc(&canonical);
+            item.text = commit_text.clone();
+            item.comment = "纠错".into();
+            (
+                item,
+                CandidateOrigin::PureRust {
+                    canonical,
+                    commit_text,
+                    features: [0.0; 9],
+                },
+            )
+        })
+    }
+
     fn build_overlay_candidates(
         &self,
         clipboard: &ClipboardManager,
@@ -1585,32 +2171,54 @@ impl EngineState {
         let mut seen: HashSet<String> = HashSet::new();
 
         let paste = clipboard.quick_paste_state();
-        if let Some(clip) = paste.quick_paste.filter(|_| self.config.platform == "android" && paste.candidate_visible && self.raw_input.is_empty()) {
-            overlay.push((CandidateItem {
-                index: 0,
-                text: clip.content.clone(),
-                comment: "快捷粘贴".into(),
-                pinned: false,
-                is_clipboard_shortcut: false,
-                quick_paste_id: Some(clip.id),
-                function_action: None,
-                shortcut_code: None,
-                frecency_score: 0.0,
-            }, CandidateOrigin::Overlay {
-                canonical: clip.content.clone(),
-                commit_text: clip.content,
-                is_clipboard: true,
-            }));
+        if let Some(clip) = paste.quick_paste.filter(|_| {
+            self.config.platform == "android"
+                && paste.candidate_visible
+                && self.raw_input.is_empty()
+        }) {
+            overlay.push((
+                CandidateItem {
+                    index: 0,
+                    text: clip.content.clone(),
+                    comment: "快捷粘贴".into(),
+                    pinned: false,
+                    is_clipboard_shortcut: false,
+                    quick_paste_id: Some(clip.id),
+                    function_action: None,
+                    shortcut_code: None,
+                    frecency_score: 0.0,
+                },
+                CandidateOrigin::Overlay {
+                    features: [0.0; 9],
+                    canonical: clip.content.clone(),
+                    commit_text: clip.content,
+                    is_clipboard: true,
+                },
+            ));
         }
 
         for binding in &self.config.shortcuts {
             if !binding.text.is_empty() && binding.text == self.raw_input && self.config.shortcut_enabled(binding.action) {
                 let label = binding.action.label().to_string();
-                overlay.push((CandidateItem {
-                    index: 0, text: label.clone(), comment: "功能".into(),
-                    pinned: false, is_clipboard_shortcut: false, quick_paste_id: None,
-                    function_action: Some(binding.action), shortcut_code: None, frecency_score: 0.0,
-                }, CandidateOrigin::Overlay { canonical: label.clone(), commit_text: label, is_clipboard: true }));
+                overlay.push((
+                    CandidateItem {
+                        index: 0,
+                        text: label.clone(),
+                        comment: "功能".into(),
+                        pinned: false,
+                        is_clipboard_shortcut: false,
+                        quick_paste_id: None,
+                        function_action: Some(binding.action),
+                        shortcut_code: None,
+                        frecency_score: 0.0,
+                    },
+                    CandidateOrigin::Overlay {
+                        features: [0.0; 9],
+                        canonical: label.clone(),
+                        commit_text: label,
+                        is_clipboard: true,
+                    },
+                ));
             }
         }
 
@@ -1628,6 +2236,7 @@ impl EngineState {
                     frecency_score: 1000.0,
                 };
                 let origin = CandidateOrigin::Overlay {
+                    features: [0.0; 9],
                     canonical: clip.content.clone(),
                     commit_text: clip.content.clone(),
                     is_clipboard: true,
@@ -1651,11 +2260,100 @@ impl EngineState {
                         frecency_score: 500.0 - (idx as f64),
                     };
                     let origin = CandidateOrigin::Overlay {
+                        features: [0.0; 9],
                         canonical: val.clone(),
                         commit_text: val,
                         is_clipboard: true,
                     };
                     overlay.push((item, origin));
+                }
+            }
+        }
+
+        if self.config.adaptive_learning {
+            let compact: String = self
+                .raw_input
+                .chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .collect();
+            let now_ms = RetentionEngine::now_epoch_ms();
+            let phrases = retention
+                .query_user_phrases(&compact, self.schema == SchemaKind::DoublePinyinFlypy);
+            let mut learned: Vec<_> = phrases
+                .into_iter()
+                .map(|p| {
+                    let clipboard = p.source == "clipboard";
+                    (
+                        p.word.as_str(),
+                        if clipboard { "剪贴板" } else { "习惯" },
+                        self.contextual_score(retention, &p.word, now_ms)
+                            + if clipboard { 0.35 } else { 1.0 },
+                    )
+                })
+                .collect();
+            for phrase in retention.query_acronym_phrases(&compact) {
+                learned.push((
+                    phrase.word.as_str(),
+                    "简拼",
+                    self.contextual_score(retention, &phrase.word, now_ms) + 1.0,
+                ));
+            }
+            let continuations = self
+                .previous_context(now_ms)
+                .map(|previous| {
+                    retention.query_context_continuations(
+                        previous,
+                        &compact,
+                        self.schema == SchemaKind::DoublePinyinFlypy,
+                        now_ms,
+                        |word| {
+                            let ann = crate::imp::polyphone::PolyphoneAnnotator::new(
+                                std::sync::Arc::clone(imported.corpus()),
+                            )
+                            .annotate_text(word);
+                            let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
+                            (ann.untoned, xiaohe)
+                        },
+                    )
+                })
+                .unwrap_or_default();
+            for (word, _) in &continuations {
+                learned.push((
+                    word.as_str(),
+                    "续写",
+                    self.contextual_score(retention, word, now_ms) + 1.5,
+                ));
+            }
+            if let Some(word) = retention.query_user_english(&compact) {
+                learned.push((
+                    word,
+                    "英文",
+                    self.contextual_score(retention, word, now_ms) + 1.0,
+                ));
+            }
+            learned.sort_by(|a, b| b.2.total_cmp(&a.2));
+            for (canonical, comment, score) in learned {
+                let text = self.convert_opencc(canonical);
+                if seen.insert(text.clone()) {
+                    overlay.push((
+                        CandidateItem {
+                            index: 0,
+                            text: text.clone(),
+                            comment: comment.into(),
+                            pinned: retention.pinned_words.contains(canonical),
+                            frecency_score: score,
+                            is_clipboard_shortcut: false,
+                            shortcut_code: None,
+                            quick_paste_id: None,
+                            function_action: None,
+                        },
+                        CandidateOrigin::Overlay {
+                            features: [0.0; 9],
+                            canonical: canonical.to_string(),
+                            commit_text: text,
+                            is_clipboard: false,
+                        },
+                    ));
                 }
             }
         }
@@ -1667,14 +2365,29 @@ impl EngineState {
                 }
                 let text = self.convert_opencc(&hint.ch);
                 if seen.insert(text.clone()) {
-                    overlay.push((CandidateItem {
-                        index: 0, text: text.clone(), comment: hint.toned_pinyin.clone(),
-                        pinned: retention.pinned_words.contains(&hint.ch),
-                        frecency_score: retention.decayed_score_at(&hint.ch, RetentionEngine::now_epoch_ms()),
-                        is_clipboard_shortcut: false, shortcut_code: None,
-                        quick_paste_id: None,
-                        function_action: None,
-                    }, CandidateOrigin::Overlay {canonical: hint.ch.clone(), commit_text: text, is_clipboard: false}));
+                    overlay.push((
+                        CandidateItem {
+                            index: 0,
+                            text: text.clone(),
+                            comment: hint.toned_pinyin.clone(),
+                            pinned: retention.pinned_words.contains(&hint.ch),
+                            frecency_score: self.contextual_score(
+                                retention,
+                                &hint.ch,
+                                RetentionEngine::now_epoch_ms(),
+                            ),
+                            is_clipboard_shortcut: false,
+                            shortcut_code: None,
+                            quick_paste_id: None,
+                            function_action: None,
+                        },
+                        CandidateOrigin::Overlay {
+                            features: [0.0; 9],
+                            canonical: hint.ch.clone(),
+                            commit_text: text,
+                            is_clipboard: false,
+                        },
+                    ));
                 }
             }
         }
@@ -1704,9 +2417,16 @@ impl EngineState {
                         quick_paste_id: None,
                         function_action: None,
                         shortcut_code: None,
-                        frecency_score: (imp.weight as f64) + 50.0,
+                        frecency_score: (imp.weight as f64)
+                            + 50.0
+                            + self.contextual_score(
+                                retention,
+                                &imp.text,
+                                RetentionEngine::now_epoch_ms(),
+                            ),
                     };
                     let origin = CandidateOrigin::Overlay {
+                        features: [0.0; 9],
                         canonical: imp.text,
                         commit_text: converted,
                         is_clipboard: false,
@@ -1722,12 +2442,15 @@ impl EngineState {
                     self.schema == SchemaKind::DoublePinyinFlypy,
                 )
             {
-                let decoded = self.pure_rust.query_all_candidates_with_canonical(
+                let decoded = self.pure_rust.query_all_candidates_contextual(
                     &self.raw_input,
                     self.schema,
                     OpenCcMode::Simplified,
                     Some(imported),
                     Some(retention),
+                    self.previous_context(RetentionEngine::now_epoch_ms()),
+                    self.active_app_id.as_deref(),
+                    self.config.adaptive_learning,
                 );
                 for (item, canonical) in decoded
                     .into_iter()
@@ -1748,6 +2471,7 @@ impl EngineState {
                             frecency_score: item.frecency_score + 50.0,
                         };
                         let origin = CandidateOrigin::Overlay {
+                            features: [0.0; 9],
                             canonical,
                             commit_text: converted,
                             is_clipboard: false,
@@ -1758,6 +2482,10 @@ impl EngineState {
             }
         }
 
+        let now_ms = RetentionEngine::now_epoch_ms();
+        for (rank, (item, origin)) in overlay.iter_mut().enumerate() {
+            self.score_pair(item, origin, retention, now_ms, rank);
+        }
         (overlay, seen)
     }
 
@@ -1871,6 +2599,8 @@ impl EngineState {
         if index < self.candidate_origins.len() {
             let orig = self.candidate_origins.remove(index);
             self.candidate_origins.insert(first_word, orig);
+            let features = self.candidate_features.remove(index);
+            self.candidate_features.insert(first_word, features);
         }
         for (i, c) in self.current_candidates.iter_mut().enumerate() {
             c.index = i;
@@ -1907,6 +2637,7 @@ impl EngineState {
         self.current_candidates.remove(index);
         if index < self.candidate_origins.len() {
             self.candidate_origins.remove(index);
+            self.candidate_features.remove(index);
         }
         for (i, c) in self.current_candidates.iter_mut().enumerate() {
             c.index = i;
@@ -1914,7 +2645,10 @@ impl EngineState {
         Ok(())
     }
 
-    pub fn empty_action(&self, commit_text: Option<String>) -> InputAction {
+    pub fn empty_action(&mut self, commit_text: Option<String>) -> InputAction {
+        if let Some(ch) = commit_text.as_deref().and_then(|text| text.chars().next_back()) {
+            self.last_committed_char = Some(ch);
+        }
         let page_size = self.current_page.page_size.max(1);
         let page_items: Vec<CandidateItem> = self
             .current_candidates
@@ -1945,5 +2679,494 @@ impl EngineState {
             macro_expanded,
             voice_trigger: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod personalization_tests {
+    use super::*;
+
+    fn fixture() -> (
+        EngineState,
+        ClipboardManager,
+        ImportedLexiconIndex,
+        RetentionEngine,
+    ) {
+        let mut engine = EngineState::new(EngineConfig {
+            schema: SchemaKind::RimeIce,
+            ..Default::default()
+        });
+        engine.resolved_assets_dir = None;
+        (
+            engine,
+            ClipboardManager::new(50),
+            ImportedLexiconIndex::new(None),
+            RetentionEngine::default(),
+        )
+    }
+
+    fn type_code(
+        engine: &mut EngineState,
+        code: &str,
+        clip: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        r: &mut RetentionEngine,
+    ) {
+        for ch in code.chars() {
+            engine
+                .process_key(ch as u32, 0, SwipeDir::None, clip, imported, r)
+                .unwrap();
+        }
+    }
+
+    fn offer(engine: &mut EngineState, word: &str, code: &str) {
+        engine.raw_input = code.into();
+        engine.set_current_candidates(vec![(
+            CandidateItem {
+                index: 0,
+                text: word.into(),
+                comment: String::new(),
+                pinned: false,
+                is_clipboard_shortcut: false,
+                quick_paste_id: None,
+                function_action: None,
+                shortcut_code: None,
+                frecency_score: 0.0,
+            },
+            CandidateOrigin::PureRust {
+                features: [0.0; 9],
+                canonical: word.into(),
+                commit_text: word.into(),
+            },
+        )]);
+    }
+
+    #[test]
+    fn phase3_commit_feedback_semantic_recall_and_cached_hot_queries() {
+        let (mut e, clip, imp, mut r) = fixture();
+        offer(&mut e, "项目进度安排", "xiangmujinduanpai");
+        e.process_key(0x20, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        let context = e.cached_context_vec.unwrap();
+        type_code(&mut e, "shuru", &clip, &imp, &mut r);
+        assert_eq!(
+            e.cached_context_vec,
+            Some(context),
+            "typing must only read the context cache"
+        );
+        assert_eq!(e.current_candidates.len(), e.candidate_features.len());
+        let target = e.canonical_at(1).unwrap().to_string();
+        assert!(e.selection_feedback(1).unwrap().1.is_some());
+        let committed = e
+            .process_key('2' as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(committed.commit_text.as_deref(), Some(target.as_str()));
+        assert!(r.reranker.updates > 0);
+        assert!(r.semantic_memories.iter().any(|m| m.word == target));
+        assert!(e.candidate_features.is_empty());
+        e.reset_commit_context();
+        offer(&mut e, "项目进度计划", "xiangmujindujihua");
+        e.process_key(0x20, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        type_code(&mut e, "shuru", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some(target.as_str()));
+        assert!(e.candidate_features[0][5] > 0.0);
+        // Fill the personal datastore to its production bound before timing cached queries.
+        for i in 0..512 {
+            r.record_semantic_memory(
+                context,
+                &format!("词{i}"),
+                None,
+                RetentionEngine::now_epoch_ms(),
+            );
+        }
+        let now = RetentionEngine::now_epoch_ms();
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            for (rank, candidate) in e.current_candidates.iter().enumerate() {
+                std::hint::black_box(e.features_for(&r, &candidate.text, now, Some(rank)));
+            }
+        }
+        let mean = start.elapsed() / 1000;
+        eprintln!(
+            "phase3 cached candidate query mean={mean:?}, memories={}",
+            r.semantic_memories.len()
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(mean < std::time::Duration::from_micros(500), "{mean:?}");
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            std::hint::black_box(e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap());
+        }
+        let hot_mean = start.elapsed() / 100;
+        eprintln!("phase3 full warm key query mean={hot_mean:?}");
+        #[cfg(not(debug_assertions))]
+        assert!(hot_mean < std::time::Duration::from_micros(500), "{hot_mean:?}");
+        let before = r.reranker.updates;
+        e.config.adaptive_learning = false;
+        e.reset_commit_context();
+        e.clear_composition_state();
+        type_code(&mut e, "shuru", &clip, &imp, &mut r);
+        e.process_key('2' as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(r.reranker.updates, before);
+        assert!(e.cached_context_vec.is_none());
+        e.process_key(0x1b, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert!(e.context_window.is_empty());
+    }
+
+    #[test]
+    fn frequent_typed_phrases_gain_personal_acronyms() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let now = RetentionEngine::now_epoch_ms();
+        for _ in 0..2 {
+            e.record_candidate_commit("项目管理", "xiangmuguanli", None, &imp, &mut r, now);
+        }
+        let phrase = r.user_phrases.get("项目管理").unwrap();
+        assert_eq!(phrase.source, "typed");
+        assert_eq!(phrase.acronym, "xmgl");
+        type_code(&mut e, "xmgl", &clip, &imp, &mut r);
+        assert!(e
+            .current_candidates
+            .iter()
+            .any(|c| c.text == "项目管理" && c.comment == "简拼"));
+        e.clear_composition_state();
+        e.config.adaptive_learning = false;
+        let (overlay, _) = e.build_overlay_candidates(&clip, &imp, &r, false);
+        assert!(!overlay.iter().any(|(c, _)| c.comment == "简拼"));
+    }
+
+    #[test]
+    fn one_key_context_continuation_commits_and_expires_without_idle_space_change() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let now = RetentionEngine::now_epoch_ms();
+        r.record_contextual_selection("打扰了", "daraole", Some("不好意思"), None, now, 1.0, true);
+        offer(&mut e, "不好意思", "buhaoyisi");
+        e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        type_code(&mut e, "d", &clip, &imp, &mut r);
+        assert_eq!(e.current_candidates[0].text, "打扰了");
+        assert_eq!(e.current_candidates[0].comment, "续写");
+        let commit = e
+            .process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(commit.commit_text.as_deref(), Some("打扰了"));
+        assert_eq!(
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap()
+                .commit_text
+                .as_deref(),
+            Some(" ")
+        );
+        e.last_committed_word = Some("不好意思".into());
+        e.last_committed_ms = now.saturating_sub(6001);
+        type_code(&mut e, "d", &clip, &imp, &mut r);
+        assert!(!e.current_candidates.iter().any(|c| c.comment == "续写"));
+    }
+
+    #[test]
+    fn adjacent_transposition_recovers_complete_words_but_preserves_valid_input() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "nihoa", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some("你好"));
+        assert_eq!(e.current_candidates[0].comment, "纠错");
+        assert!(
+            matches!(&e.candidate_origins[0], CandidateOrigin::PureRust { canonical, .. } if canonical == "你好")
+        );
+        assert_eq!(
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap()
+                .commit_text
+                .as_deref(),
+            Some("你好")
+        );
+        type_code(&mut e, "nihao", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some("你好"));
+        assert!(!e.current_candidates.iter().any(|c| c.comment == "纠错"));
+        e.clear_composition_state();
+        r.erase_word("你好");
+        type_code(&mut e, "nihoa", &clip, &imp, &mut r);
+        assert!(!e.current_candidates.iter().any(|c| c.text == "你好"));
+        e.clear_composition_state();
+        e.config.adaptive_learning = false;
+        type_code(&mut e, "nihoa", &clip, &imp, &mut r);
+        assert!(!e.current_candidates.iter().any(|c| c.comment == "纠错"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_page_zero_recovers_transposition_with_portable_commit_origin() {
+        let (mut e, clip, imp, r) = fixture();
+        // Synthetic native snapshot exercises merging without creating a Rime session.
+        e.raw_input = "nihoa".into();
+        let snapshot = rime_ffi::RimeSnapshot {
+            commit_text: None,
+            preedit: "nihoa".into(),
+            cursor_utf8: 5,
+            page_index: 0,
+            page_size: 5,
+            has_prev: false,
+            has_next: false,
+            candidates: vec![rime_ffi::RimeRawCandidate {
+                text: "你".into(),
+                comment: String::new(),
+            }],
+        };
+        let action = e.apply_rime_snapshot(snapshot, false, false, &clip, &imp, &r);
+        assert_eq!(action.candidates[0].text, "你好");
+        assert_eq!(action.candidates[0].comment, "纠错");
+        assert_eq!(e.candidate_features[0][8], 1.0);
+        assert!(
+            matches!(&e.candidate_origins[0], CandidateOrigin::PureRust { canonical, .. } if canonical == "你好")
+        );
+    }
+
+    #[test]
+    fn fast_correction_lookup_respects_schema_imported_readings_and_erasure() {
+        let (e, _, mut imp, mut r) = fixture();
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "nihao"),
+            (SchemaKind::DoublePinyinFlypy, "nihc"),
+        ] {
+            let words = e
+                .pure_rust
+                .query_correction_candidates(code, schema, &imp, &r);
+            assert!(words.iter().any(|(_, word, _)| word == "你好"));
+            assert!(words.len() <= 3);
+        }
+        imp.inject_hotwords(&[crate::imp::ImportedLexiconEntry {
+            text: "你好".into(),
+            pinyin: "ni hu".into(),
+            toned_pinyin: "nǐ hǔ".into(),
+            xiaohe: "nihu".into(),
+            weight: 1000,
+        }]);
+        assert!(!e
+            .pure_rust
+            .query_correction_candidates("nihao", SchemaKind::RimeIce, &imp, &r)
+            .iter()
+            .any(|(_, word, _)| word == "你好"));
+        assert!(e
+            .pure_rust
+            .query_correction_candidates("nihu", SchemaKind::DoublePinyinFlypy, &imp, &r)
+            .iter()
+            .any(|(_, word, _)| word == "你好"));
+        r.erase_word("你好");
+        assert!(!e
+            .pure_rust
+            .query_correction_candidates("nihu", SchemaKind::DoublePinyinFlypy, &imp, &r)
+            .iter()
+            .any(|(_, word, _)| word == "你好"));
+        assert!(e
+            .pure_rust
+            .query_correction_candidates(&"x".repeat(49), SchemaKind::RimeIce, &imp, &r)
+            .is_empty());
+    }
+
+    #[test]
+    fn soft_efficiency_warm_query_latency() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let now = RetentionEngine::now_epoch_ms();
+        r.register_typed_phrase("项目管理", "xiang mu guan li", "xlmugrli", now);
+        r.pin_word("项目管理");
+        r.record_contextual_selection("打扰了", "daraole", Some("不好意思"), None, now, 2.0, true);
+        e.last_committed_word = Some("不好意思".into());
+        e.last_committed_ms = now;
+        // Warm dictionary/model caches before measuring the added candidate work.
+        e.raw_input = "nihoa".into();
+        let fragments = e.pure_rust.query_all_candidates_with_canonical(
+            &e.raw_input,
+            e.schema,
+            OpenCcMode::Simplified,
+            Some(&imp),
+            Some(&r),
+        );
+        assert!(e
+            .recover_transposition(fragments.iter().map(|(_, word)| word.as_str()), &imp, &r)
+            .is_some());
+        let measure = |query: &mut dyn FnMut()| {
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                query();
+            }
+            start.elapsed() / 100
+        };
+        let typo = measure(&mut || {
+            std::hint::black_box(e.recover_transposition(
+                fragments.iter().map(|(_, word)| word.as_str()),
+                &imp,
+                &r,
+            ));
+        });
+        e.raw_input = "d".into();
+        let continuation = measure(&mut || {
+            std::hint::black_box(e.build_overlay_candidates(&clip, &imp, &r, false));
+        });
+        e.raw_input = "xmgl".into();
+        let acronym = measure(&mut || {
+            std::hint::black_box(e.build_overlay_candidates(&clip, &imp, &r, false));
+        });
+        eprintln!("warm query averages: typo={typo:?}, continuation={continuation:?}, acronym={acronym:?}");
+        #[cfg(not(debug_assertions))]
+        for latency in [typo, continuation, acronym] {
+            assert!(
+                latency < std::time::Duration::from_micros(500),
+                "{latency:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn digit_context_keeps_decimal_and_time_punctuation_half_width() {
+        let (mut e, clip, imp, mut r) = fixture();
+        for (digits, punct) in [("3", '.'), ("12", ':')] {
+            for digit in digits.chars() {
+                e.process_key(digit as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+            }
+            let action = e
+                .process_key(punct as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(action.commit_text, Some(punct.to_string()));
+            assert_eq!(e.last_committed_char, Some(punct));
+        }
+        for (punct, expected) in [('.', "。"), (':', "：")] {
+            offer(&mut e, "你好", "nihao");
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(e.last_committed_char, Some('好'));
+            assert_eq!(
+                e.process_key(punct as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap()
+                    .commit_text
+                    .as_deref(),
+                Some(expected)
+            );
+        }
+        e.empty_action(Some("12".into()));
+        e.process_key(27, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(e.last_committed_char, None);
+        e.empty_action(Some("3".into()));
+        e.on_app_focus("chat").unwrap();
+        assert_eq!(e.last_committed_char, None);
+    }
+
+    #[test]
+    fn paired_context_promotes_follower_in_decoder() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "ni", &clip, &imp, &mut r);
+        assert!(e.current_candidates.len() >= 2);
+        let first = e.canonical_at(0).unwrap().to_string();
+        let follower = e.canonical_at(1).unwrap().to_string();
+        e.clear_composition_state();
+        let now = RetentionEngine::now_epoch_ms();
+        r.record_contextual_selection(&first, "ni", None, None, now, 1.0, true);
+        r.record_contextual_selection(&follower, "ni", Some("前"), None, now, 1.0, true);
+        offer(&mut e, "前", "qian");
+        e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        type_code(&mut e, "ni", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some(follower.as_str()));
+    }
+
+    #[test]
+    fn app_affinity_ranks_different_words_for_same_code() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "ni", &clip, &imp, &mut r);
+        let code_word = e.canonical_at(0).unwrap().to_string();
+        let chat_word = e.canonical_at(1).unwrap().to_string();
+        e.clear_composition_state();
+        let now = RetentionEngine::now_epoch_ms();
+        r.record_contextual_selection(&code_word, "ni", None, Some("code"), now, 1.0, true);
+        r.record_contextual_selection(&chat_word, "ni", None, Some("wechat"), now, 1.0, true);
+        for (app, expected) in [("code", code_word), ("wechat", chat_word)] {
+            e.clear_composition_state();
+            e.on_app_focus(app).unwrap();
+            e.lang_mode = LangMode::Zh;
+            type_code(&mut e, "ni", &clip, &imp, &mut r);
+            assert_eq!(e.canonical_at(0), Some(expected.as_str()));
+        }
+    }
+
+    #[test]
+    fn repeated_consecutive_commits_synthesize_phrase_for_both_schemas() {
+        let (mut e, clip, imp, mut r) = fixture();
+        for _ in 0..2 {
+            for (word, code) in [("你", "ni"), ("好", "hao")] {
+                offer(&mut e, word, code);
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+            }
+        }
+        let p = r
+            .user_phrases
+            .get("你好")
+            .expect("two compositions promote a phrase")
+            .clone();
+        assert_eq!(p.source, "typed");
+        for (schema, code) in [
+            (SchemaKind::RimeIce, p.quanpin),
+            (SchemaKind::DoublePinyinFlypy, p.xiaohe),
+        ] {
+            e.set_schema(schema);
+            type_code(&mut e, &code, &clip, &imp, &mut r);
+            assert!(e
+                .current_candidates
+                .iter()
+                .any(|c| c.text == "你好" && c.comment == "习惯"));
+        }
+    }
+
+    #[test]
+    fn backspace_regret_corrects_original_context_and_preference() {
+        let (mut e, clip, imp, mut r) = fixture();
+        for (word, code) in [("前", "qian"), ("尼", "ni")] {
+            offer(&mut e, word, code);
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+        }
+        e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(e.regret_backspaces, 1);
+        type_code(&mut e, "ni", &clip, &imp, &mut r);
+        offer(&mut e, "你", "ni");
+        e.process_key('1' as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert!(r.frecency["尼"] <= 0.5);
+        assert_eq!(r.code_preferences["ni"]["你"], 2.5);
+        assert!(!r.code_preferences["ni"].contains_key("尼"));
+        assert_eq!(r.context_bigrams["前"]["你"], 2.5);
+        assert!(!r.context_bigrams.contains_key("尼"));
+        assert_eq!(e.regret_backspaces, 0);
+        e.process_key(27, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert!(e.last_committed_word.is_none());
+    }
+
+    #[test]
+    fn enter_learns_casing_and_disabled_learning_keeps_legacy_frecency() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "OpenAI", &clip, &imp, &mut r);
+        let committed = e
+            .process_key(13, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(committed.commit_text.as_deref(), Some("OpenAI"));
+        assert_eq!(r.query_user_english("openai"), Some("OpenAI"));
+        type_code(&mut e, "openai", &clip, &imp, &mut r);
+        assert!(e
+            .current_candidates
+            .iter()
+            .any(|c| c.text == "OpenAI" && c.comment == "英文"));
+        e.clear_composition_state();
+        e.config.adaptive_learning = false;
+        offer(&mut e, "好", "hao");
+        e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        assert!(r.frecency.contains_key("好"));
+        assert!(r.code_preferences.is_empty());
+        assert!(EngineConfig::parse_json("{}").unwrap().adaptive_learning);
+        assert!(EngineConfig::parse_json("{}").unwrap().learn_from_clipboard);
     }
 }

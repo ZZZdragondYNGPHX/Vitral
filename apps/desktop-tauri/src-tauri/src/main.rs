@@ -24,7 +24,7 @@ fn preferences(settings: &Settings) -> Result<Value, String> {
     match fs::read(&settings.path) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(
-            json!({"pure_offline":false,"schema":"double_pinyin_flypy","opencc_mode":"simplified","clipboard_ring_capacity":50,"candidate_font_px":16,"theme":"system"}),
+            json!({"adaptive_learning":true,"learn_from_clipboard":true,"pure_offline":false,"schema":"double_pinyin_flypy","opencc_mode":"simplified","clipboard_ring_capacity":50,"candidate_font_px":16,"theme":"system"}),
         ),
         Err(e) => Err(e.to_string()),
     }
@@ -33,6 +33,11 @@ fn preferences(settings: &Settings) -> Result<Value, String> {
 fn public_settings(mut cfg: Value) -> Value {
     if cfg.get("shortcuts").is_none() {
         cfg["shortcuts"] = json!(shortcuts::defaults());
+    }
+    for key in ["adaptive_learning", "learn_from_clipboard"] {
+        if cfg.get(key).is_none() {
+            cfg[key] = json!(true);
+        }
     }
     cfg["shortcut_defaults"] = json!(shortcuts::defaults());
     cfg["shortcut_actions"] = json!(shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()})));
@@ -89,6 +94,11 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                     shortcuts::normalize(&mut bindings).map_err(|e| e.to_string())?;
                     fields.insert(key.clone(), json!(bindings));
                     continue;
+                }
+                "adaptive_learning" | "learn_from_clipboard" => {
+                    if !value.is_boolean() {
+                        return Err("学习设置应为开启或关闭".into());
+                    }
                 }
                 "linux_english_mode" if cfg!(target_os = "linux") => {
                     if !value.is_boolean() {

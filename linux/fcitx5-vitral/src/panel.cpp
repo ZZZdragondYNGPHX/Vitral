@@ -40,6 +40,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 #include <QWindow>
+#include <climits>
 #include <cmath>
 
 using namespace vitral::tokens;
@@ -210,8 +211,12 @@ public:
   Panel()
       : bus_("dev.vitral.IME", "/dev/vitral/IME", "dev.vitral.IME",
              QDBusConnection::sessionBus()) {
-    setWindowFlags(Qt::Tool | Qt::FramelessWindowHint |
-                   Qt::WindowStaysOnTopHint | Qt::WindowDoesNotAcceptFocus);
+    const bool isWayland = QApplication::platformName().startsWith("wayland");
+    Qt::WindowFlags flags = Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint |
+                            Qt::WindowDoesNotAcceptFocus;
+    if (!isWayland)
+      flags |= Qt::Tool;
+    setWindowFlags(flags);
     setAttribute(Qt::WA_ShowWithoutActivating);
     setAttribute(Qt::WA_TranslucentBackground);
 
@@ -455,6 +460,9 @@ public:
       layer_->setLayer(LayerShellQt::Window::LayerTop);
       layer_->setKeyboardInteractivity(
           LayerShellQt::Window::KeyboardInteractivityNone);
+      layer_->setActivateOnShow(false);
+      layer_->setCloseOnDismissed(false);
+      layer_->setWantsToBeOnActiveScreen(true);
       layer_->setExclusiveZone(0);
     }
     KWindowEffects::enableBlurBehind(windowHandle(), true);
@@ -1000,21 +1008,29 @@ private:
         lang_->style()->polish(lang_);
       }
       lang_->setVisible(state["english_mode_enabled"].toBool(true));
-      show();
       reposition();
+      if (!isVisible())
+        show();
     });
   }
 
   void reposition() {
     adjustSize();
-    const int edgeHideMargin = -width() / 2;
+    const QSize sz = size().expandedTo(sizeHint());
+    if (sz != size())
+      resize(sz);
+    const int edgeHideMargin = -sz.width() / 2;
     const int right = faded_ ? edgeHideMargin : 14;
+    if (sz == lastSize_ && right == lastRight_)
+      return;
+    lastSize_ = sz;
+    lastRight_ = right;
     if (layer_) {
       layer_->setMargins({0, 0, right, 14});
-      layer_->setDesiredSize(size());
+      layer_->setDesiredSize(sz);
     } else if (auto *scr = screen()) {
       auto r = scr->availableGeometry();
-      move(r.right() - width() - right, r.bottom() - height() - 14);
+      move(r.right() - sz.width() - right, r.bottom() - sz.height() - 14);
     }
   }
 
@@ -1254,14 +1270,23 @@ private:
   QDBusPendingCallWatcher *cloudWatcher_ = nullptr;
   QTimer timer_;
   QElapsedTimer idle_;
+  QSize lastSize_;
+  int lastRight_ = INT_MIN;
   int tick_ = -1, generation_ = 0, editor_ = -1;
   bool expanded_ = false, continuous_ = false, polling_ = false, faded_ = false;
 };
 
 int main(int argc, char **argv) {
   qputenv("QT_WAYLAND_USE_DATA_CONTROL", "1");
+  if (qEnvironmentVariableIsEmpty("QT_WAYLAND_SHELL_INTEGRATION") &&
+      (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY") ||
+       qgetenv("XDG_SESSION_TYPE") == "wayland")) {
+    qputenv("QT_WAYLAND_SHELL_INTEGRATION", "layer-shell");
+  }
   QApplication app(argc, argv);
   app.setQuitOnLastWindowClosed(false);
+  if (!QDBusConnection::sessionBus().registerService("dev.vitral.Panel"))
+    return 0;
   Panel panel;
   return app.exec();
 }

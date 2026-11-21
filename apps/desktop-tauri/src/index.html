@@ -166,6 +166,38 @@
         </article>
 
         <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <h2>懂你引擎 · 个性化舒适输入</h2>
+              <span class="card-sub">纯本地实时学习，仅存本机与自选加密云盘 · 开源可查、随时可清空</span>
+            </div>
+            <button type="button" class="btn-danger-ghost" data-action="personalization-clear" id="btn-clear-habits">清空习惯记忆</button>
+          </div>
+
+          <dl id="habit-stats" class="usage-grid" style="margin:0 0 12px" hidden></dl>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="adaptive-toggle">上下文与应用感知学习</label>
+              <p class="help">本地在线训练个人排序权重与 rbt3 语义记忆，并静默学习上下文连词与一字续写、10 分钟话题热词、按应用隔离词频、个人简拼、连续造词、退格纠偏与邻键倒序纠错。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="adaptive-toggle" class="switch" name="adaptive_learning" type="checkbox" checked>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="clip-learn-toggle">剪贴板静默识词</label>
+              <p class="help">从日常复制的片段中本地提取中文专名与英文术语（自动跳过密码、密钥与网址），首次打字就能直接命中。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="clip-learn-toggle" class="switch" name="learn_from_clipboard" type="checkbox" checked>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
           <div class="card-head">
             <h2>外观与视觉</h2>
             <span class="card-sub">保存后即时应用到系统候选面板与悬浮状态胶囊</span>
@@ -341,8 +373,9 @@
           </div>
 
           <div class="actions">
+            <button type="button" data-action="poll-services" class="online btn-accent-soft">立即同步</button>
             <button type="button" data-action="storage" class="online btn-ghost">查看云盘用量</button>
-            <button type="button" data-action="restore-from-koofr" class="online btn-accent-soft">一键从云端恢复</button>
+            <button type="button" data-action="restore-from-koofr" class="online btn-ghost">一键从云端恢复</button>
           </div>
           <dl id="usage" class="usage-grid" hidden></dl>
         </article>

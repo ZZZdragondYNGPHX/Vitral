@@ -319,6 +319,51 @@ impl KoofrDavClient {
         &self.clean_root
     }
 
+    fn ensure_collections(&self, rel_parent: &str) -> Result<(), VitralError> {
+        self.guard.require_online("dav_mkcol")?;
+        let mut url = reqwest::Url::parse(&self.cfg.endpoint)
+            .map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
+        let client = dav_http_client()?;
+        let method = reqwest::Method::from_bytes(b"MKCOL")
+            .map_err(|e| VitralError::Internal(e.to_string()))?;
+        run_on_blocking_dav_thread(|| {
+            dav_runtime()?.block_on(async {
+                for segment in self
+                    .clean_root
+                    .split('/')
+                    .chain(rel_parent.split('/'))
+                    .filter(|s| !s.is_empty())
+                {
+                    url.path_segments_mut()
+                        .map_err(|_| {
+                            VitralError::InvalidArgument("invalid WebDAV endpoint".into())
+                        })?
+                        .pop_if_empty()
+                        .push(segment)
+                        .push("");
+                    self.guard.require_online("dav_mkcol")?;
+                    let mut request = client.request(method.clone(), url.clone());
+                    if let Some(user) = self.cfg.username.as_ref() {
+                        request = request.basic_auth(user, self.cfg.password.as_ref());
+                    }
+                    let response = request
+                        .send()
+                        .await
+                        .map_err(|e| VitralError::Io(e.without_url().to_string()))?;
+                    if !response.status().is_success()
+                        && response.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED
+                    {
+                        return Err(VitralError::Io(format!(
+                            "WebDAV MKCOL failed: HTTP status {}",
+                            response.status()
+                        )));
+                    }
+                }
+                Ok(())
+            })
+        })
+    }
+
     pub fn write_bytes(&self, rel_path: &str, data: &[u8]) -> Result<(), VitralError> {
         self.guard.require_online("dav_write")?;
         let rel = validate_rel_path(rel_path, false)?;
@@ -339,23 +384,12 @@ impl KoofrDavClient {
                         .map(|_| ())
                         .map_err(|e| VitralError::Io(format!("WebDAV PUT {rel} failed: {e}")));
                 }
-                if let Some((parent, _)) = rel.rsplit_once('/') {
-                    let parts: Vec<&str> = parent.split('/').filter(|s| !s.is_empty()).collect();
-                    let mut cur = String::new();
-                    for part in parts {
-                        cur.push_str(part);
-                        cur.push('/');
-                        let _ = self.op.create_dir(&cur);
-                    }
-                    self.op
-                        .write(&rel, data.to_vec())
-                        .map(|_| ())
-                        .map_err(|e| VitralError::Io(format!("WebDAV PUT {rel} failed: {e}")))
-                } else {
-                    Err(VitralError::Io(format!(
-                        "WebDAV PUT {rel} failed: {first_err}"
-                    )))
-                }
+                let parent_dir = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
+                self.ensure_collections(parent_dir)?;
+                self.op
+                    .write(&rel, data.to_vec())
+                    .map(|_| ())
+                    .map_err(|e| VitralError::Io(format!("WebDAV PUT {rel} failed: {e}")))
             }
         })
     }
@@ -584,15 +618,14 @@ pub(crate) fn merge_clipboard_ring(
                 let result = put.body(data).send().await.map_err(io)?;
                 match result.status() {
                     reqwest::StatusCode::PRECONDITION_FAILED => Ok::<_, VitralError>(None),
-                    reqwest::StatusCode::CONFLICT if missing => Ok(Some((false, merged))),
+                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => Ok(Some((false, merged))),
                     _ => { result.error_for_status().map_err(io)?; Ok(Some((true, merged))) }
                 }
             })?;
             match conditional {
                 Some((true, entries)) => return Ok(entries),
                 Some((false, _)) => {
-                    guard.require_online("create clipboard collection")?;
-                    dav.op.create_dir("clipboard/").map_err(|e| VitralError::Io(e.to_string()))?;
+                    dav.ensure_collections("clipboard")?;
                 }
                 None => {}
             }
@@ -640,12 +673,12 @@ pub(crate) fn sync_current_copy(
                 let response = put.body(encrypt_envelope(&data, cfg.sync_key.as_deref())?).send().await.map_err(io)?;
                 match response.status() {
                     reqwest::StatusCode::PRECONDITION_FAILED => Ok((false, None)),
-                    reqwest::StatusCode::CONFLICT if missing => Ok((false, Some(local.clone()))),
+                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => Ok((false, Some(local.clone()))),
                     _ => { response.error_for_status().map_err(io)?; Ok::<_, VitralError>((true, Some(local.clone()))) }
                 }
             })?;
             if outcome.0 { return Ok(outcome.1); }
-            if outcome.1.is_some() { dav.op.create_dir("clipboard/").map_err(|e| VitralError::Io(e.to_string()))?; }
+            if outcome.1.is_some() { dav.ensure_collections("clipboard")?; }
         }
         Err(VitralError::Io("current clipboard changed during synchronization".into()))
     })

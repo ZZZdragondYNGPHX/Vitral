@@ -256,6 +256,12 @@ class SettingsActivity : ComponentActivity() {
                     )
                 }
                 var offline by remember { mutableStateOf(config.optBoolean("pure_offline")) }
+                var adaptive by remember {
+                    mutableStateOf(config.optBoolean("adaptive_learning", true))
+                }
+                var clipLearn by remember {
+                    mutableStateOf(config.optBoolean("learn_from_clipboard", true))
+                }
                 var size by remember {
                     mutableFloatStateOf(
                         config
@@ -302,6 +308,8 @@ class SettingsActivity : ComponentActivity() {
                                                 if (flypy) "double_pinyin_flypy" else "rime_ice",
                                             )
                                             .put("pure_offline", offline)
+                                            .put("adaptive_learning", adaptive)
+                                            .put("learn_from_clipboard", clipLearn)
                                             .put("candidate_font_px", size.roundToInt())
                                             .put("clipboard_ring_capacity", capacity.roundToInt())
                                         busy = true
@@ -474,6 +482,34 @@ class SettingsActivity : ComponentActivity() {
                                         }
                                     }
                                 }
+
+                                SectionCard(
+                                    "懂你引擎 · 个性化舒适输入",
+                                    "本地专属排序模型与语义记忆，可选加密云同步，随时可清空",
+                                ) {
+                                    Check("个人专属排序与上下文学习", adaptive) { adaptive = it }
+                                    Check("剪贴板静默识词（自动跳过密码与网址）", clipLearn) { clipLearn = it }
+                                    OutlinedButton(
+                                        enabled = !busy,
+                                        onClick = {
+                                            busy = true
+                                            Core.call(
+                                                this@SettingsActivity,
+                                                "personalization-clear",
+                                                background = true,
+                                            ) { r ->
+                                                busy = false
+                                                notice =
+                                                    r.fold(
+                                                        { "已清空个人习惯记忆" },
+                                                        { it.message.orEmpty() },
+                                                    )
+                                            }
+                                        },
+                                    ) {
+                                        Text("清空习惯记忆")
+                                    }
+                                }
                             }
                             1 -> {
                                 SectionCard("网络模式", "纯离线模式下物理阻断局域网与外部网络请求") {
@@ -554,6 +590,26 @@ class SettingsActivity : ComponentActivity() {
                                                 busy = true
                                                 Core.call(
                                                     this@SettingsActivity,
+                                                    "poll-services",
+                                                    background = true,
+                                                ) { r ->
+                                                    busy = false
+                                                    notice =
+                                                        r.fold(
+                                                            { "已完成与 Koofr 云端同步" },
+                                                            { it.message.orEmpty() },
+                                                        )
+                                                }
+                                            },
+                                        ) {
+                                            Text("立即同步")
+                                        }
+                                        OutlinedButton(
+                                            enabled = !busy && !offline,
+                                            onClick = {
+                                                busy = true
+                                                Core.call(
+                                                    this@SettingsActivity,
                                                     "restore-from-koofr",
                                                     json("config" to config),
                                                     true,
@@ -624,7 +680,7 @@ class SettingsActivity : ComponentActivity() {
                                                 }
                                             },
                                         ) {
-                                            Text("云盘用量")
+                                            Text("用量")
                                         }
                                     }
                                 }

@@ -54,6 +54,8 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             core.apply_preferences(serde_json::from_value(v.clone())?)?;
             json!({"ok":true,"shortcuts":core.input.lock().engine.config.shortcuts})
         }
+        "personalization-stats" => to_value(core.personalization_stats())?,
+        "personalization-clear" => to_value(core.clear_learned_habits())?,
         "storage" => to_value(core.cloud_usage()?)?,
         "set-pure-offline" => {
             core.set_pure_offline(arg(v, "enabled")?);

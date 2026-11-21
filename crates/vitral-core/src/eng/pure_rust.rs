@@ -119,6 +119,139 @@ impl PureRustEngine {
         imported: Option<&ImportedLexiconIndex>,
         retention: Option<&RetentionEngine>,
     ) -> Vec<(CandidateItem, String)> {
+        self.query_all_candidates_contextual(
+            raw_input,
+            schema,
+            opencc_mode,
+            imported,
+            retention,
+            None,
+            None,
+            false,
+        )
+    }
+
+    /// Exact dictionary words for typo recovery, without the sentence beam or grammar LM.
+    /// Bound both syllable paths and homophones so a malformed code stays inexpensive.
+    pub(super) fn query_correction_candidates(
+        &self,
+        code: &str,
+        schema: SchemaKind,
+        imported: &ImportedLexiconIndex,
+        retention: &RetentionEngine,
+    ) -> Vec<(CandidateItem, String, f64)> {
+        use crate::imp::xiaohe::{canonical_syllable_set, xiaohe_reverse_map};
+
+        if !(4..=48).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+            return Vec::new();
+        }
+        let flypy = schema == SchemaKind::DoublePinyinFlypy;
+        if flypy && code.len() % 2 != 0 {
+            return Vec::new();
+        }
+        let corpus = self.get_corpus();
+        let now_ms = RetentionEngine::now_epoch_ms();
+        let mut seen = HashSet::new();
+        let mut ranked = Vec::new();
+        let mut add = |word: &str, reading: &str, weight: u64| {
+            if word.chars().count() < 2
+                || !word.chars().all(crate::ret::is_cjk)
+                || retention.erased_words.contains(word)
+                || !imported.matches_reading(word, code, flypy)
+                || !seen.insert(word.to_string())
+            {
+                return;
+            }
+            let frecency_score = retention.decayed_score_at(word, now_ms);
+            ranked.push((
+                CandidateItem {
+                    index: 0,
+                    text: word.to_string(),
+                    comment: reading.to_string(),
+                    pinned: retention.pinned_words.contains(word),
+                    is_clipboard_shortcut: false,
+                    quick_paste_id: None,
+                    function_action: None,
+                    shortcut_code: None,
+                    frecency_score,
+                },
+                word.to_string(),
+                frecency_score + (weight as f64 + 1.0).ln(),
+            ));
+        };
+        let imported_words = if flypy {
+            imported.query_xiaohe(code)
+        } else {
+            imported.query_quanpin(code)
+        };
+        for word in imported_words.iter().take(8) {
+            add(&word.text, &word.pinyin, u64::from(word.weight));
+        }
+        let mut paths = vec![(0usize, String::new(), 0usize)];
+        let mut visited = 0;
+        while let Some((offset, reading, syllable_count)) = paths.pop() {
+            if visited == 64 {
+                break;
+            }
+            visited += 1;
+            if offset == code.len() {
+                if syllable_count >= 2 {
+                    if let Some(words) = corpus.spaced_pinyin_to_words.get(&reading) {
+                        for (word, weight) in words.iter().take(8) {
+                            add(word, &reading, *weight);
+                        }
+                    }
+                }
+                continue;
+            }
+            if syllable_count == 8 {
+                continue;
+            }
+            let mut push = |end: usize, syllable: &str| {
+                let mut next = reading.clone();
+                if !next.is_empty() {
+                    next.push(' ');
+                }
+                next.push_str(syllable);
+                paths.push((end, next, syllable_count + 1));
+            };
+            if flypy {
+                if let Some(syllables) = xiaohe_reverse_map().get(&code[offset..offset + 2]) {
+                    for syllable in syllables.iter().rev() {
+                        push(offset + 2, syllable);
+                    }
+                }
+            } else {
+                for end in offset + 1..=(offset + 6).min(code.len()) {
+                    let syllable = &code[offset..end];
+                    if canonical_syllable_set().contains(syllable) {
+                        push(end, syllable);
+                    }
+                }
+            }
+        }
+        ranked.sort_by(|a, b| {
+            b.0.pinned
+                .cmp(&a.0.pinned)
+                .then_with(|| b.2.total_cmp(&a.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        ranked.truncate(3);
+        ranked
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn query_all_candidates_contextual(
+        &self,
+        raw_input: &str,
+        schema: SchemaKind,
+        opencc_mode: OpenCcMode,
+        imported: Option<&ImportedLexiconIndex>,
+        retention: Option<&RetentionEngine>,
+        prev_context: Option<&str>,
+        app_id: Option<&str>,
+        adaptive: bool,
+    ) -> Vec<(CandidateItem, String)> {
         if raw_input.is_empty() {
             return Vec::new();
         }
@@ -159,7 +292,16 @@ impl PureRustEngine {
             }
             let pinned = retention.is_some_and(|r| r.pinned_words.contains(&cand.text));
             let frec = retention
-                .map(|r| r.decayed_score_at(&cand.text, now_ms))
+                .map(|r| {
+                    r.contextual_score_at(
+                        &cand.text,
+                        raw_input,
+                        prev_context,
+                        app_id,
+                        now_ms,
+                        adaptive,
+                    )
+                })
                 .unwrap_or(0.0);
             let comment = cand.syllables.join(" ");
             let item = CandidateItem {

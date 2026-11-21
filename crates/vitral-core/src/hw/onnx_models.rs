@@ -12,6 +12,7 @@ use ort::{session::Session, value::TensorRef};
 #[derive(Debug, Clone)]
 pub struct BertTokenizer {
     vocab: HashMap<String, i64>,
+    pub id_to_char: Vec<Option<char>>,
     pub cls_id: i64,
     pub sep_id: i64,
     pub mask_id: i64,
@@ -23,8 +24,14 @@ impl BertTokenizer {
     pub fn from_vocab_file(path: &Path) -> Option<Self> {
         let content = fs::read_to_string(path).ok()?;
         let mut vocab = HashMap::with_capacity(22_000);
+        let mut id_to_char = Vec::new();
         for (idx, line) in content.lines().enumerate() {
             let tok = line.trim_end_matches(&['\r', '\n'][..]);
+            id_to_char.push(
+                tok.chars()
+                    .next()
+                    .filter(|&ch| tok.chars().count() == 1 && crate::ret::is_cjk(ch)),
+            );
             if !tok.is_empty() {
                 vocab.insert(tok.to_string(), idx as i64);
             }
@@ -36,6 +43,7 @@ impl BertTokenizer {
         let pad_id = *vocab.get("[PAD]").unwrap_or(&0);
         Some(Self {
             vocab,
+            id_to_char,
             cls_id,
             sep_id,
             mask_id,
@@ -234,6 +242,85 @@ impl HwOnnxBundle {
         }
     }
 
+    /// Encode only committed context; candidate queries consume the cached projection.
+    pub fn encode_rbt3_context(
+        &self,
+        context_chars: &[char],
+    ) -> Option<([i8; 32], HashMap<char, f32>)> {
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            let _ = context_chars;
+            None
+        }
+        #[cfg(feature = "native-onnx")]
+        {
+            if context_chars.is_empty() {
+                return None;
+            }
+            let tok = self.tokenizer.as_ref()?;
+            let sess_mtx = self.rerank_session.as_ref()?;
+            let chars = &context_chars[context_chars.len().saturating_sub(16)..];
+            let mask_pos = 1 + chars.len();
+            let mut ids = Vec::with_capacity(chars.len() + 3);
+            ids.push(tok.cls_id);
+            ids.extend(
+                chars
+                    .iter()
+                    .map(|&ch| tok.char_token_id(ch).unwrap_or(tok.unk_id)),
+            );
+            ids.extend([tok.mask_id, tok.sep_id]);
+            let len = ids.len();
+            let attention = vec![1i64; len];
+            let types = vec![0i64; len];
+            let mut session = sess_mtx.lock();
+            let outputs = session.run(ort::inputs![
+                "input_ids" => TensorRef::from_array_view(([1usize, len], ids.as_slice())).ok()?,
+                "attention_mask" => TensorRef::from_array_view(([1usize, len], attention.as_slice())).ok()?,
+                "token_type_ids" => TensorRef::from_array_view(([1usize, len], types.as_slice())).ok()?
+            ]).ok()?;
+            let (shape, logits) = outputs["logits"].try_extract_tensor::<f32>().ok()?;
+            if shape.len() != 3 || shape[0] != 1 || shape[1] as usize != len {
+                return None;
+            }
+            let vocab_size = shape[2] as usize;
+            let row = &logits[mask_pos * vocab_size..(mask_pos + 1) * vocab_size];
+            let max_z = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let log_norm = max_z
+                + row
+                    .iter()
+                    .map(|&z| (z as f64 - max_z).exp())
+                    .sum::<f64>()
+                    .ln();
+            let mut top: Vec<_> = tok
+                .id_to_char
+                .iter()
+                .zip(row)
+                .enumerate()
+                .filter_map(|(tid, (ch, &z))| {
+                    ch.filter(|_| tid as i64 != tok.unk_id)
+                        .map(|ch| (tid, ch, z))
+                })
+                .collect();
+            let k = top.len().min(64);
+            if k == 0 {
+                return None;
+            }
+            top.select_nth_unstable_by(k - 1, |a, b| {
+                b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0))
+            });
+            top.truncate(k);
+            top.sort_by_key(|t| t.0);
+            let mut vector = [0.0; 32];
+            let mut priors = HashMap::with_capacity(k);
+            for (tid, ch, z) in top {
+                let prob = (z as f64 - log_norm).exp() as f32;
+                priors.insert(ch, prob);
+                crate::ret::project_token(&mut vector, tid as u64, prob);
+            }
+            Some((crate::ret::quantize_context(vector), priors))
+        }
+    }
+
     /// Run `hw_model` ONNX on a flattened `[B, 3, 48, 48]` DirectMap batch.
     pub fn classify_directmap_batch(
         &self,
@@ -392,5 +479,44 @@ impl HwOnnxBundle {
             }
             Some(out)
         }
+    }
+}
+
+#[cfg(all(test, feature = "native-onnx"))]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn real_rbt3_context_encoding_reuses_frozen_mlm() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        if !assets.join("reranker/model_int8.onnx").is_file() {
+            return;
+        }
+        let bundle = HwOnnxBundle::load_cached(Some(&assets));
+        assert!(bundle.encode_rbt3_context(&[]).is_none());
+        let encode = |text: &str| {
+            bundle
+                .encode_rbt3_context(&text.chars().collect::<Vec<_>>())
+                .expect("available rbt3 model must encode context")
+        };
+        let (a, priors) = encode("今天晚上想吃");
+        let (b, _) = encode("今天晚上要吃");
+        assert!(a.iter().any(|&v| v != 0));
+        assert!(!priors.is_empty() && priors.len() <= 64);
+        assert!(priors
+            .iter()
+            .all(|(&ch, &p)| crate::ret::is_cjk(ch) && p.is_finite() && p > 0.0 && p <= 1.0));
+        let dot = a
+            .iter()
+            .zip(b)
+            .map(|(&x, y)| x as f64 * y as f64)
+            .sum::<f64>();
+        let norm = |v: &[i8; 32]| v.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let cosine = dot / (norm(&a) * norm(&b));
+        eprintln!(
+            "rbt3 similar-context cosine={cosine:.4}, priors={}",
+            priors.len()
+        );
+        assert!(cosine > 0.65, "similar contexts: {cosine}");
     }
 }

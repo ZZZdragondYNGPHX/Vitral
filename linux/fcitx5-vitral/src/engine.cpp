@@ -10,6 +10,7 @@
 #include <QSysInfo>
 #include <QUuid>
 #include <atomic>
+#include <csignal>
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/rawconfig.h>
 #include <fcitx-utils/event.h>
@@ -207,19 +208,26 @@ public:
   }
 
   void startPanel() {
-    if (panel_.state() == QProcess::NotRunning) {
-      auto bin = QStandardPaths::findExecutable("vitral-panel");
-      if (!bin.isEmpty()) {
-        auto environment = QProcessEnvironment::systemEnvironment();
-        // KWin's private input-method socket belongs to Fcitx, not the panel.
-        environment.remove("WAYLAND_SOCKET");
-        panel_.setProcessEnvironment(environment);
-        panel_.start(bin, {});
-      }
-    }
+    if (panelPid_ > 0 && ::kill(static_cast<pid_t>(panelPid_), 0) == 0)
+      return;
+    panelPid_ = 0;
+    auto bin = QStandardPaths::findExecutable("vitral-panel");
+    if (bin.isEmpty())
+      return;
+    auto environment = QProcessEnvironment::systemEnvironment();
+    // KWin's private input-method socket belongs to Fcitx, not the panel.
+    environment.remove("WAYLAND_SOCKET");
+    QProcess proc;
+    proc.setProgram(bin);
+    proc.setProcessEnvironment(environment);
+    qint64 pid = 0;
+    if (proc.startDetached(&pid))
+      panelPid_ = pid;
   }
 
   ~Engine() override {
+    if (panelPid_ > 0)
+      ::kill(static_cast<pid_t>(panelPid_), SIGTERM);
     clipboardTimer_.reset();
     control_.reset();
     if (aiWorker_.joinable())
@@ -577,7 +585,7 @@ private:
   std::jthread aiWorker_;
   bool aiBusy_ = false;
   bool composing_ = false, hasPrev_ = false, hasNext_ = false;
-  QProcess panel_;
+  qint64 panelPid_ = 0;
   std::atomic<bool> english_{false}, active_{false};
   std::atomic<bool> internalEnglish_{true};
   std::atomic<int> activity_{0}, editor_{0}, panelTheme_{0};
