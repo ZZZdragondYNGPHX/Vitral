@@ -1,6 +1,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 #[cfg(windows)]
 mod windows;
+// Share shortcut validation and defaults without loading the input engine in the Linux settings process.
+#[path = "../../../../crates/vitral-core/src/shortcuts.rs"]
+mod shortcuts;
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -28,7 +31,19 @@ fn preferences(settings: &Settings) -> Result<Value, String> {
 }
 
 fn public_settings(mut cfg: Value) -> Value {
+    if cfg.get("shortcuts").is_none() {
+        cfg["shortcuts"] = json!(shortcuts::defaults());
+    }
+    cfg["shortcut_defaults"] = json!(shortcuts::defaults());
+    cfg["shortcut_actions"] = json!(shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()})));
+    cfg["launch_page"] = json!(if std::env::args().any(|a| a == "--clipboard") { "library" } else { "input" });
+    if cfg!(target_os = "linux") {
+        cfg["linux_english_mode"] = json!(cfg["linux_english_mode"].as_bool().unwrap_or(true));
+    } else if let Some(fields) = cfg.as_object_mut() {
+        fields.remove("linux_english_mode");
+    }
     for key in ["ai_api_key", "koofr_password", "sync_key"] {
+        cfg[format!("has_{key}")] = json!(cfg.get(key).and_then(Value::as_str).is_some_and(|s| !s.is_empty()));
         if let Some(fields) = cfg.as_object_mut() {
             fields.remove(key);
         }
@@ -69,6 +84,17 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
         let fields = cfg.as_object_mut().ok_or("配置格式错误")?;
         for (key, value) in patch.as_object().ok_or("配置格式错误")? {
             match key.as_str() {
+                "shortcuts" => {
+                    let mut bindings: Vec<shortcuts::ShortcutBinding> = serde_json::from_value(value.clone()).map_err(|e| e.to_string())?;
+                    shortcuts::normalize(&mut bindings).map_err(|e| e.to_string())?;
+                    fields.insert(key.clone(), json!(bindings));
+                    continue;
+                }
+                "linux_english_mode" if cfg!(target_os = "linux") => {
+                    if !value.is_boolean() {
+                        return Err("输入法内英文模式应为开启或关闭".into());
+                    }
+                }
                 "candidate_font_px" if !(13..=22).contains(&value.as_u64().unwrap_or(0)) => {
                     return Err("候选字号应在 13–22 px 之间".into())
                 }
@@ -266,8 +292,8 @@ fn main() {
                     tauri::WebviewUrl::App("recorder.html".into()),
                 )
                 .title("Vitral · 录音笔")
-                .inner_size(340., 210.)
-                .min_inner_size(270., 155.)
+                .inner_size(380., 280.)
+                .min_inner_size(300., 200.)
                 .always_on_top(true)
                 .build()?;
             } else {

@@ -236,7 +236,9 @@ pub fn serve() -> Result<()> {
         .ok_or("install directory")?
         .join("assets"));
     config["background_sync"] = json!(true);
+    config["platform"] = json!("windows");
     let core = Arc::new(VitralCore::init(&config.to_string())?);
+    crate::windows_clipboard::start(core.clone());
     let poll = core.clone();
     std::thread::spawn(move || loop {
         std::thread::sleep(Duration::from_secs(3));

@@ -601,6 +601,56 @@ pub(crate) fn merge_clipboard_ring(
     })
 }
 
+/// The latest copy survives history trimming and device-local suggestion dismissal.
+pub(crate) fn sync_current_copy(
+    guard: &OfflineGuard, cfg: &DavConfig, local: Option<&ClipboardEntry>,
+) -> Result<Option<ClipboardEntry>, VitralError> {
+    let dav = KoofrDavClient::connect(guard, cfg)?;
+    let mut url = reqwest::Url::parse(&cfg.endpoint).map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
+    url.path_segments_mut().map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?
+        .pop_if_empty().extend(dav.clean_root.split('/')).push("clipboard").push("current.json.enc");
+    let client = dav_http_client()?;
+    let request = |method| {
+        let req = client.request(method, url.clone());
+        if let Some(user) = cfg.username.as_ref() { req.basic_auth(user, cfg.password.as_ref()) } else { req }
+    };
+    let io = |e: reqwest::Error| VitralError::Io(e.without_url().to_string());
+    run_on_blocking_dav_thread(|| {
+        for _ in 0..4 {
+            let outcome = dav_runtime()?.block_on(async {
+                guard.require_online("synchronize current clipboard")?;
+                let reply = request(reqwest::Method::GET).send().await.map_err(io)?;
+                let missing = reply.status() == reqwest::StatusCode::NOT_FOUND;
+                let (cloud, tag) = if missing { (None, None) } else {
+                    let reply = reply.error_for_status().map_err(io)?;
+                    let tag = reply.headers().get(reqwest::header::ETAG).cloned();
+                    let data = reply.bytes().await.map_err(io)?;
+                    (Some(serde_json::from_slice::<ClipboardEntry>(&decrypt_envelope(&data, cfg.sync_key.as_deref())?)
+                        .map_err(|e| VitralError::Parse(e.to_string()))?), tag)
+                };
+                let Some(local) = local else { return Ok((true, cloud)); };
+                if cloud.as_ref().is_some_and(|e| crate::clip::copy_order(e) >= crate::clip::copy_order(local)) {
+                    return Ok((true, cloud));
+                }
+                let mut put = request(reqwest::Method::PUT);
+                if missing { put = put.header(reqwest::header::IF_NONE_MATCH, "*"); }
+                else { put = put.header(reqwest::header::IF_MATCH, tag.ok_or_else(|| VitralError::Io("WebDAV current clipboard response is missing ETag".into()))?); }
+                let data = serde_json::to_vec(local).map_err(|e| VitralError::Parse(e.to_string()))?;
+                guard.require_online("write current clipboard")?;
+                let response = put.body(encrypt_envelope(&data, cfg.sync_key.as_deref())?).send().await.map_err(io)?;
+                match response.status() {
+                    reqwest::StatusCode::PRECONDITION_FAILED => Ok((false, None)),
+                    reqwest::StatusCode::CONFLICT if missing => Ok((false, Some(local.clone()))),
+                    _ => { response.error_for_status().map_err(io)?; Ok::<_, VitralError>((true, Some(local.clone()))) }
+                }
+            })?;
+            if outcome.0 { return Ok(outcome.1); }
+            if outcome.1.is_some() { dav.op.create_dir("clipboard/").map_err(|e| VitralError::Io(e.to_string()))?; }
+        }
+        Err(VitralError::Io("current clipboard changed during synchronization".into()))
+    })
+}
+
 pub fn upload_clipboard_ring(
     guard: &OfflineGuard,
     cfg: &DavConfig,

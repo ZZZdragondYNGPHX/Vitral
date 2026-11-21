@@ -1,14 +1,14 @@
 # 工具链、设计令牌与离线资源
 
 Vitral 的输入核心使用 Rust。Linux、Windows 和 Android 的打包脚本均从仓库根目录运行。
-宿主职责见[架构与模块](../architecture.md)，交互要求见 [PROPOSAL.md](../PROPOSAL.md)。
+宿主职责见[架构与模块](../handoff/PROJECT.md)，交互要求见 [PROPOSAL.md](../PROPOSAL.md)。
 
 ## Linux
 
 - Rust workspace 构建 CLI、C ABI 共享库和公共核心。
 - 桌面管理中心使用独立的 Tauri Cargo manifest。
 - Fcitx5 插件通过 CMake 构建，使用 Fcitx5 Core、Qt 6 和 libsystemd。
-- 状态面板使用 Qt Widgets、Qt DBus、LayerShellQt、KWayland 和 KF6WindowSystem。
+- 状态面板使用 Qt Widgets、Qt DBus、Qt Wayland Client、wayland-scanner、LayerShellQt、KWayland 和 KF6WindowSystem。
 - 管理中心需要 GTK 3、WebKitGTK 4.1 等 Tauri Linux 依赖。
 - 原生拼音引擎使用 librime，发行包内的字典和语法文件放在 `usr/share/vitral/assets/`。
 - `scripts/package-linux.sh` 组合插件、核心库、主题、管理中心和资源，输出 x86_64 tar.zst。

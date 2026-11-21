@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QSettings>
 #include <QStandardPaths>
 #include <QSysInfo>
@@ -11,6 +12,7 @@
 #include <atomic>
 #include <fcitx-config/configuration.h>
 #include <fcitx-config/rawconfig.h>
+#include <fcitx-utils/event.h>
 #include <fcitx-utils/eventdispatcher.h>
 #include <fcitx-utils/log.h>
 #include <fcitx/addonfactory.h>
@@ -22,6 +24,7 @@
 #include <fcitx/inputpanel.h>
 #include <fcitx/instance.h>
 #include <functional>
+#include <set>
 #include <stdexcept>
 
 #include "vitral_core.h"
@@ -47,11 +50,20 @@ QJsonObject unpack(VitralStringResult result) {
 class Choice final : public CandidateWord {
 public:
   using Select = std::function<void(InputContext *)>;
+  static QString displayText(const QJsonObject &candidate) {
+    auto text = candidate["text"].toString();
+    if (candidate.contains("quick_paste_id")) {
+      text = text.simplified();
+      if (text.size() > 8)
+        text = text.left(8) + "…";
+    }
+    return text;
+  }
   Choice(const QJsonObject &candidate, Select select)
-      : CandidateWord(Text(candidate["text"].toString().toStdString())),
+      : CandidateWord(Text(displayText(candidate).toStdString())),
         select_(std::move(select)) {
     setComment(Text(candidate["comment"].toString().toStdString()));
-    setCustomLabel(Text(std::to_string(candidate["index"].toInt() + 1) + ". "));
+    setCustomLabel(Text(std::to_string(candidate["index"].toInt() + 1) + " "));
   }
   void select(InputContext *ic) const override {
     auto callback = select_;
@@ -60,6 +72,32 @@ public:
 
 private:
   Select select_;
+};
+
+class PagedCandidateList final : public CommonCandidateList {
+public:
+  using Page = std::function<void(KeySym)>;
+  PagedCandidateList(bool hasPrev, bool hasNext, Page page)
+      : hasPrev_(hasPrev), hasNext_(hasNext), page_(std::move(page)) {}
+  bool hasPrev() const override { return hasPrev_; }
+  bool hasNext() const override { return hasNext_; }
+  bool usedNextBefore() const override { return hasPrev_; }
+  void prev() override {
+    if (hasPrev_) {
+      auto callback = page_;
+      callback(FcitxKey_Page_Up);
+    }
+  }
+  void next() override {
+    if (hasNext_) {
+      auto callback = page_;
+      callback(FcitxKey_Page_Down);
+    }
+  }
+
+private:
+  bool hasPrev_, hasNext_;
+  Page page_;
 };
 
 class Engine final : public InputMethodEngineV2 {
@@ -72,6 +110,8 @@ public:
     QJsonObject cfg;
     if (file.open(QIODevice::ReadOnly))
       cfg = QJsonDocument::fromJson(file.readAll()).object();
+    internalEnglish_ = cfg.value("linux_english_mode").toBool(true);
+    setPanelTheme(cfg);
     const auto data =
         QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
         "/vitral";
@@ -95,6 +135,15 @@ public:
       vitral_free_string(error);
       throw std::runtime_error(why);
     }
+    shortcuts_ = command("shortcuts-state")["bindings"].toArray();
+    clipboardTimer_ = instance_->eventLoop().addTimeEvent(
+        CLOCK_MONOTONIC, now(CLOCK_MONOTONIC) + 250000, 0,
+        [this](EventSourceTime *timer, uint64_t) {
+          receiveClipboard();
+          timer->setNextInterval(250000);
+          timer->setOneShot();
+          return true;
+        });
     control_ = std::make_unique<DesktopControl>(
         core_,
         [this](std::string cmd, std::string args) {
@@ -117,10 +166,13 @@ public:
               return;
             }
             if (cmd == "toggle-language") {
+              if (!internalEnglish_)
+                return;
               auto action = unpack(vitral_process_key(core_, 0, 1u << 30,
                                                       VITRAL_SWIPE_DIR_NONE));
               english_ = action["lang_mode"].toString() == "en";
               render(ic, action);
+              ic->updateUserInterface(UserInterfaceComponent::StatusArea);
               return;
             }
             if (cmd == "commit-text") {
@@ -135,16 +187,40 @@ public:
           });
         },
         [this] {
-          return QJsonDocument(QJsonObject{{"active", active_.load()},
-                                           {"editor", editor_.load()},
-                                           {"english", english_.load()},
-                                           {"activity", activity_.load()}})
+          return QJsonDocument(
+                     QJsonObject{
+                         {"active", active_.load()},
+                         {"editor", editor_.load()},
+                         {"english", english_.load()},
+                         {"english_mode_enabled", internalEnglish_.load()},
+                         {"theme", panelTheme_.load() == 1   ? "light"
+                                   : panelTheme_.load() == 2 ? "dark"
+                                                             : "system"},
+                         {"activity", activity_.load()},
+                         {"function", function_.load()},
+                         {"function_serial", functionSerial_.load()},
+                         {"function_editor", functionEditor_.load()}})
               .toJson(QJsonDocument::Compact)
               .toStdString();
         });
+    startPanel();
+  }
+
+  void startPanel() {
+    if (panel_.state() == QProcess::NotRunning) {
+      auto bin = QStandardPaths::findExecutable("vitral-panel");
+      if (!bin.isEmpty()) {
+        auto environment = QProcessEnvironment::systemEnvironment();
+        // KWin's private input-method socket belongs to Fcitx, not the panel.
+        environment.remove("WAYLAND_SOCKET");
+        panel_.setProcessEnvironment(environment);
+        panel_.start(bin, {});
+      }
+    }
   }
 
   ~Engine() override {
+    clipboardTimer_.reset();
     control_.reset();
     if (aiWorker_.joinable())
       aiWorker_.join();
@@ -156,15 +232,17 @@ public:
     ++editor_;
     active_ = true;
     ++activity_;
-    if (panel_.state() == QProcess::NotRunning) {
-      auto bin = QStandardPaths::findExecutable("vitral-panel");
-      if (!bin.isEmpty())
-        panel_.start(bin, {});
-    }
+    startPanel();
     auto focus = unpack(vitral_on_app_focus(
         core_, ic->program().empty() ? "desktop" : ic->program().c_str()));
     english_ = focus["lang_mode"].toString() == "en";
+    if (!internalEnglish_ && english_) {
+      unpack(vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
+      english_ = false;
+    }
+    receiveClipboard();
     unpack(vitral_on_ime_open(core_));
+    render(ic, command("candidate-state"));
   }
 
   void reset(const InputMethodEntry &, InputContextEvent &event) override {
@@ -173,6 +251,7 @@ public:
           vitral_process_key(core_, FcitxKey_Escape, 0, VITRAL_SWIPE_DIR_NONE));
     composing_ = false;
     shiftHeld_ = false;
+    shortcutKeysDown_.clear();
     event.inputContext()->inputPanel().reset();
     event.inputContext()->updatePreedit();
     event.inputContext()->updateUserInterface(
@@ -188,22 +267,62 @@ public:
   }
 
   void keyEvent(const InputMethodEntry &, KeyEvent &event) override {
+    receiveClipboard();
     auto key = event.key();
     auto sym = key.sym();
     auto *ic = event.inputContext();
     if (sym == FcitxKey_Shift_L || sym == FcitxKey_Shift_R) {
-      if (event.isRelease() && shiftHeld_) {
-        auto action = unpack(
-            vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
-        english_ = action["lang_mode"].toString() == "en";
-        render(ic, action);
-        event.filterAndAccept();
+      if (key.states().test(KeyState::Ctrl) ||
+          key.states().test(KeyState::Alt) ||
+          key.states().test(KeyState::Super)) {
+        shiftHeld_ = false;
+        return;
       }
+      if (event.isRelease() && shiftHeld_ && runShortcut(ic, "Shift"))
+        event.filterAndAccept();
       shiftHeld_ = !event.isRelease();
       return;
     }
     shiftHeld_ = false;
     ++activity_;
+    if (event.isRelease()) {
+      if (shortcutKeysDown_.erase(sym))
+        event.filterAndAccept();
+      return;
+    }
+    if (shortcutKeysDown_.contains(sym)) {
+      event.filterAndAccept();
+      return;
+    }
+    QString shortcut;
+    if (sym >= FcitxKey_F1 && sym <= FcitxKey_F12)
+      shortcut = "F" + QString::number(sym - FcitxKey_F1 + 1);
+    else if (key.states().test(KeyState::Ctrl) ||
+             key.states().test(KeyState::Alt)) {
+      if (sym >= FcitxKey_a && sym <= FcitxKey_z)
+        shortcut = QChar(static_cast<char16_t>('A' + sym - FcitxKey_a));
+      else if ((sym >= FcitxKey_A && sym <= FcitxKey_Z) ||
+               (sym >= FcitxKey_0 && sym <= FcitxKey_9))
+        shortcut = QChar(static_cast<char16_t>(sym));
+      else if (sym == FcitxKey_space)
+        shortcut = "Space";
+      else if (sym == FcitxKey_Return)
+        shortcut = "Enter";
+    }
+    if (!shortcut.isEmpty() && !key.states().test(KeyState::Super)) {
+      QString prefix;
+      if (key.states().test(KeyState::Ctrl))
+        prefix += "Ctrl+";
+      if (key.states().test(KeyState::Alt))
+        prefix += "Alt+";
+      if (key.states().test(KeyState::Shift))
+        prefix += "Shift+";
+      if (runShortcut(ic, prefix + shortcut)) {
+        shortcutKeysDown_.insert(sym);
+        event.filterAndAccept();
+        return;
+      }
+    }
     if (!event.isRelease() && composing_ && sym >= FcitxKey_1 &&
         sym <= FcitxKey_5 &&
         (key.states().test(KeyState::Ctrl) ||
@@ -221,6 +340,36 @@ public:
     if (event.isRelease() || english_ || key.states().test(KeyState::Ctrl) ||
         key.states().test(KeyState::Alt) || key.states().test(KeyState::Super))
       return;
+    auto list = std::dynamic_pointer_cast<CommonCandidateList>(
+        ic->inputPanel().candidateList());
+    if (list && list->size() > 0 && !key.states().test(KeyState::Shift)) {
+      if (sym == FcitxKey_Left || sym == FcitxKey_Right) {
+        int next =
+            std::clamp(list->cursorIndex() + (sym == FcitxKey_Left ? -1 : 1), 0,
+                       list->size() - 1);
+        list->setGlobalCursorIndex(next);
+        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+        event.filterAndAccept();
+        return;
+      }
+      if (sym == FcitxKey_Up || sym == FcitxKey_Down) {
+        if (sym == FcitxKey_Up ? hasPrev_ : hasNext_) {
+          auto page =
+              sym == FcitxKey_Up ? FcitxKey_Page_Up : FcitxKey_Page_Down;
+          auto action =
+              unpack(vitral_process_key(core_, page, 0, VITRAL_SWIPE_DIR_NONE));
+          if (!action.isEmpty())
+            render(ic, action);
+        }
+        event.filterAndAccept();
+        return;
+      }
+      if (sym == FcitxKey_space && list->cursorIndex() >= 0) {
+        list->candidate(list->cursorIndex()).select(ic);
+        event.filterAndAccept();
+        return;
+      }
+    }
     const bool editingKey = sym == FcitxKey_BackSpace ||
                             sym == FcitxKey_Return || sym == FcitxKey_Escape ||
                             sym == FcitxKey_Page_Up ||
@@ -240,6 +389,37 @@ public:
   }
 
 private:
+  bool runShortcut(InputContext *ic, const QString &key) {
+    for (const auto &item : shortcuts_) {
+      auto binding = item.toObject();
+      if (binding["key"].toString() != key ||
+          (!internalEnglish_ &&
+           binding["action"].toString() == "toggle_language"))
+        continue;
+      auto action = command("shortcut-key", {{"key", key}});
+      if (action.isEmpty())
+        return false;
+      render(ic, action);
+      return true;
+    }
+    return false;
+  }
+  QJsonObject command(const char *name, const QJsonObject &args = {}) {
+    auto bytes = QJsonDocument(args).toJson(QJsonDocument::Compact);
+    return unpack(vitral_fcitx_command(core_, name, bytes.constData()));
+  }
+  void receiveClipboard() {
+    auto *ic = instance_->lastFocusedInputContext();
+    auto id =
+        command("quick-paste-state")["quick_paste"].toObject()["id"].toString();
+    if (id != pasteId_) {
+      pasteId_ = id;
+      if (active_ && ic && ic->hasFocus() &&
+          instance_->inputMethod(ic) == "vitral")
+        render(ic, command("candidate-state"));
+    }
+  }
+
   void inlineAi(InputContext *ic, bool translate) {
     auto show = [](InputContext *context, const std::string &message) {
       context->inputPanel().setAuxDown(Text(message));
@@ -292,7 +472,26 @@ private:
     });
   }
 
+  void setPanelTheme(const QJsonObject &settings) {
+    const auto theme = settings["theme"].toString();
+    panelTheme_ = theme == "light" ? 1 : theme == "dark" ? 2 : 0;
+  }
   void applyAppearance(const QJsonObject &settings) {
+    setPanelTheme(settings);
+    internalEnglish_ = settings["linux_english_mode"].toBool(true);
+    shortcuts_ = command("shortcuts-state")["bindings"].toArray();
+    shiftHeld_ = false;
+    auto *ic = instance_->lastFocusedInputContext();
+    if (!internalEnglish_ && english_) {
+      auto action =
+          unpack(vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
+      english_ = false;
+      if (active_ && ic && ic->hasFocus() &&
+          instance_->inputMethod(ic) == "vitral") {
+        render(ic, action);
+        ic->updateUserInterface(UserInterfaceComponent::StatusArea);
+      }
+    }
     auto *ui = instance_->addonManager().addon("classicui");
     if (!ui || !ui->getConfig())
       return;
@@ -313,12 +512,18 @@ private:
     return english_ ? "En" : "中";
   }
   void render(InputContext *ic, const QJsonObject &action) {
+    pasteId_ =
+        command("quick-paste-state")["quick_paste"].toObject()["id"].toString();
+    english_ = action["lang_mode"].toString() == "en";
     auto commit = action["commit_text"].toString();
     if (!commit.isEmpty())
       ic->commitString(commit.toStdString());
     auto preedit = action["preedit"].toObject();
     auto text = preedit["text"].toString().toStdString();
     composing_ = !text.empty();
+    const auto page = action["page"].toObject();
+    hasPrev_ = page["has_prev"].toBool();
+    hasNext_ = page["has_next"].toBool();
     auto &panel = ic->inputPanel();
     panel.reset();
     Text marked(text, TextFormatFlag::Underline);
@@ -327,7 +532,13 @@ private:
       panel.setClientPreedit(marked);
     else
       panel.setPreedit(marked);
-    auto list = std::make_unique<CommonCandidateList>();
+    auto list = std::make_unique<PagedCandidateList>(
+        hasPrev_, hasNext_, [this, ic](KeySym key) {
+          auto action =
+              unpack(vitral_process_key(core_, key, 0, VITRAL_SWIPE_DIR_NONE));
+          if (!action.isEmpty())
+            render(ic, action);
+        });
     list->setPageSize(ergonomics::kDesktopCandidatePageSize);
     list->setLayoutHint(CandidateLayoutHint::Horizontal);
     for (const auto &item : action["candidates"].toArray()) {
@@ -344,19 +555,36 @@ private:
     }
     ic->updatePreedit();
     ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+    const auto function = action["function_action"].toString();
+    if (!function.isEmpty())
+      ic->updateUserInterface(UserInterfaceComponent::StatusArea);
+    if (function == "settings")
+      QProcess::startDetached("vitral-desktop", {});
+    else if (function == "clipboard" || function == "lookup" ||
+             function == "handwriting") {
+      function_ = function == "clipboard" ? 1 : function == "lookup" ? 2 : 3;
+      functionEditor_ = editor_.load();
+      ++functionSerial_;
+    }
   }
 
   Instance *instance_;
   EventDispatcher dispatcher_;
+  std::unique_ptr<EventSourceTime> clipboardTimer_;
+  QString pasteId_;
   std::unique_ptr<DesktopControl> control_;
   VitralEngine *core_ = nullptr;
   std::jthread aiWorker_;
   bool aiBusy_ = false;
-  bool composing_ = false;
+  bool composing_ = false, hasPrev_ = false, hasNext_ = false;
   QProcess panel_;
   std::atomic<bool> english_{false}, active_{false};
-  std::atomic<int> activity_{0}, editor_{0};
+  std::atomic<bool> internalEnglish_{true};
+  std::atomic<int> activity_{0}, editor_{0}, panelTheme_{0};
   bool shiftHeld_ = false;
+  QJsonArray shortcuts_;
+  std::set<uint32_t> shortcutKeysDown_;
+  std::atomic<int> function_{0}, functionSerial_{0}, functionEditor_{-1};
 };
 
 class Factory final : public AddonFactory {

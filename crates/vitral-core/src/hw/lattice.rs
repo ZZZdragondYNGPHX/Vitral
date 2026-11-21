@@ -25,7 +25,7 @@ pub struct LatticeSlot {
 }
 
 /// Dual-regime CASIA-OLHWDB spatiotemporal stroke segmentation:
-/// - Superimposed writing: splits on `dt >= superimposed_ink_fade_out_ms` (420ms).
+/// - Superimposed writing: a long pause before restarting in the previous glyph area splits the ink.
 /// - Horizontal connected writing: routes pause/wide-gap candidates through a batched
 ///   visual DAG + `IdsIndex` structural-compound gate (keeping LR single characters like
 ///   `明`/`好`/`你` unified even across intra-char pauses while splitting horizontal sequences).
@@ -59,7 +59,7 @@ pub fn segment_strokes(
     let median_dt = dts.get(dts.len() / 2).copied().unwrap_or(50).max(20);
     let fade_ms = TOKENS.handwriting.superimposed_ink_fade_out_ms as u64;
 
-    // Step 1: Hard boundaries (dt >= 420ms) and candidate horizontal boundaries
+    // Collect overlaid restarts and possible horizontal boundaries.
     let mut hard_splits = vec![false; valid.len() - 1];
     let mut horiz_candidates = vec![false; valid.len() - 1];
 
@@ -71,7 +71,16 @@ pub fn segment_strokes(
 
     for i in 0..(valid.len() - 1) {
         let dt = valid[i + 1].1.t_start.saturating_sub(valid[i].1.t_end);
-        if dt >= fade_ms {
+        let next = &valid[i + 1].1;
+        let cur_w = (cur_max_x - cur_min_x).max(1e-4);
+        let cur_h = (cur_max_y - cur_min_y).max(1e-4);
+        let char_scale = cur_h.max(cur_w);
+        let gap_x = next.min_x - cur_max_x;
+        let paused = dt >= fade_ms;
+
+        // A pause before the right component of a glyph needs the same visual
+        // comparison as a short pen lift. An overlaid restart stays a boundary.
+        if paused && gap_x < -0.05 * char_scale {
             hard_splits[i] = true;
             cur_min_x = valid[i + 1].1.min_x;
             cur_max_x = valid[i + 1].1.max_x;
@@ -83,12 +92,6 @@ pub fn segment_strokes(
 
         // Check horizontal non-overlap with the next stroke AND ensure no subsequent stroke
         // before the next hard split jumps back left into [cur_min_x, cur_max_x]
-        let next = &valid[i + 1].1;
-        let cur_w = (cur_max_x - cur_min_x).max(1e-4);
-        let cur_h = (cur_max_y - cur_min_y).max(1e-4);
-        let char_scale = cur_h.max(cur_w);
-        let gap_x = next.min_x - cur_max_x;
-
         let mut jumps_back_left = false;
         let mut merged_max_x = cur_max_x.max(next.max_x);
         let mut merged_max_y = cur_max_y.max(next.max_y);
@@ -112,13 +115,13 @@ pub fn segment_strokes(
         let merged_h = (merged_max_y - merged_min_y).max(1e-4);
         let merged_aspect = merged_w / merged_h;
 
-        let pause_signal = dt >= 135 && (dt as f32) >= 2.2 * (median_dt as f32);
+        let pause_signal = paused || (dt >= 135 && (dt as f32) >= 2.2 * (median_dt as f32));
         let wide_gap_signal = gap_x > 0.28 * char_scale && merged_aspect > 1.18;
 
         // Never hard-split on sub-420ms pauses blindly; route through visual DAG + IDS gate.
-        if gap_x > 0.02 * char_scale
-            && !jumps_back_left
-            && cur_count >= 2
+        if (paused || gap_x > 0.02 * char_scale)
+            && (paused || !jumps_back_left)
+            && (paused || cur_count >= 2)
             && (pause_signal || wide_gap_signal)
         {
             horiz_candidates[i] = true;

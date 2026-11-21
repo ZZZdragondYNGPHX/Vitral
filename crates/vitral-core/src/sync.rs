@@ -112,6 +112,8 @@ pub fn sort_devices_mru(devices: &mut [RelayDevice]) {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileBackup {
+    #[serde(default = "crate::shortcuts::defaults")]
+    pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
     pub schema_version: u32,
     pub schema: SchemaKind,
     pub opencc_mode: OpenCcMode,

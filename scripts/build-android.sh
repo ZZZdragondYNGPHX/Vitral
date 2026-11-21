@@ -22,7 +22,7 @@ tasks=(testDebugUnitTest assembleRelease)
 if [[ -z ${VITRAL_ANDROID_KEYSTORE:-} && ! -f $development_store ]]; then
     tasks=(:app:validateSigningDebug "${tasks[@]}")
 fi
-./gradlew --no-daemon "${tasks[@]}"
+./gradlew --no-daemon --max-workers=1 "${tasks[@]}"
 release_dir="$root/target/release"
 mkdir -p "$release_dir"
 stage=$(mktemp -d "$release_dir/vitral-apk.XXXXXX")

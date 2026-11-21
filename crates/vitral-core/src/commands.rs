@@ -52,7 +52,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
     Ok(match cmd {
         "configure" => {
             core.apply_preferences(serde_json::from_value(v.clone())?)?;
-            json!({"ok":true})
+            json!({"ok":true,"shortcuts":core.input.lock().engine.config.shortcuts})
         }
         "storage" => to_value(core.cloud_usage()?)?,
         "set-pure-offline" => {
@@ -89,6 +89,17 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             };
             to_value(core.process_key(keycode(string(v, "keycode")?)?, flags, swipe)?)?
         }
+        "shortcuts-state" => {
+            let st = core.input.lock();
+            json!({"bindings":st.engine.config.shortcuts,"actions":crate::shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()}))})
+        }
+        "shortcut-match" => {
+            let key = crate::shortcuts::normalize_key(string(v, "key")?)?;
+            let st = core.input.lock();
+            to_value(st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == key && st.engine.config.shortcut_enabled(b.action)).map(|b| b.action))?
+        }
+        "shortcut-key" => to_value(core.shortcut_key(string(v, "key")?)?)?,
+        "candidate-state" => to_value(core.candidate_state()?)?,
         "select-candidate" => to_value(core.select_candidate(arg(v, "idx")?)?)?,
         "pin-candidate" => to_value(core.pin_candidate(arg(v, "idx")?)?)?,
         "erase-candidate" => to_value(core.erase_candidate(arg(v, "idx")?)?)?,
@@ -138,6 +149,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "clipboard-state" => to_value(core.clipboard_state())?,
         "poll-services" => to_value(core.poll_services()?)?,
         "clipboard-poll" => to_value(core.poll_clipboard()?)?,
+        "hide-quick-paste-for-input" => { core.hide_quick_paste_for_input(); to_value(core.quick_paste_state())? },
         "quick-paste-state" => to_value(core.quick_paste_state())?,
         "consume-quick-paste" => to_value(core.consume_quick_paste())?,
         "on-ime-open" => to_value(core.on_ime_open())?,
@@ -146,6 +158,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "clipboard-pin" => {
             to_value(core.clipboard_pin(string(v, "id")?, v["shortcut_code"].as_str())?)?
         }
+        "clipboard-unpin" => to_value(core.clipboard_unpin(string(v, "id")?)?)?,
         "clipboard-clear-unpinned" => to_value(core.clipboard_clear_unpinned())?,
         "relay-discover" => to_value(core.discover_devices()?)?,
         "relay-stop-discovery" => {
@@ -185,7 +198,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             let mut result = to_value(core.restore_from_koofr(&v["config"].to_string())?)?;
             let st = core.input.lock();
             result["preferences"] = json!({
-                "schema": st.engine.schema, "opencc_mode": st.engine.opencc_mode,
+                "schema": st.engine.schema, "opencc_mode": st.engine.opencc_mode, "shortcuts": st.engine.config.shortcuts,
                 "clipboard_ring_capacity": st.engine.config.clipboard_ring_capacity,
                 "frecency_half_life_sec": st.retention.half_life_sec
             });

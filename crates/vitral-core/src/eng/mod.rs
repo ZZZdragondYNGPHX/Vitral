@@ -69,6 +69,10 @@ pub enum SwipeDir {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
+    #[serde(default = "crate::shortcuts::defaults")]
+    pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
+    #[serde(default = "default_enabled")]
+    pub linux_english_mode: bool,
     #[serde(default)]
     pub data_dir: String,
     #[serde(default)]
@@ -126,6 +130,10 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    pub fn shortcut_enabled(&self, action: crate::shortcuts::ShortcutAction) -> bool {
+        !(cfg!(target_os = "linux") && !self.linux_english_mode && action == crate::shortcuts::ShortcutAction::ToggleLanguage)
+    }
+
     pub fn parse_json(raw: &str) -> Result<Self, VitralError> {
         let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|e| VitralError::Parse(e.to_string()))?;
         crate::sync::merge_alias(&mut value,"koofr_endpoint","webdav_url")?;
@@ -172,6 +180,8 @@ impl std::fmt::Debug for EngineConfig {
     }
 }
 
+fn default_enabled() -> bool { true }
+
 fn default_schema() -> SchemaKind {
     SchemaKind::DoublePinyinFlypy
 }
@@ -194,6 +204,8 @@ fn default_ring_capacity() -> usize {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            shortcuts: crate::shortcuts::defaults(),
+            linux_english_mode: true,
             data_dir: String::new(),
             cache_dir: String::new(),
             assets_dir: String::new(),
@@ -246,6 +258,10 @@ pub struct CandidateItem {
     pub comment: String,
     pub pinned: bool,
     pub is_clipboard_shortcut: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quick_paste_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_action: Option<crate::shortcuts::ShortcutAction>,
     pub shortcut_code: Option<String>,
     pub frecency_score: f64,
 }
@@ -260,6 +276,8 @@ pub struct PageInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputAction {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function_action: Option<crate::shortcuts::ShortcutAction>,
     pub lang_mode: LangMode,
     pub schema: String,
     pub preedit: PreeditState,
@@ -335,6 +353,12 @@ pub struct EngineState {
     pub(crate) lookup_hints: Vec<crate::hw::Mode1Candidate>,
     candidate_origins: Vec<CandidateOrigin>,
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    rime_first_page: Vec<(CandidateItem, CandidateOrigin)>,
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    rime_overlay_page: usize,
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    rime_first_has_next: bool,
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
     rime_session_id: Option<rime_ffi::RimeSessionId>,
 }
 
@@ -407,8 +431,31 @@ impl EngineState {
             lookup_hints: Vec::new(),
             candidate_origins: Vec::new(),
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            rime_first_page: Vec::new(),
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            rime_overlay_page: 0,
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            rime_first_has_next: false,
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
             rime_session_id: None,
         }
+    }
+
+    pub(crate) fn refresh_candidates(
+        &mut self, clipboard: &ClipboardManager, imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Result<InputAction, VitralError> {
+        if self.raw_input.is_empty() && self.composing.is_empty() {
+            let (pairs, _) = self.build_overlay_candidates(clipboard, imported, retention, false);
+            self.set_current_candidates(pairs.into_iter().filter(|(c, _)| c.quick_paste_id.is_some()).collect());
+            return Ok(self.empty_action(None));
+        }
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if let (Some(sid), Some(assets)) = (self.rime_session_id, self.resolved_assets_dir.clone()) {
+            let snap = rime_ffi::with_runtime(&assets, &self.config.cache_dir, &self.config.data_dir, |rt| rt.snapshot(sid))?;
+            return Ok(self.apply_rime_snapshot(snap, false, false, clipboard, imported, retention));
+        }
+        self.process_key_pure_rust(0, clipboard, imported, retention)
     }
 
     pub(crate) fn canonical_at(&self, index: usize) -> Option<&str> {
@@ -416,6 +463,11 @@ impl EngineState {
     }
 
     pub(crate) fn clear_composition_state(&mut self) {
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        {
+            self.rime_first_page.clear();
+            self.rime_overlay_page = 0;
+        }
         self.composing.clear();
         self.raw_input.clear();
         self.cursor_utf8 = 0;
@@ -581,6 +633,14 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) -> Result<InputAction, VitralError> {
+        // Fcitx uses X11 keysyms; normalize editing keys before interpreting
+        // printable text. In particular, 0xff08 is BackSpace, not Unicode '（'.
+        let keycode = match keycode {
+            0xff08 => 0x08,
+            0xff0d => 0x0d,
+            0xff1b => 0x1b,
+            _ => keycode,
+        };
         if modifiers & MOD_LANG_TOGGLE != 0 {
             self.toggle_lang_mode();
             return Ok(self.empty_action(None));
@@ -710,6 +770,8 @@ impl EngineState {
             comment: "En/Token".to_string(),
             pinned: false,
             is_clipboard_shortcut: false,
+            quick_paste_id: None,
+            function_action: None,
             shortcut_code: None,
             frecency_score: 0.0,
         };
@@ -914,6 +976,8 @@ impl EngineState {
                     comment: c.comment,
                     pinned,
                     is_clipboard_shortcut: false,
+                    quick_paste_id: None,
+                    function_action: None,
                     shortcut_code: None,
                     frecency_score: frec,
                 };
@@ -979,6 +1043,8 @@ impl EngineState {
                         comment: pr_item.comment,
                         pinned,
                         is_clipboard_shortcut: false,
+                        quick_paste_id: None,
+                        function_action: None,
                         shortcut_code: None,
                         frecency_score: frec,
                     };
@@ -1033,6 +1099,8 @@ impl EngineState {
                                 comment: String::new(),
                                 pinned: retention.pinned_words.contains(&word),
                                 is_clipboard_shortcut: false,
+                                quick_paste_id: None,
+                                function_action: None,
                                 shortcut_code: None,
                                 frecency_score: retention.decayed_score_at(&word, now_ms),
                             },
@@ -1110,8 +1178,12 @@ impl EngineState {
                     priority_overlay.push((c, orig));
                 }
             }
-            priority_overlay.truncate(page_size.max(5));
-            self.set_current_candidates(priority_overlay);
+            // Keep the existing first-page ranking, plus the word displaced by Quick Paste.
+            priority_overlay.truncate(page_size + priority_overlay.iter().filter(|(c, _)| c.quick_paste_id.is_some() || c.function_action.is_some()).count());
+            self.rime_first_page = priority_overlay;
+            self.rime_overlay_page = 0;
+            self.rime_first_has_next = snap.has_next;
+            self.set_current_candidates(self.rime_first_page.iter().take(page_size).cloned().collect());
         } else {
             let mut pinned_base = Vec::new();
             let mut normal_base = Vec::new();
@@ -1145,9 +1217,20 @@ impl EngineState {
             page_index: snap.page_index,
             page_size,
             has_prev: snap.has_prev,
-            has_next: snap.has_next,
+            has_next: snap.has_next || (snap.page_index == 0 && self.rime_first_page.len() > page_size),
         };
 
+        self.empty_action(None)
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    fn show_rime_overlay_page(&mut self) -> InputAction {
+        let size = self.current_page.page_size;
+        let start = self.rime_overlay_page * size;
+        self.set_current_candidates(self.rime_first_page.iter().skip(start).take(size).cloned().collect());
+        self.current_page.page_index = self.rime_overlay_page;
+        self.current_page.has_prev = start > 0;
+        self.current_page.has_next = start + size < self.rime_first_page.len() || self.rime_first_has_next;
         self.empty_action(None)
     }
 
@@ -1176,6 +1259,23 @@ impl EngineState {
         }
         let sid = self.ensure_rime_session(assets_dir)?;
 
+        // Overlay candidates share the first backend page. Page through its
+        // overflow before advancing Rime so no displaced word disappears.
+        let page_size = self.current_page.page_size;
+        let last_overlay = self.rime_first_page.len().saturating_sub(1) / page_size;
+        let backward = keycode == 0xff55;
+        let forward = keycode == 0xff56;
+        if self.current_page.page_index <= last_overlay && (backward || forward) {
+            if backward && self.rime_overlay_page > 0 {
+                self.rime_overlay_page -= 1;
+                return Ok(self.show_rime_overlay_page());
+            }
+            if forward && self.rime_overlay_page < last_overlay {
+                self.rime_overlay_page += 1;
+                return Ok(self.show_rime_overlay_page());
+            }
+        }
+        let returning_to_first = backward && self.current_page.page_index == last_overlay + 1;
         let is_backspace = keycode == 0x08 || keycode == 0xFF08;
         let is_escape = keycode == 0x1B || keycode == 0xFF1B;
         let is_space = keycode == 0x20;
@@ -1328,9 +1428,18 @@ impl EngineState {
             |rt| rt.process_key(sid, keycode, modifiers),
         )?;
 
-        Ok(self.apply_rime_snapshot(
+        let backend_page = snap.page_index;
+        let mut action = self.apply_rime_snapshot(
             snap, is_return, is_escape, clipboard, imported, retention,
-        ))
+        );
+        if returning_to_first && backend_page == 0 {
+            self.rime_overlay_page = self.rime_first_page.len().saturating_sub(1) / page_size;
+            action = self.show_rime_overlay_page();
+        } else if backend_page > 0 {
+            self.current_page.page_index = backend_page + last_overlay;
+            action.page = self.current_page.clone();
+        }
+        Ok(action)
     }
 
     fn process_key_pure_rust(
@@ -1475,6 +1584,36 @@ impl EngineState {
         let mut overlay: Vec<(CandidateItem, CandidateOrigin)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
+        let paste = clipboard.quick_paste_state();
+        if let Some(clip) = paste.quick_paste.filter(|_| self.config.platform == "android" && paste.candidate_visible && self.raw_input.is_empty()) {
+            overlay.push((CandidateItem {
+                index: 0,
+                text: clip.content.clone(),
+                comment: "快捷粘贴".into(),
+                pinned: false,
+                is_clipboard_shortcut: false,
+                quick_paste_id: Some(clip.id),
+                function_action: None,
+                shortcut_code: None,
+                frecency_score: 0.0,
+            }, CandidateOrigin::Overlay {
+                canonical: clip.content.clone(),
+                commit_text: clip.content,
+                is_clipboard: true,
+            }));
+        }
+
+        for binding in &self.config.shortcuts {
+            if !binding.text.is_empty() && binding.text == self.raw_input && self.config.shortcut_enabled(binding.action) {
+                let label = binding.action.label().to_string();
+                overlay.push((CandidateItem {
+                    index: 0, text: label.clone(), comment: "功能".into(),
+                    pinned: false, is_clipboard_shortcut: false, quick_paste_id: None,
+                    function_action: Some(binding.action), shortcut_code: None, frecency_score: 0.0,
+                }, CandidateOrigin::Overlay { canonical: label.clone(), commit_text: label, is_clipboard: true }));
+            }
+        }
+
         if let Some(clip) = clipboard.find_shortcut(&self.raw_input) {
             if seen.insert(clip.content.clone()) {
                 let item = CandidateItem {
@@ -1483,6 +1622,8 @@ impl EngineState {
                     comment: format!("📌 {}", self.raw_input),
                     pinned: true,
                     is_clipboard_shortcut: true,
+                    quick_paste_id: None,
+                    function_action: None,
                     shortcut_code: clip.shortcut_code.clone(),
                     frecency_score: 1000.0,
                 };
@@ -1504,6 +1645,8 @@ impl EngineState {
                         comment: format!("🕒 {label}"),
                         pinned: false,
                         is_clipboard_shortcut: false,
+                        quick_paste_id: None,
+                        function_action: None,
                         shortcut_code: None,
                         frecency_score: 500.0 - (idx as f64),
                     };
@@ -1529,6 +1672,8 @@ impl EngineState {
                         pinned: retention.pinned_words.contains(&hint.ch),
                         frecency_score: retention.decayed_score_at(&hint.ch, RetentionEngine::now_epoch_ms()),
                         is_clipboard_shortcut: false, shortcut_code: None,
+                        quick_paste_id: None,
+                        function_action: None,
                     }, CandidateOrigin::Overlay {canonical: hint.ch.clone(), commit_text: text, is_clipboard: false}));
                 }
             }
@@ -1556,6 +1701,8 @@ impl EngineState {
                         comment: imp.toned_pinyin.clone(),
                         pinned: retention.pinned_words.contains(&imp.text),
                         is_clipboard_shortcut: false,
+                        quick_paste_id: None,
+                        function_action: None,
                         shortcut_code: None,
                         frecency_score: (imp.weight as f64) + 50.0,
                     };
@@ -1595,6 +1742,8 @@ impl EngineState {
                             comment: item.comment,
                             pinned: retention.pinned_words.contains(&canonical),
                             is_clipboard_shortcut: false,
+                            quick_paste_id: None,
+                            function_action: None,
                             shortcut_code: None,
                             frecency_score: item.frecency_score + 50.0,
                         };
@@ -1702,12 +1851,26 @@ impl EngineState {
             .map(str::to_string)
             .unwrap_or_else(|| self.current_candidates[index].text.clone());
         retention.pin_word(&canonical);
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if !self.rime_first_page.is_empty()
+            && self.current_page.page_index <= self.rime_first_page.len().saturating_sub(1) / self.current_page.page_size
+        {
+            if let Some(pos) = self.rime_first_page.iter().position(|(item, origin)| item.quick_paste_id.is_none() && origin.canonical() == canonical) {
+                let mut pair = self.rime_first_page.remove(pos);
+                pair.0.pinned = true;
+                let first_word = usize::from(self.rime_first_page.first().is_some_and(|(c, _)| c.quick_paste_id.is_some()));
+                self.rime_first_page.insert(first_word, pair);
+                self.show_rime_overlay_page();
+                return Ok(());
+            }
+        }
         let mut item = self.current_candidates.remove(index);
         item.pinned = true;
-        self.current_candidates.insert(0, item);
+        let first_word = usize::from(self.current_candidates.first().is_some_and(|c| c.quick_paste_id.is_some()));
+        self.current_candidates.insert(first_word, item);
         if index < self.candidate_origins.len() {
             let orig = self.candidate_origins.remove(index);
-            self.candidate_origins.insert(0, orig);
+            self.candidate_origins.insert(first_word, orig);
         }
         for (i, c) in self.current_candidates.iter_mut().enumerate() {
             c.index = i;
@@ -1732,6 +1895,15 @@ impl EngineState {
             .map(str::to_string)
             .unwrap_or_else(|| self.current_candidates[index].text.clone());
         retention.erase_word(&canonical);
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if !self.rime_first_page.is_empty()
+            && self.current_page.page_index <= self.rime_first_page.len().saturating_sub(1) / self.current_page.page_size
+        {
+            self.rime_first_page.retain(|(item, origin)| item.quick_paste_id.is_some() || origin.canonical() != canonical);
+            self.rime_overlay_page = self.rime_overlay_page.min(self.rime_first_page.len().saturating_sub(1) / self.current_page.page_size);
+            self.show_rime_overlay_page();
+            return Ok(());
+        }
         self.current_candidates.remove(index);
         if index < self.candidate_origins.len() {
             self.candidate_origins.remove(index);
@@ -1757,6 +1929,7 @@ impl EngineState {
             None
         };
         InputAction {
+            function_action: None,
             lang_mode: self.lang_mode,
             schema: self.schema.as_str().to_string(),
             preedit: PreeditState {

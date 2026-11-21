@@ -25,6 +25,20 @@ const GUID profile = {0x4aabb15d,
                       {0xab, 0x90, 0x67, 0xef, 0x1c, 0xd9, 0xe2, 0x02}};
 constexpr wchar_t key[] =
     L"SOFTWARE\\Classes\\CLSID\\{7C9E6679-7425-40DE-944B-E07FC1F90AE7}";
+
+const ThemePalette &currentPalette() {
+  DWORD value = 0;
+  DWORD size = sizeof(value);
+  if (RegGetValueW(
+          HKEY_CURRENT_USER,
+          L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+          L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) ==
+      ERROR_SUCCESS) {
+    return value == 1 ? kLightTheme : kDarkTheme;
+  }
+  return kDarkTheme;
+}
+
 HMODULE module() {
   HMODULE h = nullptr;
   GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -104,16 +118,47 @@ struct Panel {
   ComPtr<ID2D1Factory> d2d;
   ComPtr<IDWriteFactory> write;
   ComPtr<IDWriteTextFormat> font;
-  bool active = false, english = false, paste = false, ink = false,
-       drawing = false;
+  ComPtr<IDWriteTextFormat> smallFont;
+  bool active = false, english = false, ink = false, drawing = false;
   bool idle = false;
-  int count = 0, mode = 0;
+  int count = 0, mode = 0, selected = 0;
   RECT caret{};
   ULONGLONG last = GetTickCount64(), glow = 0;
   std::wstring words[5];
+  float cellLeft[5]{};
+  float cellRight[5]{};
+  int totalChoiceWidth = 100;
   std::vector<float> points;
   void send(int op, int index = 0, const wchar_t *text = nullptr) {
     event(owner, op, index, text, nullptr, 0);
+  }
+  void measureChoices() {
+    float cursor = 8.f;
+    for (int i = 0; i < count; i++) {
+      float width = 62.f;
+      if (write && font) {
+        std::wstring full = std::to_wstring(i + 1) + L" " + words[i];
+        ComPtr<IDWriteTextLayout> layout;
+        if (SUCCEEDED(write->CreateTextLayout(full.c_str(), (UINT32)full.size(),
+                                              font.Get(), 400.f, 40.f,
+                                              &layout))) {
+          DWRITE_TEXT_METRICS m{};
+          if (SUCCEEDED(layout->GetMetrics(&m)))
+            width = (std::max)(56.f, std::ceil(m.widthIncludingTrailingWhitespace) + 24.f);
+        }
+      }
+      cellLeft[i] = cursor;
+      cellRight[i] = cursor + width;
+      cursor = cellRight[i] + 4.f;
+    }
+    totalChoiceWidth = (std::max)(110, (int)std::ceil(cursor + 4.f));
+  }
+  int hitChoice(int x) const {
+    for (int i = 0; i < count; i++) {
+      if (x >= cellLeft[i] && x <= cellRight[i])
+        return i;
+    }
+    return -1;
   }
   void place();
   void init() {
@@ -135,10 +180,19 @@ struct Panel {
       write->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
                               DWRITE_FONT_WEIGHT_NORMAL,
                               DWRITE_FONT_STYLE_NORMAL,
-                              DWRITE_FONT_STRETCH_NORMAL, 16, L"zh-CN", &font);
+                              DWRITE_FONT_STRETCH_NORMAL, 15.5f, L"zh-CN", &font);
       if (font) {
         font->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         font->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+      }
+      write->CreateTextFormat(L"Microsoft YaHei UI", nullptr,
+                              DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                              DWRITE_FONT_STYLE_NORMAL,
+                              DWRITE_FONT_STRETCH_NORMAL, 12.f, L"zh-CN",
+                              &smallFont);
+      if (smallFont) {
+        smallFont->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        smallFont->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
       }
     }
   }
@@ -151,6 +205,7 @@ void Surface::paint() {
   int w = r.right, h = r.bottom;
   if (!w || !h)
     return;
+  const ThemePalette &pal = currentPalette();
   ComPtr<IDCompositionSurface> s;
   if (FAILED(panel->compositor->CreateSurface(
           w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &s)))
@@ -174,45 +229,85 @@ void Surface::paint() {
     ComPtr<ID2D1SolidColorBrush> b;
     rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), &b);
     if (b) {
-      auto color = [&](RgbaColor c) {
-        b->SetColor(
-            D2D1::ColorF(c.r / 255.f, c.g / 255.f, c.b / 255.f, c.alpha));
+      auto color = [&](RgbaColor c, float alphaScale = 1.f) {
+        b->SetColor(D2D1::ColorF(c.r / 255.f, c.g / 255.f, c.b / 255.f,
+                                 c.alpha * alphaScale));
       };
       float rad =
           status ? (std::min)((float)radius::kDesktopStatusCapsulePx, h / 2.f)
-                 : radius::kDesktopCandidateWindowPx;
+                 : (float)radius::kDesktopCandidateWindowPx;
       auto rr = D2D1::RoundedRect(D2D1::RectF(1, 1, (float)w - 1, (float)h - 1),
                                   rad, rad);
-      color(kDarkTheme.surface_panel);
+      color(status ? pal.surface_panel : pal.surface_popover);
       rt->FillRoundedRectangle(rr, b.Get());
-      color(kDarkTheme.border_specular);
-      rt->DrawRoundedRectangle(rr, b.Get());
-      auto label = [&](const std::wstring &text, float x, float end) {
-        color(kDarkTheme.text_primary);
-        rt->DrawText(text.data(), (UINT32)text.size(), panel->font.Get(),
-                     D2D1::RectF(x, 0, end, 40), b.Get(),
-                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
-      };
+      color(pal.border_specular);
+      rt->DrawRoundedRectangle(rr, b.Get(), 1.f);
+
       if (status) {
-        color(kDarkTheme.accent_primary);
-        rt->DrawLine({12, 13}, {20, 28}, b.Get(), 3);
-        rt->DrawLine({20, 28}, {28, 13}, b.Get(), 3);
-        label(panel->english ? L"En" : L"中", 37, 75);
-        if (panel->paste)
-          label(L"粘贴", 75, 135);
+        // Vitral V mark
+        color(pal.accent_text);
+        rt->DrawLine({13.f, 12.f}, {20.5f, 27.f}, b.Get(), 2.2f);
+        rt->DrawLine({20.5f, 27.f}, {28.f, 12.f}, b.Get(), 2.2f);
+        rt->DrawLine({13.f, 12.f}, {20.5f, 17.5f}, b.Get(), 1.4f);
+        rt->DrawLine({28.f, 12.f}, {20.5f, 17.5f}, b.Get(), 1.4f);
+
+        // Language pill badge
+        auto pill = D2D1::RoundedRect(D2D1::RectF(38.f, 7.f, 76.f, 33.f), 10.f, 10.f);
+        color(panel->english ? pal.surface_key_primary : pal.accent_soft);
+        rt->FillRoundedRectangle(pill, b.Get());
+        color(panel->english ? pal.text_primary : pal.accent_text);
+        const std::wstring langText = panel->english ? L"En" : L"中";
+        rt->DrawText(langText.data(), (UINT32)langText.size(),
+                     panel->smallFont ? panel->smallFont.Get() : panel->font.Get(),
+                     D2D1::RectF(38.f, 7.f, 76.f, 33.f), b.Get(),
+                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
       } else {
-        for (int i = 0; i < panel->count; i++)
-          label(panel->words[i], i * 100.f, (i + 1) * 100.f);
+        for (int i = 0; i < panel->count; i++) {
+          const float left = panel->cellLeft[i];
+          const float right = panel->cellRight[i];
+          const bool activeItem = (i == panel->selected && !panel->ink);
+          if (activeItem) {
+            auto pill = D2D1::RoundedRect(
+                D2D1::RectF(left, 5.f, right, 37.f),
+                (float)radius::kCandidateActivePillPx,
+                (float)radius::kCandidateActivePillPx);
+            color(pal.accent_soft);
+            rt->FillRoundedRectangle(pill, b.Get());
+            color(pal.accent_primary, 0.38f);
+            rt->DrawRoundedRectangle(pill, b.Get(), 1.f);
+          }
+          std::wstring text = std::to_wstring(i + 1) + L" " + panel->words[i];
+          color(activeItem ? pal.accent_text : pal.text_primary);
+          rt->DrawText(text.data(), (UINT32)text.size(), panel->font.Get(),
+                       D2D1::RectF(left, 2.f, right, 40.f), b.Get(),
+                       D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
         if (panel->ink) {
-          color(kDarkTheme.ink_stroke_primary);
+          // Recessed handwriting surface + subtle guide lines
+          auto padRect =
+              D2D1::RoundedRect(D2D1::RectF(10.f, 44.f, (float)w - 10.f, (float)h - 10.f),
+                                12.f, 12.f);
+          color(pal.surface_key_function);
+          rt->FillRoundedRectangle(padRect, b.Get());
+          color(pal.border_specular, 0.7f);
+          rt->DrawRoundedRectangle(padRect, b.Get(), 1.f);
+
+          const float midX = w * 0.5f;
+          const float midY = 44.f + (h - 54.f) * 0.5f;
+          color(pal.text_secondary, 0.22f);
+          rt->DrawLine({20.f, midY}, {(float)w - 20.f, midY}, b.Get(), 1.f);
+          rt->DrawLine({midX, 54.f}, {midX, (float)h - 20.f}, b.Get(), 1.f);
+
+          color(pal.ink_stroke_primary);
           auto &p = panel->points;
           for (size_t i = 3; i + 2 < p.size(); i += 3)
-            rt->DrawLine({p[i - 3] * w, 42 + p[i - 2] * (h - 42)},
-                         {p[i] * w, 42 + p[i + 1] * (h - 42)}, b.Get(), 3);
+            rt->DrawLine({p[i - 3] * w, 44.f + p[i - 2] * (h - 54.f)},
+                         {p[i] * w, 44.f + p[i + 1] * (h - 54.f)}, b.Get(),
+                         (float)handwriting::kStrokeWidthPx);
         }
         if (GetTickCount64() < panel->glow) {
-          color(kDarkTheme.retroactive_fix_glow);
-          rt->DrawLine({10, 39}, {(float)w - 10, 39}, b.Get(), 2);
+          color(pal.retroactive_fix_glow);
+          rt->DrawLine({12.f, 40.f}, {(float)w - 12.f, 40.f}, b.Get(), 2.2f);
         }
       }
     }
@@ -223,9 +318,8 @@ void Surface::paint() {
   surface = s;
   ComPtr<IDCompositionEffectGroup> alpha;
   if (SUCCEEDED(panel->compositor->CreateEffectGroup(&alpha))) {
-    alpha->SetOpacity(status && panel->idle
-                          ? motion::kDesktopIdleOpacity
-                          : 1.f);
+    alpha->SetOpacity(status && panel->idle ? (float)motion::kDesktopIdleOpacity
+                                            : 1.f);
     visual->SetEffect(alpha.Get());
   }
   panel->compositor->Commit();
@@ -254,7 +348,7 @@ void Panel::place() {
     return;
   }
   auto a = mi.rcWork;
-  int sw = paste ? 138 : 82;
+  int sw = 88;
   POINT mouse{};
   GetCursorPos(&mouse);
   bool was_idle = idle;
@@ -262,18 +356,20 @@ void Panel::place() {
   if (idle != was_idle && status.wnd)
     InvalidateRect(status.wnd, nullptr, FALSE);
   bool edge =
-      idle && !(mouse.x >= a.right - sw - 12 && mouse.y >= a.bottom - 65);
-  status.show(edge ? a.right - sw / 2 : a.right - sw - 12, a.bottom - 52, sw,
+      idle && !(mouse.x >= a.right - sw - 14 && mouse.y >= a.bottom - 65);
+  status.show(edge ? a.right - sw / 2 : a.right - sw - 14, a.bottom - 54, sw,
               40);
   if (!ink && !count) {
     ShowWindow(choices.wnd, SW_HIDE);
     return;
   }
-  int w = ink ? 500 : (std::max)(100, count * 100), h = ink ? 208 : 42;
+  measureChoices();
+  int w = ink ? (std::max)(360, totalChoiceWidth) : totalChoiceWidth;
+  int h = ink ? 216 : 44;
   int x = caret.right || caret.bottom ? caret.left : a.right - w - 14;
-  int y = caret.bottom ? caret.bottom + 3 : a.bottom - h - 65;
+  int y = caret.bottom ? caret.bottom + 4 : a.bottom - h - 66;
   if (y + h > a.bottom)
-    y = caret.top - h - 3;
+    y = caret.top - h - 4;
   choices.show(
       std::clamp(x, (int)a.left, (std::max)((int)a.left, (int)a.right - w)),
       std::clamp(y, (int)a.top, (std::max)((int)a.top, (int)a.bottom - h)), w,
@@ -311,30 +407,14 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
       p.place();
     }
     return 0;
-  case WM_CLIPBOARDUPDATE:
-    if (p.active && OpenClipboard(win)) {
-      HANDLE h = GetClipboardData(CF_UNICODETEXT);
-      std::wstring text;
-      if (h) {
-        auto data = (const wchar_t *)GlobalLock(h);
-        if (data) {
-          size_t n = wcsnlen(data, GlobalSize(h) / sizeof(wchar_t));
-          text.assign(data, n);
-          GlobalUnlock(h);
-        }
-      }
-      CloseClipboard();
-      if (!text.empty())
-        p.send(9, 0, text.c_str());
-    }
-    return 0;
   case WM_RBUTTONUP: {
     auto menu = CreatePopupMenu();
-    AppendMenuW(menu, MF_STRING, 1, L"手写查音");
+    AppendMenuW(menu, MF_STRING, 1, L"单字查音");
     AppendMenuW(menu, MF_STRING, 2, L"连续手写");
-    AppendMenuW(menu, MF_STRING, 3, L"确认手写");
-    AppendMenuW(menu, MF_STRING, 4, L"关闭手写");
-    AppendMenuW(menu, MF_STRING, 5, L"打开 Vitral 设置");
+    AppendMenuW(menu, MF_STRING, 3, L"确认手写上屏");
+    AppendMenuW(menu, MF_STRING, 4, L"关闭手写板");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, 5, L"打开 Vitral 管理中心");
     POINT pt{x, y};
     ClientToScreen(win, &pt);
     int id = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0,
@@ -346,18 +426,26 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
     }
     return 0;
   }
+  case WM_MOUSEMOVE:
+    if (!s->status && !p.ink && y <= 44) {
+      int idx = p.hitChoice(x);
+      if (idx >= 0 && p.selected != idx)
+        p.send(10, idx);
+    }
+    break;
   case WM_LBUTTONDOWN: {
     p.last = GetTickCount64();
     if (s->status) {
       if (x < 36)
         PostMessageW(win, WM_RBUTTONUP, 0, lp);
       else
-        p.send(x > 75 && p.paste ? 2 : 1);
+        p.send(1);
       return 0;
     }
-    if (y <= 42) {
-      if (x / 100 < p.count)
-        p.send(0, x / 100);
+    if (y <= 44) {
+      int idx = p.hitChoice(x);
+      if (idx >= 0)
+        p.send(0, idx);
       return 0;
     }
     if (p.ink) {
@@ -377,7 +465,8 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
     GetClientRect(win, &r);
     p.points.insert(p.points.end(),
                     {std::clamp(float(x) / r.right, 0.f, 1.f),
-                     std::clamp(float(y - 42) / (r.bottom - 42), 0.f, 1.f),
+                     std::clamp(float(y - 44) / (std::max)(1L, r.bottom - 54),
+                                0.f, 1.f),
                      float(GetTickCount64() % 600000)});
     InvalidateRect(win, nullptr, FALSE);
     if (msg == WM_LBUTTONUP) {
@@ -432,7 +521,6 @@ extern "C" void *vitral_panel_open(void *owner, Event event) {
   }
   if (p->status.wnd) {
     SetTimer(p->status.wnd, 1, 750, nullptr);
-    AddClipboardFormatListener(p->status.wnd);
   }
   return p;
 }
@@ -440,7 +528,6 @@ extern "C" void vitral_panel_close(Panel *p) {
   if (!p)
     return;
   if (p->status.wnd) {
-    RemoveClipboardFormatListener(p->status.wnd);
     DestroyWindow(p->status.wnd);
   }
   if (p->choices.wnd)
@@ -449,24 +536,25 @@ extern "C" void vitral_panel_close(Panel *p) {
   UnregisterClassW(L"Vitral.Tsf.Panel", module());
 }
 extern "C" void vitral_panel_update(Panel *p, bool active, bool english,
-                                    bool paste, int mode, const RECT *caret,
+                                    int mode, const RECT *caret,
                                     const wchar_t *const *words, int count,
-                                    bool glow, bool activity) {
+                                    int selected, bool glow, bool activity) {
   if (!p)
     return;
   p->active = active;
   p->english = english;
-  p->paste = paste;
   p->ink = mode != 0;
   p->mode = mode;
   p->count = (std::min)(5, count);
+  p->selected = selected;
   if (caret)
     p->caret = *caret;
   for (int i = 0; i < p->count; i++)
     p->words[i] = words[i];
   if (glow && p->choices.wnd) {
     p->glow = GetTickCount64() + handwriting::kRetroactiveHighlightDurationMs;
-    SetTimer(p->choices.wnd, 2, handwriting::kRetroactiveHighlightDurationMs, nullptr);
+    SetTimer(p->choices.wnd, 2, handwriting::kRetroactiveHighlightDurationMs,
+             nullptr);
   }
   if (activity)
     p->last = GetTickCount64();

@@ -1,2 +1,155 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Vitral · 录音笔</title><link rel="stylesheet" href="generated/tokens.css"><link rel="stylesheet" href="style.css"></head>
-<body style="display:block"><main style="padding:12px"><div class="actions"><button id="capture" class="primary">录音</button><button id="summary" disabled>摘要</button></div><textarea id="transcript" rows="3" aria-label="录音转写"></textarea><output id="state" role="status"></output></main><script type="module" src="recorder.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vitral · 录音笔</title>
+  <link rel="stylesheet" href="generated/tokens.css">
+  <link rel="stylesheet" href="style.css">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      padding: 12px;
+      gap: 10px;
+      overflow: hidden;
+    }
+    .rec-shell {
+      position: relative;
+      z-index: 1;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 14px;
+      border-radius: var(--vitral-radius-popover);
+      background: var(--vitral-surface-panel);
+      border: 1px solid var(--vitral-border-specular);
+      box-shadow: var(--inner-highlight);
+      min-height: 0;
+    }
+    .rec-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .rec-id {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 13.5px;
+      font-weight: 600;
+    }
+    .rec-lamp {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--vitral-text-secondary);
+      transition: background 180ms;
+    }
+    .rec-shell[data-phase="recording"] .rec-lamp {
+      background: var(--danger);
+      box-shadow: 0 0 10px var(--danger);
+      animation: pulseDot 0.9s ease-in-out infinite;
+    }
+    .rec-shell[data-phase="busy"] .rec-lamp {
+      background: var(--vitral-accent-primary);
+      animation: pulseDot 0.9s ease-in-out infinite;
+    }
+    .rec-shell[data-phase="done"] .rec-lamp {
+      background: var(--success);
+    }
+    .rec-clock {
+      font-family: ui-monospace, "JetBrains Mono", Menlo, monospace;
+      font-size: 12.5px;
+      color: var(--vitral-text-secondary);
+    }
+    .wave {
+      display: inline-flex;
+      align-items: center;
+      gap: 3px;
+      height: 16px;
+      opacity: 0;
+      transition: opacity 180ms;
+    }
+    .rec-shell[data-phase="recording"] .wave {
+      opacity: 1;
+    }
+    .wave i {
+      display: block;
+      width: 2.5px;
+      height: 14px;
+      border-radius: 2px;
+      background: var(--vitral-accent-text);
+      animation: recBar 720ms ease-in-out infinite;
+    }
+    .wave i:nth-child(2) { animation-delay: 110ms; }
+    .wave i:nth-child(3) { animation-delay: 220ms; }
+    .wave i:nth-child(4) { animation-delay: 330ms; }
+    .wave i:nth-child(5) { animation-delay: 160ms; }
+    @keyframes recBar {
+      0%, 100% { transform: scaleY(0.28); opacity: 0.55; }
+      50% { transform: scaleY(1); opacity: 1; }
+    }
+    #transcript {
+      flex: 1;
+      min-height: 76px;
+      resize: none;
+      font-size: 13.5px;
+    }
+    .rec-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .rec-bar .actions {
+      margin: 0;
+    }
+    .rec-status {
+      font-size: 12px;
+      color: var(--vitral-text-secondary);
+      white-space: pre-wrap;
+      overflow-y: auto;
+      max-height: 76px;
+      line-height: 1.45;
+    }
+    .rec-status.is-summary {
+      padding: 8px 10px;
+      border-radius: 9px;
+      background: var(--bg-elevated);
+      border: 1px solid rgba(14, 165, 233, 0.25);
+      color: var(--vitral-text-primary);
+    }
+  </style>
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"><span class="orb orb-a"></span></div>
+  <main class="rec-shell" id="shell" data-phase="idle">
+    <div class="rec-header">
+      <div class="rec-id">
+        <span class="rec-lamp" aria-hidden="true"></span>
+        <span>AI 录音笔</span>
+        <span class="wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      </div>
+      <span class="rec-clock" id="clock">00:00</span>
+    </div>
+
+    <textarea id="transcript" rows="3" aria-label="录音转写" placeholder="点击「开始录音」进行本机离线语音转写…"></textarea>
+
+    <div class="rec-bar">
+      <div class="actions">
+        <button type="button" id="capture" class="primary">开始录音</button>
+        <button type="button" id="copy" class="btn-ghost" disabled>复制</button>
+        <button type="button" id="summary" class="btn-accent-soft" disabled>提炼摘要</button>
+      </div>
+    </div>
+
+    <output id="state" class="rec-status" role="status"></output>
+  </main>
+  <script type="module" src="recorder.js"></script>
+</body>
+</html>

@@ -12,3 +12,5 @@
 | ONNX Runtime | Microsoft Corporation，MIT。许可及第三方声明随包提供。[ONNX Runtime](https://github.com/microsoft/onnxruntime) |
 
 资源清单中的 URL 和 SHA-256 指向构建时使用的文件。手写转换与量化过程见源码中的 `scripts/export_hw_onnx.py`。
+
+- `ext-data-control-v1.xml`: Wayland protocol definitions, X11-style permissive license; copyright and license in `Wayland-data-control.txt`. Source: https://gitlab.freedesktop.org/wayland/wayland-protocols/-/blob/main/staging/ext-data-control/ext-data-control-v1.xml

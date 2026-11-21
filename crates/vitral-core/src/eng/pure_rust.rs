@@ -168,6 +168,8 @@ impl PureRustEngine {
                 comment,
                 pinned,
                 is_clipboard_shortcut: false,
+                quick_paste_id: None,
+                function_action: None,
                 shortcut_code: None,
                 frecency_score: frec,
             };
@@ -192,6 +194,8 @@ impl PureRustEngine {
                     comment: raw_input.to_string(),
                     pinned: false,
                     is_clipboard_shortcut: false,
+                    quick_paste_id: None,
+                    function_action: None,
                     shortcut_code: None,
                     frecency_score: 0.0,
                 },

@@ -45,11 +45,11 @@ extern "C" {
         panel: *mut c_void,
         active: bool,
         english: bool,
-        paste: bool,
         mode: i32,
         caret: *const RECT,
         words: *const *const u16,
         count: i32,
+        selected: i32,
         glow: bool,
         activity: bool,
     );
@@ -121,9 +121,10 @@ impl IClassFactory_Impl for Factory_Impl {
 struct View {
     active: bool,
     english: bool,
-    paste: bool,
+    paste_id: String,
     mode: i32,
     caret: RECT,
+    selected: usize,
     words: Vec<String>,
     values: Vec<String>,
     slots: Vec<Value>,
@@ -137,6 +138,7 @@ struct Editor {
     composition: RefCell<Option<(ITfContext, ITfComposition)>>,
     panel: Cell<*mut c_void>,
     view: RefCell<View>,
+    shift_held: Cell<bool>,
 }
 impl Editor {
     fn call(&self, name: &str, v: Value) -> Result<Value> {
@@ -156,11 +158,11 @@ impl Editor {
                 self.panel.get(),
                 v.active,
                 v.english,
-                v.paste,
                 v.mode,
                 &v.caret,
                 pointers.as_ptr(),
                 pointers.len() as _,
+                v.selected as _,
                 glow,
                 activity,
             )
@@ -182,10 +184,26 @@ impl Editor {
             let mut v = self.view.borrow_mut();
             v.active = opened.is_ok();
             if let Ok(r) = opened {
-                v.paste = !r["quick_paste"].is_null();
+                v.paste_id = r["quick_paste"]["id"].as_str().unwrap_or("").into();
+                if let Ok(action) = self.call("candidate-state", json!({})) {
+                    v.words = action["candidates"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .map(|c| {
+                            let text = c["text"].as_str().unwrap_or("");
+                            if c["quick_paste_id"].is_string() {
+                                format!("粘贴 {text}")
+                            } else {
+                                text.into()
+                            }
+                        })
+                        .collect();
+                }
                 v.english = r["lang_mode"] == "en";
             }
         } else {
+            self.shift_held.set(false);
             self.view.replace(View::default());
             self.on_ime_close();
             let old = self.composition.borrow_mut().take();
@@ -253,6 +271,7 @@ impl Service {
                 composition: Default::default(),
                 panel: Cell::new(ptr::null_mut()),
                 view: Default::default(),
+                shift_held: Cell::new(false),
             }),
             _live: Live::new(),
         })
@@ -350,14 +369,44 @@ struct Action {
     args: Value,
 }
 impl Action {
-    fn consume_quick_paste() -> Self {
-        Self::new("consume-quick-paste", json!({}))
-    }
     fn new(cmd: &'static str, args: Value) -> Self {
         Self { cmd, args }
     }
 }
 impl Service_Impl {
+    fn shortcut_name(code: u32) -> Option<String> {
+        let down = |key| unsafe { GetKeyState(key) < 0 };
+        if down(0x5b) || down(0x5c) {
+            return None;
+        }
+        if matches!(code, 0x10 | 0xa0 | 0xa1) {
+            return (!down(0x11) && !down(0x12)).then(|| "Shift".into());
+        }
+        let base = if (0x70..=0x7b).contains(&code) {
+            format!("F{}", code - 0x70 + 1)
+        } else if down(0x11) || down(0x12) {
+            match code {
+                0x30..=0x39 | 0x41..=0x5a => char::from_u32(code)?.to_string(),
+                32 => "Space".into(),
+                13 => "Enter".into(),
+                _ => return None,
+            }
+        } else {
+            return None;
+        };
+        let mut parts = Vec::new();
+        if down(0x11) {
+            parts.push("Ctrl".to_string());
+        }
+        if down(0x12) {
+            parts.push("Alt".to_string());
+        }
+        if down(0x10) {
+            parts.push("Shift".to_string());
+        }
+        parts.push(base);
+        Some(parts.join("+"))
+    }
     fn key(&self, w: WPARAM, l: LPARAM) -> Option<Action> {
         let code = w.0 as u32;
         let down = |key| unsafe { GetKeyState(key) < 0 };
@@ -365,6 +414,23 @@ impl Service_Impl {
         let view = self.editor.view.borrow();
         if !view.active {
             return None;
+        }
+        if let Some(key) = Self::shortcut_name(code) {
+            if self
+                .editor
+                .call("shortcut-match", json!({"key":key}))
+                .ok()
+                .is_some_and(|v| v.is_string())
+            {
+                return Some(Action::new(
+                    if (l.0 & (1 << 30)) != 0 {
+                        "shortcut-repeat"
+                    } else {
+                        "shortcut-key"
+                    },
+                    json!({"key":key}),
+                ));
+            }
         }
         if composing && (49..=53).contains(&code) && ((code - 49) as usize) < view.words.len() {
             let op = if down(0x11) {
@@ -378,12 +444,6 @@ impl Service_Impl {
                 return Some(Action::new(cmd, json!({"idx":code-49})));
             }
         }
-        if down(0x11) && code == 0x20 {
-            return Some(Action::new(
-                "process-key",
-                json!({"keycode":"","modifiers":["lang_toggle"]}),
-            ));
-        }
         if view.english || down(0x11) || down(0x12) || down(0x5b) || down(0x5c) {
             return None;
         }
@@ -393,6 +453,29 @@ impl Service_Impl {
             && ((code - 49) as usize) < view.words.len()
         {
             return Some(Action::new("select-candidate", json!({"idx":code-49})));
+        }
+        if code == 32 && !view.words.is_empty() && !composing {
+            return Some(Action::new("select-candidate", json!({"idx":0})));
+        }
+        if !view.words.is_empty() && view.mode == 0 && !down(0x10) {
+            if code == 37 || code == 39 {
+                return Some(Action::new(
+                    "move-candidate",
+                    json!({"delta":if code == 37 {-1} else {1}}),
+                ));
+            }
+            if code == 38 || code == 40 {
+                return Some(Action::new(
+                    "process-key",
+                    json!({"keycode":if code == 38 {"PageUp"} else {"PageDown"}}),
+                ));
+            }
+            if code == 32 {
+                return Some(Action::new(
+                    "select-candidate",
+                    json!({"idx":view.selected}),
+                ));
+            }
         }
         let key = match code {
             8 | 13 | 27 | 32 | 33 | 34 if composing => match code {
@@ -459,18 +542,42 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok(())
     }
     fn OnTestKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
+        if !matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
+            self.editor.shift_held.set(false);
+        }
         Ok((ctx.is_some() && self.key(w, l).is_some()).into())
     }
     fn OnKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
+        if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
+            self.editor
+                .shift_held
+                .set(Self::shortcut_name(w.0 as u32).is_some());
+            return Ok(false.into());
+        }
+        self.editor.shift_held.set(false);
         Ok(ctx
             .zip(self.key(w, l))
             .is_some_and(|(c, a)| self.edit(c, a).unwrap_or(false))
             .into())
     }
-    fn OnTestKeyUp(&self, _: Option<&ITfContext>, _: WPARAM, _: LPARAM) -> Result<BOOL> {
-        Ok(false.into())
+    fn OnTestKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
+        Ok((ctx.is_some()
+            && matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1)
+            && self.editor.shift_held.get())
+        .into())
     }
-    fn OnKeyUp(&self, _: Option<&ITfContext>, _: WPARAM, _: LPARAM) -> Result<BOOL> {
+    fn OnKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
+        if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1)
+            && self.editor.shift_held.replace(false)
+            && Self::shortcut_name(w.0 as u32).is_some()
+        {
+            return Ok(ctx
+                .is_some_and(|c| {
+                    self.edit(c, Action::new("shortcut-key", json!({"key":"Shift"})))
+                        .unwrap_or(false)
+                })
+                .into());
+        }
         Ok(false.into())
     }
     fn OnPreservedKey(&self, _: Option<&ITfContext>, _: *const GUID) -> Result<BOOL> {
@@ -490,6 +597,21 @@ impl ITfEditSession_Impl for Edit_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         let ed = &self.editor;
         let a = &self.action;
+        if a.cmd == "shortcut-repeat" {
+            self.handled.set(true);
+            return Ok(());
+        }
+        if a.cmd == "move-candidate" {
+            let mut view = ed.view.borrow_mut();
+            let delta = a.args["delta"].as_i64().unwrap_or(0);
+            view.selected = (view.selected as i64 + delta)
+                .clamp(0, view.words.len().saturating_sub(1) as i64)
+                as usize;
+            drop(view);
+            ed.draw(false, true);
+            self.handled.set(true);
+            return Ok(());
+        }
         let r = if a.cmd == "insert" {
             a.args.clone()
         } else {
@@ -513,7 +635,11 @@ impl ITfEditSession_Impl for Edit_Impl {
         let toggle = a.args["modifiers"]
             .as_array()
             .is_some_and(|m| m.iter().any(|v| v == "lang_toggle"));
-        if a.cmd == "process-key" && !edits_text && !toggle {
+        if (a.cmd == "process-key" || a.cmd == "shortcut-key")
+            && !edits_text
+            && !toggle
+            && !r["function_action"].is_string()
+        {
             return Ok(());
         }
         if edits_text {
@@ -572,12 +698,10 @@ impl ITfEditSession_Impl for Edit_Impl {
         if let Some(lang) = r["lang_mode"].as_str() {
             v.english = lang == "en";
         }
-        if a.cmd == "consume-quick-paste" {
-            v.paste = false;
-        }
         if a.cmd == "hw-confirm" {
             v.mode = 0;
         }
+        v.selected = 0;
         v.words.clear();
         v.values.clear();
         v.slots.clear();
@@ -585,7 +709,9 @@ impl ITfEditSession_Impl for Edit_Impl {
             for c in candidates.iter().take(5) {
                 let text = c["text"].as_str().or(c["char"].as_str()).unwrap_or("");
                 v.values.push(text.into());
-                v.words.push(if let Some(py) = c["toned_pinyin"].as_str() {
+                v.words.push(if c["quick_paste_id"].is_string() {
+                    format!("粘贴 {text}")
+                } else if let Some(py) = c["toned_pinyin"].as_str() {
                     format!(
                         "{} {} {}",
                         text,
@@ -605,7 +731,25 @@ impl ITfEditSession_Impl for Edit_Impl {
             }
             glow = slots.iter().any(|s| s["changed_retroactively"] == true);
         }
+        let function = r["function_action"].as_str().unwrap_or("");
+        if function == "lookup" || function == "handwriting" {
+            v.mode = if function == "lookup" { 1 } else { 2 };
+        }
         drop(v);
+        match function {
+            "settings" => {
+                let _ = std::process::Command::new(&ed.host).spawn();
+            }
+            "clipboard" => {
+                let _ = std::process::Command::new(&ed.host)
+                    .arg("--clipboard")
+                    .spawn();
+            }
+            "lookup" | "handwriting" => {
+                ed.call("hw-begin", json!({"mode":if function == "lookup" {"PhoneticLookup"} else {"ContinuousLattice"}}))?;
+            }
+            _ => {}
+        }
         ed.draw(glow, true);
         self.handled.set(true);
         Ok(())
@@ -615,7 +759,7 @@ unsafe extern "C" fn panel_event(
     owner: *const c_void,
     op: i32,
     index: i32,
-    text: *const u16,
+    _text: *const u16,
     points: *const f32,
     n: usize,
 ) {
@@ -655,7 +799,6 @@ unsafe extern "C" fn panel_event(
             "process-key",
             json!({"keycode":"","modifiers":["lang_toggle"]}),
         ),
-        2 => Action::consume_quick_paste(),
         3 if index == 5 => {
             let _ = std::process::Command::new(&ed.host).spawn();
             return;
@@ -679,20 +822,27 @@ unsafe extern "C" fn panel_event(
                 .collect();
             Action::new("hw-push-stroke", json!({"points":pts,"pen_up":true}))
         }
-        8 => {
-            if let Ok(r) = ed.call("quick-paste-state", json!({})) {
-                let paste = !r["quick_paste"].is_null();
-                if ed.view.borrow().paste != paste {
-                    ed.view.borrow_mut().paste = paste;
-                    ed.draw(false, false)
-                }
+        10 => {
+            let mut view = ed.view.borrow_mut();
+            if index >= 0 && (index as usize) < view.words.len() {
+                view.selected = index as usize;
             }
+            drop(view);
+            ed.draw(false, false);
             return;
         }
-        9 if !text.is_null() => {
-            let s = PCWSTR(text).to_string().unwrap_or_default();
-            let _ = ed.call("clipboard-push", json!({"payload":s}));
-            return;
+        8 => {
+            let Ok(r) = ed.call("quick-paste-state", json!({})) else {
+                return;
+            };
+            let id = r["quick_paste"]["id"].as_str().unwrap_or("");
+            let mut view = ed.view.borrow_mut();
+            if view.paste_id == id || view.mode != 0 {
+                return;
+            }
+            view.paste_id = id.into();
+            drop(view);
+            Action::new("candidate-state", json!({}))
         }
         _ => return,
     };

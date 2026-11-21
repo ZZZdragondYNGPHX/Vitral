@@ -1,11 +1,12 @@
 {
   "name": "vitral-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "tokens:gen": "python3 scripts/gen-tokens.py",
     "tokens:verify": "python3 scripts/gen-tokens.py --check",
+    "test:tokens": "pnpm --filter @vitral/desktop-tauri test:tokens",
     "desktop:dev": "pnpm --filter @vitral/desktop-tauri dev",
     "desktop:build": "pnpm --filter @vitral/desktop-tauri build"
   }

@@ -1237,7 +1237,7 @@ mod tests {
         let cold_res = vitral_clipboard_ingest_remote(engine, cold_payload.as_ptr(), true);
         assert_eq!(cold_res.status, VitralStatus::Ok);
         let cold_json = CStr::from_ptr(cold_res.json_utf8).to_str().unwrap();
-        assert!(cold_json.contains(r#""quick_paste":null"#));
+        assert!(cold_json.contains(r#""current_copy":{"id":"c0""#));
         vitral_free_result(cold_res);
 
         let live_payload = CString::new(
@@ -1264,7 +1264,8 @@ mod tests {
         let close_res = vitral_on_ime_close(engine);
         assert_eq!(close_res.status, VitralStatus::Ok);
         let close_json = CStr::from_ptr(close_res.json_utf8).to_str().unwrap();
-        assert!(close_json.contains(r#""quick_paste":null"#));
+        assert!(close_json.contains(r#""content":"otp-9988""#));
+        assert!(close_json.contains(r#""candidate_visible":false"#));
         vitral_free_result(close_res);
 
         let push_res = vitral_clipboard_push(engine, live_payload.as_ptr());
@@ -1333,7 +1334,7 @@ mod tests {
             assert_eq!(ingest_res.status, VitralStatus::Ok);
             let ingest_json = CStr::from_ptr(ingest_res.json_utf8).to_str().unwrap();
             let qp_b: serde_json::Value = serde_json::from_str(ingest_json).unwrap();
-            assert_eq!(qp_b["quick_paste"]["content"].as_str(), Some("from-devA"));
+            assert_eq!(qp_b["current_copy"]["id"].as_str(), Some(id_a.max(id_b).as_str()));
             vitral_free_result(ingest_res);
 
             let clip_b = vitral_clipboard_state(dev_b);

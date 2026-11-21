@@ -1,10 +1,9 @@
 {
   "name": "@vitral/desktop-tauri",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
-    "dev": "../../scripts/locked-run.sh cargo run --manifest-path src-tauri/Cargo.toml",
-    "build": "../../scripts/locked-run.sh cargo build --release --manifest-path src-tauri/Cargo.toml"
+    "test:tokens": "node tests/tokens.test.mjs"
   }
 }

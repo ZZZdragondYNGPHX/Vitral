@@ -208,11 +208,13 @@ object Core {
 
     fun save(ctx: Context, cfg: JSONObject, done: (Result<Any>) -> Unit) =
         call(ctx, "configure", cfg, true) { result ->
-            if (result.isSuccess)
+            if (result.isSuccess) {
+                (result.getOrNull() as? JSONObject)?.optJSONArray("shortcuts")?.let { cfg.put("shortcuts", it) }
                 ctx.getSharedPreferences("vitral", 0)
                     .edit()
                     .putString("settings", cfg.toString())
                     .apply()
+            }
             done(result)
         }
 }

@@ -1,13 +1,467 @@
-<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Vitral</title><link rel="stylesheet" href="generated/tokens.css"><link rel="stylesheet" href="style.css"></head>
-<body><a class="skip" href="#main">跳至设置</a><aside><div class="brand"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="m9 9 15 30L39 9l-15 11z"/></svg>Vitral</div><nav aria-label="管理中心"><button data-tab="input" aria-current="page">输入与外观</button><button data-tab="library">词库与剪贴板</button><button data-tab="cloud">同步与换机</button><button data-tab="tools">语音与 AI</button></nav></aside>
-<main id="main" tabindex="-1"><header><span>管理中心</span><h1>输入与外观</h1></header>
-<section id="input">
-<article class="preview"><div class="capsule" aria-label="候选字号预览"><span><small>1</small> 今日</span><span><small>2</small> 近日</span><span><small>3</small> 尽日</span><span><small>4</small> 金日</span><span><small>5</small> 紧日</span></div><p>候选字号预览</p></article>
-<article><h2>键盘</h2><label>输入方案<select name="schema"><option value="double_pinyin_flypy">小鹤双拼</option><option value="rime_ice">雾凇全拼</option></select></label><label>常用词权重减半周期<select name="frecency_half_life_sec"><option value="86400">1 天</option><option selected value="604800">7 天</option><option value="2592000">30 天</option></select></label><label>字形<select name="opencc_mode"><option value="simplified">简体</option><option value="traditional">繁體</option><option value="taiwan_standard">臺灣正體</option><option value="hong_kong">香港繁體</option></select></label><label>候选字号<span><input type="range" min="13" max="22" value="16" name="candidate_font_px"><output>16 px</output></span></label><label>主题<select name="theme"><option value="system">跟随系统</option><option value="dark">深色</option><option value="light">浅色</option></select></label><p>保存后，字号和主题会应用到 Fcitx5 经典候选面板。候选显示时，Ctrl + 1–5 置顶对应词，Alt + 1–5 移除。</p></article></section>
-<section id="library" hidden><article><h2>导入词库</h2><button id="import" class="drop">选择或拖入词库文件<small>.scel · .dict.yaml · TSV · TXT</small></button></article>
-<article><h2>剪贴板历史</h2><label>保留条数<span><input name="clipboard_ring_capacity" type="range" min="20" max="200" value="50"><output>50 条</output></span></label><div class="actions"><button data-action="clipboard-state">读取历史</button><button data-action="clipboard-clear-unpinned">清空未置顶</button></div><ul id="entries"></ul></article></section>
-<section id="cloud" hidden><article><label><strong>纯离线模式</strong><input name="pure_offline" type="checkbox"></label><p>开启后仍可使用拼音、手写和本机语音转写。</p></article><article><h2>Koofr WebDAV</h2><label>端点<input name="koofr_endpoint" type="url" placeholder="https://app.koofr.net/dav/Koofr"></label><label>账户<input name="koofr_username" autocomplete="username"></label><label>应用密码<input name="koofr_password" type="password" autocomplete="new-password" placeholder="输入新密码以替换"></label><label>同步密钥<input name="sync_key" type="password" autocomplete="off"></label><div class="actions"><button data-action="storage" class="online">查看云盘用量</button><button data-action="restore-from-koofr" class="online">从备份恢复</button></div><dl id="usage"></dl></article><article><h2>设备闪传</h2><button class="online" data-action="relay-discover">发现设备并开启接收</button><button data-action="relay-stop-discovery">关闭局域网接收</button><ul id="devices"></ul><button data-action="relay-poll-inbox" class="online">接收文件和文本</button><ul id="inbox"></ul></article></section>
-<section id="tools" hidden><article><h2>AI 服务</h2><label>服务地址<input name="ai_endpoint" type="url" placeholder="http://localhost:11434"></label><label>模型<input name="ai_model" placeholder="qwen2.5:7b"></label><label>API 密钥<input name="ai_api_key" type="password" autocomplete="off"></label><label>允许 AI 在手写候选中消歧<input name="ai_tier3_enabled" type="checkbox"></label></article>
-<article><h2>录音与文本</h2><textarea id="source" rows="4" aria-label="原文或转写" placeholder="输入原文，或录音后在此校对转写"></textarea><div class="actions"><button id="record">开始录音</button><select id="target-lang" aria-label="翻译目标语言"><option value="en">英语</option><option value="zh">中文</option><option value="ja">日语</option></select><button class="online" data-ai="translate">翻译</button><button class="online" data-ai="polish">润色</button><button class="online" data-ai="summary">摘要</button></div><p id="result"></p></article></section>
-<footer><span id="notice" role="status" aria-live="polite"></span><button class="primary" id="save">保存设置</button></footer></main>
-<script type="module" src="ui.js"></script></body></html>
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Vitral · 管理中心</title>
+  <link rel="stylesheet" href="generated/tokens.css">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <a class="skip" href="#main">跳至主要内容</a>
+
+  <div class="ambient" aria-hidden="true">
+    <span class="orb orb-a"></span>
+    <span class="orb orb-b"></span>
+  </div>
+
+  <aside>
+    <div class="aside-top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none">
+            <path d="M9 9.5L24 39.5L39 9.5L24 20.5L9 9.5Z" stroke="currentColor" stroke-width="2.6" stroke-linejoin="round"/>
+          </svg>
+        </span>
+        <div>
+          <span class="brand-name">Vitral</span>
+          <span class="brand-sub">纯粹晶透输入法</span>
+        </div>
+      </div>
+
+      <nav aria-label="管理中心">
+        <button type="button" data-tab="input" aria-current="page">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="2.5" y="5" width="19" height="14" rx="3"/><path d="M6.5 9.5h.01M10 9.5h.01M13.5 9.5h.01M17 9.5h.01M7.5 13.5h9"/></svg>
+          <span>输入与外观</span>
+        </button>
+        <button type="button" data-tab="shortcuts">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M18 3a3 3 0 0 0-3 3v12a3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3H6a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3V6a3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3h12a3 3 0 0 0 3-3 3 3 0 0 0-3-3z"/></svg>
+          <span>快捷键</span>
+        </button>
+        <button type="button" data-tab="library">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="3" width="8" height="4" rx="1.2"/><path d="M16 5h2a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2"/><path d="M9 12h6M9 16h4"/></svg>
+          <span>词库与剪贴板</span>
+        </button>
+        <button type="button" data-tab="cloud">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M17.5 19H9a5 5 0 0 1-.8-9.94A6.5 6.5 0 0 1 20.6 11a4 4 0 0 1-3.1 8z"/></svg>
+          <span>同步与闪传</span>
+        </button>
+        <button type="button" data-tab="tools">
+          <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0"/><path d="M12 18v3"/></svg>
+          <span>语音与 AI</span>
+        </button>
+      </nav>
+    </div>
+
+    <div class="aside-status" id="engine-status" data-state="checking">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span class="status-text">正在检测输入服务…</span>
+    </div>
+  </aside>
+
+  <main id="main" tabindex="-1">
+    <div class="main-scroll">
+      <header class="page-head">
+        <div class="page-head-copy">
+          <span class="eyebrow">管理中心</span>
+          <h1>输入与外观</h1>
+        </div>
+        <div class="head-pills">
+          <span class="pill" id="mode-pill" hidden>纯离线</span>
+        </div>
+      </header>
+
+      <!-- ================= TAB 1: INPUT & APPEARANCE ================= -->
+      <section id="input">
+        <article class="preview-stage">
+          <div class="preview-stage-top">
+            <span class="stage-label">候选面板实时预览</span>
+            <span class="stage-hint">点击候选体验高亮 · 调整下方字号与主题即时反馈</span>
+          </div>
+          <div class="preview-canvas">
+            <div class="preview-preedit" id="preview-preedit">jr<span class="caret"></span></div>
+            <div class="capsule" id="preview-capsule" aria-label="候选字号预览">
+              <button type="button" class="cand is-active" data-idx="0"><small>1</small>今日</button>
+              <button type="button" class="cand" data-idx="1"><small>2</small>近日</button>
+              <button type="button" class="cand" data-idx="2"><small>3</small>尽日</button>
+              <button type="button" class="cand" data-idx="3"><small>4</small>金日</button>
+              <button type="button" class="cand" data-idx="4"><small>5</small>紧日</button>
+              <span class="capsule-nav" aria-hidden="true"><span>‹</span><span>›</span></span>
+            </div>
+          </div>
+          <div class="preview-tips">
+            <span><kbd>Ctrl</kbd> + <kbd>1–5</kbd> 置顶候选词</span>
+            <span><kbd>Alt</kbd> + <kbd>1–5</kbd> 抹除误造词</span>
+            <span><kbd>Enter</kbd> 提交原始字母串</span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <h2>输入方案与习惯</h2>
+            <span class="card-sub">本地毫秒级解码，支持中英混输与按应用记忆</span>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="schema-select">拼音方案</label>
+              <p class="help">小鹤双拼简洁高效，雾凇全拼支持整句多音节解码</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="segmented" data-mirror="schema" role="group" aria-label="拼音方案">
+                <button type="button" data-val="double_pinyin_flypy">小鹤双拼</button>
+                <button type="button" data-val="rime_ice">雾凇全拼</button>
+              </div>
+              <select id="schema-select" name="schema" class="sr-select" aria-label="输入方案">
+                <option value="double_pinyin_flypy">小鹤双拼</option>
+                <option value="rime_ice">雾凇全拼</option>
+              </select>
+            </div>
+          </div>
+
+          <div id="linux-language" class="row" hidden>
+            <div class="row-copy">
+              <label for="linux-english-toggle">输入法内英文模式</label>
+              <p id="linux-language-help" class="help">开启后可在 Vitral 内用快捷键切换中英文；关闭后 Vitral 固定中文并隐藏切换按钮，英文交由系统键盘输入。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="linux-english-toggle" class="switch" name="linux_english_mode" type="checkbox" checked disabled aria-describedby="linux-language-help">
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="opencc-select">输出字形</label>
+              <p class="help">通过 OpenCC 实时转换简繁标准</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="select-wrap">
+                <select id="opencc-select" name="opencc_mode">
+                  <option value="simplified">简体中文</option>
+                  <option value="traditional">繁體中文</option>
+                  <option value="taiwan_standard">臺灣正體</option>
+                  <option value="hong_kong">香港繁體</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="frecency-select">常用词权重衰减周期</label>
+              <p class="help">近期高频词优先靠前，过时临时词按所选周期自然淡出</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="select-wrap">
+                <select id="frecency-select" name="frecency_half_life_sec">
+                  <option value="86400">1 天（敏锐跟随近期）</option>
+                  <option selected value="604800">7 天（均衡推荐）</option>
+                  <option value="2592000">30 天（稳定长期习惯）</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head">
+            <h2>外观与视觉</h2>
+            <span class="card-sub">保存后即时应用到系统候选面板与悬浮状态胶囊</span>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="theme-select">界面主题</label>
+              <p class="help">深色晶透与浅色冰晶共享磨砂半透明材质</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="segmented" data-mirror="theme" role="group" aria-label="界面主题">
+                <button type="button" data-val="system">跟随系统</button>
+                <button type="button" data-val="dark">深色晶透</button>
+                <button type="button" data-val="light">浅色冰晶</button>
+              </div>
+              <select id="theme-select" name="theme" class="sr-select" aria-label="主题">
+                <option value="system">跟随系统</option>
+                <option value="dark">深色</option>
+                <option value="light">浅色</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="font-range">候选字号</label>
+              <p class="help">范围 13–22 px，默认 16 px</p>
+            </div>
+            <div class="row-ctrl range-group">
+              <div class="preset-chips" aria-label="常用字号">
+                <button type="button" class="chip-btn" data-font-preset="14">14</button>
+                <button type="button" class="chip-btn" data-font-preset="16">16</button>
+                <button type="button" class="chip-btn" data-font-preset="18">18</button>
+              </div>
+              <input id="font-range" type="range" min="13" max="22" value="16" name="candidate_font_px">
+              <output class="range-val">16 px</output>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ================= TAB 2: SHORTCUTS ================= -->
+      <section id="shortcuts" hidden>
+        <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <h2>快捷键与功能输入码</h2>
+              <p class="help">支持全局实体按键与纯字母输入码两种触发方式，留空即可关闭。输入码与剪贴板收藏简码互不覆盖。</p>
+            </div>
+            <button type="button" class="btn-ghost" id="reset-shortcuts">恢复默认</button>
+          </div>
+          <div id="shortcut-conflict" class="inline-alert" hidden role="alert"></div>
+          <div id="shortcut-rules" class="shortcut-list"></div>
+        </article>
+      </section>
+
+      <!-- ================= TAB 3: LEXICON & CLIPBOARD ================= -->
+      <section id="library" hidden>
+        <article class="card">
+          <div class="card-head">
+            <h2>多格式词库导入</h2>
+            <span class="card-sub">导入词条同时用于拼音解码与连续手写重排，并随个人词库同步</span>
+          </div>
+          <button type="button" id="import" class="drop">
+            <span class="drop-icon" aria-hidden="true">
+              <svg class="ic" viewBox="0 0 24 24"><path d="M12 16V4m0 0-4 4m4-4 4 4"/><path d="M4 17v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1"/></svg>
+            </span>
+            <span class="drop-title">点击选择或将词库文件拖放至此处</span>
+            <span class="format-tags">
+              <span>.scel 搜狗</span>
+              <span>.dict.yaml Rime</span>
+              <span>.tsv</span>
+              <span>.txt 自动注音</span>
+            </span>
+          </button>
+          <ul id="import-log" class="mini-log" hidden></ul>
+        </article>
+
+        <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <h2>剪贴板历史与收藏简码</h2>
+              <span class="card-sub" id="clip-summary">打开此页时自动读取最近记录 · 置顶项不受容量上限淘汰</span>
+            </div>
+            <div class="btn-cluster">
+              <button type="button" class="btn-ghost" data-action="clipboard-state">刷新</button>
+              <button type="button" class="btn-danger-ghost" data-action="clipboard-clear-unpinned" id="btn-clear-unpinned">清空未置顶</button>
+            </div>
+          </div>
+
+          <div class="row compact">
+            <div class="row-copy">
+              <label for="cap-range">历史保留上限</label>
+            </div>
+            <div class="row-ctrl range-group">
+              <input id="cap-range" name="clipboard_ring_capacity" type="range" min="20" max="200" step="5" value="50">
+              <output class="range-val">50 条</output>
+            </div>
+          </div>
+
+          <div class="search-bar">
+            <svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+            <input id="clip-search" type="search" placeholder="筛选剪贴板正文或简码…" aria-label="筛选剪贴板记录">
+          </div>
+
+          <div id="entries-empty" class="empty-state" hidden>暂无剪贴板记录，复制文本后将自动出现在这里</div>
+          <div id="entries-groups">
+            <div id="pinned-group" hidden>
+              <div class="group-title">置顶收藏 <span class="badge" id="pinned-count">0</span></div>
+              <ul id="entries-pinned" class="clip-list"></ul>
+            </div>
+            <div id="recent-group" hidden>
+              <div class="group-title">最近复制 <span class="badge" id="recent-count">0</span></div>
+              <ul id="entries" class="clip-list"></ul>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <!-- ================= TAB 4: CLOUD SYNC & TRANSFER ================= -->
+      <section id="cloud" hidden>
+        <article class="card offline-hero" id="offline-card">
+          <div class="row no-border">
+            <div class="row-copy">
+              <div class="title-with-badge">
+                <label for="offline-toggle"><strong>纯离线模式</strong></label>
+                <span class="badge" id="offline-badge">协同就绪</span>
+              </div>
+              <p class="help">开启后物理阻断一切局域网与外部网络请求，本地拼音、手写与离线语音转写依然完整可用。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="offline-toggle" class="switch" name="pure_offline" type="checkbox">
+            </div>
+          </div>
+        </article>
+
+        <article class="card online-card">
+          <div class="card-head row-head">
+            <div>
+              <h2>Koofr WebDAV 私有云同步</h2>
+              <span class="card-sub">端到端加密同步个人词频、外部词库、置顶剪贴板与设置</span>
+            </div>
+            <span class="mono-tag">/Koofr/Vitral</span>
+          </div>
+
+          <div class="row">
+            <div class="row-copy"><label for="koofr-endpoint">WebDAV 端点</label></div>
+            <div class="row-ctrl"><input id="koofr-endpoint" name="koofr_endpoint" type="url" placeholder="https://app.koofr.net/dav/Koofr"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy"><label for="koofr-user">账户邮箱</label></div>
+            <div class="row-ctrl"><input id="koofr-user" name="koofr_username" autocomplete="username" placeholder="name@example.com"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
+              <div class="title-with-badge">
+                <label for="koofr-pass">独立应用密码</label>
+                <span class="secret-pill" data-secret="has_koofr_password" hidden>已保存</span>
+              </div>
+            </div>
+            <div class="row-ctrl"><input id="koofr-pass" name="koofr_password" type="password" autocomplete="new-password" placeholder="输入新密码以设置或替换"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
+              <div class="title-with-badge">
+                <label for="sync-key">端到端同步密钥</label>
+                <span class="secret-pill" data-secret="has_sync_key" hidden>已保存</span>
+              </div>
+              <p class="help">本地派生加密密钥，换机时输入相同密钥即可还原</p>
+            </div>
+            <div class="row-ctrl"><input id="sync-key" name="sync_key" type="password" autocomplete="off" placeholder="输入同步口令"></div>
+          </div>
+
+          <div class="actions">
+            <button type="button" data-action="storage" class="online btn-ghost">查看云盘用量</button>
+            <button type="button" data-action="restore-from-koofr" class="online btn-accent-soft">一键从云端恢复</button>
+          </div>
+          <dl id="usage" class="usage-grid" hidden></dl>
+        </article>
+
+        <article class="card online-card">
+          <div class="card-head row-head">
+            <div>
+              <h2>设备隔空闪传</h2>
+              <span class="card-sub">局域网 LocalSend 直连优先，跨网经中转后校验 SHA-256 即删</span>
+            </div>
+            <div class="btn-cluster">
+              <button type="button" class="online btn-accent-soft" data-action="relay-discover">发现设备</button>
+              <button type="button" class="btn-ghost" data-action="relay-stop-discovery">停止接收</button>
+              <button type="button" class="online btn-ghost" data-action="relay-poll-inbox">检查收件箱</button>
+            </div>
+          </div>
+
+          <div class="device-strip-wrap">
+            <ul id="devices" class="device-strip" aria-label="可用设备列表"></ul>
+            <div id="devices-empty" class="empty-state compact">点击「发现设备」扫描局域网和在线关联设备</div>
+          </div>
+
+          <div id="inbox-wrap" hidden>
+            <div class="group-title">已接收文件与文本</div>
+            <ul id="inbox" class="inbox-list"></ul>
+          </div>
+        </article>
+      </section>
+
+      <!-- ================= TAB 5: VOICE & AI ================= -->
+      <section id="tools" hidden>
+        <article class="card online-card">
+          <div class="card-head">
+            <h2>可选 AI 服务</h2>
+            <span class="card-sub">支持本地 Ollama 或 OpenAI 兼容接口，完全可选、不强制联网</span>
+          </div>
+          <div class="row">
+            <div class="row-copy"><label for="ai-endpoint">服务地址</label></div>
+            <div class="row-ctrl"><input id="ai-endpoint" name="ai_endpoint" type="url" placeholder="http://localhost:11434"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy"><label for="ai-model">模型名称</label></div>
+            <div class="row-ctrl"><input id="ai-model" name="ai_model" placeholder="qwen2.5:7b"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
+              <div class="title-with-badge">
+                <label for="ai-key">API 密钥</label>
+                <span class="secret-pill" data-secret="has_ai_api_key" hidden>已保存</span>
+              </div>
+              <p class="help">本地 Ollama 可留空</p>
+            </div>
+            <div class="row-ctrl"><input id="ai-key" name="ai_api_key" type="password" autocomplete="off" placeholder="sk-… 或留空"></div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
+              <label for="ai-tier3">允许 AI 辅助连续手写消歧</label>
+              <p class="help">仅在已有模糊字位候选中择优，不会凭空改写清晰字</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="ai-tier3" class="switch" name="ai_tier3_enabled" type="checkbox">
+            </div>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <h2>本机离线录音与文本工作台</h2>
+              <span class="card-sub">SenseVoice-Small 本地转写 · 可选一键翻译、润色或提炼摘要</span>
+            </div>
+            <span class="rec-timer" id="rec-timer" hidden><span class="rec-dot"></span><span id="rec-elapsed">00:00</span></span>
+          </div>
+
+          <textarea id="source" rows="4" aria-label="原文或转写" placeholder="在此输入文本，或点击下方「开始录音」进行本机离线语音转写…"></textarea>
+          <div class="workbench-bar">
+            <div class="actions">
+              <button type="button" id="record" class="btn-accent-soft">开始录音</button>
+              <div class="select-wrap compact">
+                <select id="target-lang" aria-label="翻译目标语言">
+                  <option value="en">译为英语</option>
+                  <option value="zh">译为中文</option>
+                  <option value="ja">译为日语</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+              <button type="button" class="online btn-ghost" data-ai="translate">翻译</button>
+              <button type="button" class="online btn-ghost" data-ai="polish">润色</button>
+              <button type="button" class="online btn-ghost" data-ai="summary">摘要</button>
+            </div>
+            <span class="char-count" id="source-count">0 字</span>
+          </div>
+
+          <div class="result-card" id="result-card" hidden>
+            <div class="result-head">
+              <span id="result-title">处理结果</span>
+              <div class="btn-cluster">
+                <button type="button" class="btn-mini" id="copy-result">复制结果</button>
+                <button type="button" class="btn-mini" id="apply-result">替换原文</button>
+              </div>
+            </div>
+            <p id="result"></p>
+          </div>
+        </article>
+      </section>
+    </div>
+
+    <footer id="save-bar">
+      <div class="notice-wrap">
+        <span class="notice-dot" id="notice-dot" aria-hidden="true"></span>
+        <span id="notice" role="status" aria-live="polite"></span>
+      </div>
+      <div class="footer-actions">
+        <span class="kbd-hint" aria-hidden="true"><kbd>Ctrl</kbd>+<kbd>S</kbd></span>
+        <button type="button" class="primary" id="save">保存设置</button>
+      </div>
+    </footer>
+  </main>
+
+  <script type="module" src="ui.js"></script>
+</body>
+</html>
