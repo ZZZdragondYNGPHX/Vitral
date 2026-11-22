@@ -120,7 +120,7 @@ internal class AeviouKeyboard(
             )
         } else {
             // 5-row airy Chinese Quanpin / Mixed-English honeycomb (5/5/5/5/5 = 25 hexes, generous gaps!)
-            val vowelHub = Triple("aeiou", if (allowMixedEnglish) "a·e·i·o·u" else "a·e·o", 0)
+            val vowelHub = Triple("aeiou", if (allowMixedEnglish) "aeiou" else "aeo", 0)
             val bottomRow =
                 if (leftHanded) {
                     listOf(
@@ -219,7 +219,7 @@ internal class AeviouKeyboard(
         if (w <= 0f || h <= 0f) return
         val padLeft = context.dpF(if (leftHanded) 20f else 12f)
         val padRight = context.dpF(if (leftHanded) 12f else 20f)
-        val padTop = context.dpF(8f)
+        val padTop = context.dpF(28f)
         val padBottom = context.dpF(18f)
         val availW = (w - padLeft - padRight).coerceAtLeast(1f)
         val availH = (h - padTop - padBottom).coerceAtLeast(1f)
@@ -277,7 +277,6 @@ internal class AeviouKeyboard(
     }
 
     private fun computePetals(center: PointF, prefix: String) {
-        val stepDist = hexRadius * 1.88f
         // Keep activeCenter strictly on the real touched key/petal so petals NEVER spawn under a stationary finger!
         activeCenter = PointF(center.x, center.y)
 
@@ -379,70 +378,67 @@ internal class AeviouKeyboard(
             }
         }
 
-        // Handedness-aware & edge-safe petal fanning:
-        // - Right-handed mode: default & right-half keys fan into the open upper-left & left arc
-        //   to stay clear of the right thumb.
-        // - Left-handed mode: default & left-half keys fan into the open upper-right & right arc
-        //   to stay clear of the left thumb.
-        val nearRight = width > 0 && activeCenter.x > width * (if (leftHanded) 0.74f else 0.52f)
-        val nearLeft = width > 0 && activeCenter.x < width * (if (leftHanded) 0.48f else 0.26f)
-        val nearTop = height > 0 && activeCenter.y < height * 0.28f
-        val nearBottom = height > 0 && activeCenter.y > height * 0.72f
-        val anglesDeg =
-            when {
-                nearRight && nearTop -> floatArrayOf(180f, 145f, 110f, 162f, 128f, 82f)
-                nearRight && nearBottom -> floatArrayOf(-115f, -150f, 180f, -80f, -132f, 150f)
-                nearRight -> floatArrayOf(-120f, -155f, 180f, 145f, -85f, 110f)
-                nearLeft && nearTop -> floatArrayOf(0f, 35f, 70f, 18f, 52f, 95f)
-                nearLeft && nearBottom -> floatArrayOf(-65f, -30f, 0f, -100f, -48f, 25f)
-                nearLeft -> floatArrayOf(-60f, -25f, 0f, 35f, -95f, 70f)
-                nearTop ->
-                    if (leftHanded) floatArrayOf(0f, 45f, 90f, 135f, 180f, 22f)
-                    else floatArrayOf(180f, 135f, 90f, 45f, 0f, 158f)
-                nearBottom ->
-                    if (leftHanded) floatArrayOf(-60f, -120f, 0f, -90f, 180f, -30f)
-                    else floatArrayOf(-120f, -60f, 180f, -90f, 0f, -150f)
-                leftHanded -> floatArrayOf(-60f, -25f, 0f, -100f, 40f, 70f)
-                else -> floatArrayOf(-120f, -155f, 180f, -80f, 140f, 110f)
+        // True 2-ring Axial Hexagonal Lattice placement:
+        // Every cell on Ring 1 (6 direct neighbors) & Ring 2 (12 outer neighbors) is separated by
+        // at least `pitch = 1.96 * hexRadius` (~27% clear air gap for `petalR = 0.88 * hexRadius`).
+        // Mathematically impossible for any two petals or activeCenter to overlap, even at corners like D!
+        val petalR = hexRadius * 0.88f
+        val pitch = hexRadius * 1.96f
+        val padX = petalR * 1.02f
+        val padTop = context.dpF(24f) + petalR * 0.96f
+        val padBot = petalR * 1.02f
+
+        data class SlotCand(val pos: PointF, val ring: Int, val cost: Float)
+        val validSlots = ArrayList<SlotCand>(18)
+        for (q in -2..2) {
+            for (r in -2..2) {
+                val s = -q - r
+                val ring = maxOf(kotlin.math.abs(q), kotlin.math.abs(r), kotlin.math.abs(s))
+                if (ring !in 1..2) continue
+                val dx = pitch * (q + r * 0.5f)
+                val dy = pitch * (r * 0.8660254f)
+                val px = activeCenter.x + dx
+                val py = activeCenter.y + dy
+                if (width > padX * 2 && (px < padX || px > width - padX)) continue
+                if (height > padTop + padBot && (py < padTop || py > height - padBot)) continue
+                // Handedness thumb-avoidance cost:
+                // Right-hand mode prefers LEFT & UPPER-LEFT (dx < 0, dy <= 0); penalizes right/lower-right under thumb.
+                // Left-hand mode mirrors: prefers RIGHT & UPPER-RIGHT (dx > 0, dy <= 0).
+                val thumbSidePenalty =
+                    if (leftHanded) {
+                        (if (dx < -1f) 38f else 0f) + (if (dx < -1f && dy > 1f) 24f else 0f)
+                    } else {
+                        (if (dx > 1f) 38f else 0f) + (if (dx > 1f && dy > 1f) 24f else 0f)
+                    }
+                val distCost = hypot(dx, dy) / pitch * 60f
+                val upperBonus = if (dy < -1f) -10f else if (dy > 1f) 6f else 0f
+                val cost = ring * 100f + distCost + thumbSidePenalty + upperBonus
+                validSlots.add(SlotCand(PointF(px, py), ring, cost))
             }
-        val pad = hexRadius * 1.05f
-        fun petalPos(deg: Float): PointF {
-            val rad = Math.toRadians(deg.toDouble())
-            var px = activeCenter.x + stepDist * cos(rad).toFloat()
-            var py = activeCenter.y + stepDist * sin(rad).toFloat()
-            if (width > pad * 2) px = px.coerceIn(pad, width - pad)
-            if (height > pad * 2) py = py.coerceIn(pad + context.dpF(26f), height - pad)
-            // Enforce minimum separation so no clamped petal can ever overlap activeCenter
-            val dx = px - activeCenter.x
-            val dy = py - activeCenter.y
-            val dist = hypot(dx, dy)
-            val minSep = hexRadius * 1.48f
-            if (dist < minSep) {
-                val nx = if (dist > 1f) dx / dist else if (nearRight) -1f else 1f
-                val ny = if (dist > 1f) dy / dist else -0.5f
-                px = activeCenter.x + nx * minSep
-                py = activeCenter.y + ny * minSep
-            }
-            return PointF(px, py)
         }
-        var backtrackSlot = -1
+        validSlots.sortBy { it.cost }
+
+        // Reserve closest Ring-1 slot toward previous center as backtrack "↩" when sliding multi-step
+        var backtrackIdx = -1
         if (centerHistory.size >= 2) {
             val prev = centerHistory[centerHistory.size - 2]
             var bestD = Float.MAX_VALUE
-            for (slot in 0 until 6) {
-                val p = petalPos(anglesDeg[slot])
-                val d = hypot(p.x - prev.x, p.y - prev.y)
-                if (d < bestD) {
-                    bestD = d
-                    backtrackSlot = slot
+            validSlots.forEachIndexed { idx, slot ->
+                if (slot.ring == 1) {
+                    val d = hypot(slot.pos.x - prev.x, slot.pos.y - prev.y)
+                    if (d < bestD) {
+                        bestD = d
+                        backtrackIdx = idx
+                    }
                 }
             }
         }
-        val availableSlots = (0 until 6).filter { it != backtrackSlot || choices.size >= 6 }
+
+        val chosenSlots = validSlots.indices.filter { it != backtrackIdx || choices.size >= validSlots.size }
         val result = ArrayList<Petal>(6)
         choices.take(6).forEachIndexed { idx, ch ->
-            val slot = availableSlots.getOrElse(idx) { idx % 6 }
-            val p = petalPos(anglesDeg[slot])
+            val slotIdx = chosenSlots.getOrNull(idx) ?: return@forEachIndexed
+            val p = validSlots[slotIdx].pos
             result.add(
                 Petal(
                     append = ch.append,
@@ -454,8 +450,8 @@ internal class AeviouKeyboard(
                 )
             )
         }
-        if (backtrackSlot >= 0 && choices.size < 6) {
-            val p = petalPos(anglesDeg[backtrackSlot])
+        if (backtrackIdx >= 0 && result.size < 6) {
+            val p = validSlots[backtrackIdx].pos
             result.add(
                 Petal(
                     append = "↩",
@@ -585,7 +581,7 @@ internal class AeviouKeyboard(
                 c.drawPath(trailPath, trailPaint)
             }
 
-            val petalR = hexRadius * 0.98f
+            val petalR = hexRadius * 0.88f
             for (petal in petals) {
                 buildHexPath(petal.cx, petal.cy, petalR, hexPath)
                 fillPaint.color =
@@ -645,7 +641,7 @@ internal class AeviouKeyboard(
             }
 
             // Active center hex
-            buildHexPath(activeCenter.x, activeCenter.y, hexRadius * 1.06f, hexPath)
+            buildHexPath(activeCenter.x, activeCenter.y, hexRadius * 0.94f, hexPath)
             fillPaint.color = accentSolid
             c.drawPath(hexPath, fillPaint)
             borderPaint.color = 0xAAFFFFFF.toInt()
@@ -670,7 +666,7 @@ internal class AeviouKeyboard(
                 activeCenter.y + (if (centerHint.isNotEmpty()) -context.dpF(4.2f) else 0f) -
                     (textPaint.descent() + textPaint.ascent()) * 0.5f
             c.drawText(
-                cur.ifEmpty { if (allowMixedEnglish) "a·e·i·o·u" else "a·e·o" },
+                cur.ifEmpty { if (allowMixedEnglish) "aeiou" else "aeo" },
                 activeCenter.x,
                 cyText,
                 textPaint,
