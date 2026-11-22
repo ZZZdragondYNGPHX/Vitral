@@ -45,7 +45,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var manualLangOverride = false
     private var numbers = false
     private var symbolPage = false
-    private var mode = "keys" // keys | tools | lookup | continuous | clipboard | candidates | emoji
+    private var mode = "keys" // keys | tools | lookup | continuous | clipboard | clipboard_shortcut | candidates | emoji
+    private var clipboardItems: List<ClipboardItemSnapshot>? = null
+    private var clipboardMutationSeq = 0
+    private var clipboardScrollY = 0
+    private var clipboardScrollView: ScrollView? = null
+    private var editingShortcutItemId = ""
+    private var editingShortcutContent = ""
+    private var editingShortcutCode = ""
+    private var shortcutCodeDisplay: TextView? = null
+    private var shortcutClearBtn: TextView? = null
     private var inlineRequest = 0
     private var english = false
     private var fieldForceEnglish = false
@@ -362,8 +371,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         super.onTrimMemory(level)
     }
 
+    private fun clearShortcutEditorState() {
+        editingShortcutItemId = ""
+        editingShortcutContent = ""
+        editingShortcutCode = ""
+        shortcutCodeDisplay = null
+        shortcutClearBtn = null
+    }
+
     private fun invalidateEditor() {
         cancelPrediction()
+        clearShortcutEditorState()
+        clipboardScrollView = null
         hardwareShift = false
         handledHardwareKeys.clear()
         inlineRequest++
@@ -530,6 +549,31 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 call("shortcut-key", json("key" to shortcut)) { applyAction(it) }
             handledHardwareKeys.add(keyCode)
             return true
+        }
+        if (mode == "clipboard_shortcut" && !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed) {
+            when (keyCode) {
+                in KeyEvent.KEYCODE_A..KeyEvent.KEYCODE_Z -> {
+                    onShortcutEditorKey(('a'.code + keyCode - KeyEvent.KEYCODE_A).toChar().toString())
+                    handledHardwareKeys.add(keyCode)
+                    return true
+                }
+                KeyEvent.KEYCODE_DEL -> {
+                    onShortcutEditorKey("⌫")
+                    handledHardwareKeys.add(keyCode)
+                    return true
+                }
+                KeyEvent.KEYCODE_ENTER,
+                KeyEvent.KEYCODE_NUMPAD_ENTER -> {
+                    saveEditingShortcutCode()
+                    handledHardwareKeys.add(keyCode)
+                    return true
+                }
+                KeyEvent.KEYCODE_ESCAPE -> {
+                    returnToClipboardFromShortcutEditor()
+                    handledHardwareKeys.add(keyCode)
+                    return true
+                }
+            }
         }
         if (!event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed && mode == "keys") {
             val text =
@@ -1069,8 +1113,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         icon(toolbar, R.drawable.write, "手写", activeState = mode == "continuous" || mode == "lookup", weight = 1f) {
             switch(if (mode == "continuous") "keys" else "continuous")
         }
-        icon(toolbar, R.drawable.clipboard, "剪贴板", activeState = mode == "clipboard", weight = 1f) {
-            switch(if (mode == "clipboard") "keys" else "clipboard")
+        icon(
+            toolbar,
+            R.drawable.clipboard,
+            "剪贴板",
+            activeState = mode == "clipboard" || mode == "clipboard_shortcut",
+            weight = 1f,
+        ) {
+            when (mode) {
+                "clipboard_shortcut" -> returnToClipboardFromShortcutEditor()
+                "clipboard" -> switch("keys")
+                else -> switch("clipboard")
+            }
         }
         if (!flypy && mode == "keys") {
             icon(
@@ -1190,7 +1244,20 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     )
                 }
             }
-            "clipboard" -> call("clipboard-state") { if (mode == "clipboard") showRing(it) }
+            "clipboard" -> {
+                val cached = clipboardItems
+                if (cached != null) showRing(cached)
+                val fetchSeq = clipboardMutationSeq
+                call("clipboard-state") {
+                    if (mode == "clipboard" && fetchSeq == clipboardMutationSeq) {
+                        val parsed = parseClipboardRing(it)
+                        val changed = parsed != clipboardItems
+                        clipboardItems = parsed
+                        if (changed || cached == null) showRing(parsed)
+                    }
+                }
+            }
+            "clipboard_shortcut" -> showShortcutCodeEditor()
             else -> keyboard()
         }
     }
@@ -1422,6 +1489,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         cancelPrediction()
         inlineRequest++
         canvasGeneration++
+        if (next != "clipboard_shortcut") clearShortcutEditorState()
+        if (next != "clipboard") {
+            clipboardScrollView = null
+            if (next != "clipboard_shortcut") clipboardScrollY = 0
+        }
         mode = next
         shown = JSONArray()
         lastInkResult = null
@@ -1523,6 +1595,24 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         }
                     }
                 )
+            return
+        }
+        if (mode == "clipboard_shortcut") {
+            addBarItem(label("← 返回", highlight = true) { returnToClipboardFromShortcutEditor() })
+            val preview = editingShortcutContent.replace(Regex("\\s+"), " ").trim()
+            if (preview.isNotEmpty()) {
+                addBarItem(
+                    label("收藏：$preview", subtle = true) {}.apply {
+                        setSingleLine(true)
+                        maxWidth =
+                            ((sheet.width.takeIf { it > 0 } ?: resources.displayMetrics.widthPixels) * 2 / 3)
+                                .coerceAtLeast(dp(120))
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        isClickable = false
+                        isFocusable = false
+                    }
+                )
+            }
             return
         }
         if (mode == "clipboard" || mode == "emoji" || mode == "edit") {
@@ -2025,8 +2115,260 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         root.addView(actions, LinearLayout.LayoutParams(0, -1, 1.15f))
     }
 
-    private fun showRing(state: JSONObject) {
+    private fun syncClipboardInBackground() {
+        Core.call(this, "clipboard-poll", background = true)
+    }
+
+    private fun startEditShortcutCode(item: ClipboardItemSnapshot) {
+        if (!canEditClipboardShortcut(item)) return
+        clipboardScrollView?.scrollY?.let { clipboardScrollY = it }
+        clipboardScrollView = null
+        editingShortcutItemId = item.id
+        editingShortcutContent = item.content
+        editingShortcutCode = normalizeShortcutCode(item.shortcutCode.orEmpty())
+        mode = "clipboard_shortcut"
+        layoutPanel()
+        render()
+    }
+
+    private fun returnToClipboardFromShortcutEditor() {
+        clearShortcutEditorState()
+        mode = "clipboard"
+        layoutPanel()
+        render()
+    }
+
+    private fun updateShortcutCodeDisplay() {
         val dark = isDarkTheme
+        val display = shortcutCodeDisplay ?: return
+        if (editingShortcutCode.isEmpty()) {
+            display.text = "点下方字母输入简码（留空清除）"
+            display.textSize = 12.5f
+            display.typeface = Typeface.create("sans-serif", Typeface.NORMAL)
+            display.setTextColor(
+                (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
+            )
+        } else {
+            display.text = "${editingShortcutCode}│"
+            display.textSize = 16f
+            display.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            display.setTextColor(
+                (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb).toInt()
+            )
+        }
+        shortcutClearBtn?.visibility = if (editingShortcutCode.isNotEmpty()) View.VISIBLE else View.GONE
+    }
+
+    private fun onShortcutEditorKey(label: String) {
+        val vibrator = getSystemService(Vibrator::class.java)
+        val duration =
+            if (label.length == 1 && label[0].isLetter()) T.Ergonomics.hapticLetterTickMs
+            else T.Ergonomics.hapticActionThudMs
+        vibrator?.vibrate(
+            VibrationEffect.createOneShot(duration.toLong(), VibrationEffect.DEFAULT_AMPLITUDE)
+        )
+        val next = applyShortcutEditorKey(editingShortcutCode, label)
+        if (next != editingShortcutCode) {
+            editingShortcutCode = next
+            updateShortcutCodeDisplay()
+        }
+    }
+
+    private fun saveEditingShortcutCode() {
+        val itemId = editingShortcutItemId
+        if (itemId.isEmpty()) {
+            returnToClipboardFromShortcutEditor()
+            return
+        }
+        val normalized = normalizeShortcutCode(editingShortcutCode)
+        val seq = ++clipboardMutationSeq
+        val current = clipboardItems.orEmpty()
+        val optimistic =
+            applyOptimisticPin(
+                current,
+                itemId,
+                pinned = true,
+                shortcutCode = normalized.ifEmpty { null },
+                updateShortcut = true,
+            )
+        clipboardItems = optimistic
+        val id = editor
+        Core.call(
+            this,
+            "clipboard-pin",
+            json("id" to itemId, "shortcut_code" to normalized),
+        ) { result ->
+            if (!active || editor != id) return@call
+            result
+                .onSuccess { v ->
+                    syncClipboardInBackground()
+                    if (v is JSONObject && seq == clipboardMutationSeq) {
+                        val parsed = parseClipboardRing(v)
+                        val changed = parsed != clipboardItems
+                        clipboardItems = parsed
+                        if (mode == "clipboard" && changed) showRing(parsed)
+                    }
+                }
+                .onFailure { e ->
+                    message(e.message.orEmpty())
+                    if (seq == clipboardMutationSeq && mode == "clipboard") {
+                        call("clipboard-state") {
+                            if (mode == "clipboard" && seq == clipboardMutationSeq) {
+                                val parsed = parseClipboardRing(it)
+                                clipboardItems = parsed
+                                showRing(parsed)
+                            }
+                        }
+                    }
+                }
+        }
+        clearShortcutEditorState()
+        mode = "clipboard"
+        layoutPanel()
+        render()
+    }
+
+    private fun showShortcutCodeEditor() {
+        val dark = isDarkTheme
+        clipboardScrollView = null
+        body.removeAllViews()
+
+        val inputBar =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(5), dp(6), dp(5))
+                background =
+                    pillDrawable(
+                        if (dark) 0x1AFFFFFFL else 0xF2FFFFFFL,
+                        12,
+                        if (dark) 0x450EA5E9L else 0x350284C7L,
+                    )
+            }
+        inputBar.addView(
+            label("简码", highlight = true) {}.apply {
+                textSize = 11.5f
+                setPadding(dp(8), dp(2), dp(8), dp(2))
+                isClickable = false
+                isFocusable = false
+            },
+            LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(8), 0) },
+        )
+        val display =
+            TextView(this).apply {
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.START
+                gravity = Gravity.CENTER_VERTICAL
+                contentDescription = "收藏简码输入区"
+            }
+        shortcutCodeDisplay = display
+        inputBar.addView(display, LinearLayout.LayoutParams(0, -2, 1f))
+
+        val clearBtn =
+            label("✕", subtle = true) { onShortcutEditorKey("清空") }.apply {
+                contentDescription = "清空简码"
+                setPadding(dp(8), dp(3), dp(8), dp(3))
+            }
+        shortcutClearBtn = clearBtn
+        inputBar.addView(
+            clearBtn,
+            LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, dp(4), 0) },
+        )
+        inputBar.addView(
+            label("保存", solidAccent = true) { saveEditingShortcutCode() }.apply {
+                textSize = 13f
+                setPadding(dp(12), dp(5), dp(12), dp(5))
+                contentDescription = "保存简码"
+            }
+        )
+        body.addView(
+            inputBar,
+            LinearLayout.LayoutParams(-1, dp(42)).apply { setMargins(dp(3), dp(3), dp(3), dp(4)) },
+        )
+        updateShortcutCodeDisplay()
+
+        fun addShortcutRow(
+            keys: List<String>,
+            sideSpacerWeight: Float = 0f,
+            weightFn: (String) -> Float = { 1f },
+        ) {
+            val line = LinearLayout(this)
+            body.addView(line, LinearLayout.LayoutParams(-1, 0, 1f))
+            if (sideSpacerWeight > 0f) {
+                line.addView(View(this), LinearLayout.LayoutParams(0, -1, sideSpacerWeight))
+            }
+            keys.forEach { s ->
+                val role = if (s == "清空" || s == "⌫") KeyRole.FUNCTION else KeyRole.PRIMARY
+                val key =
+                    Key(
+                        this,
+                        s,
+                        flypy = false,
+                        upper = "",
+                        action = ::onShortcutEditorKey,
+                        voice = null,
+                        role = role,
+                        displayLabel = s,
+                        shiftState = 0,
+                        spaceHint = "",
+                        darkOverride = dark,
+                        sublabelMode = SublabelMode.CLEAN,
+                    )
+                line.addView(key, LinearLayout.LayoutParams(0, -1, weightFn(s)))
+            }
+            if (sideSpacerWeight > 0f) {
+                line.addView(View(this), LinearLayout.LayoutParams(0, -1, sideSpacerWeight))
+            }
+        }
+
+        addShortcutRow(rows[0].map { it.toString() })
+        addShortcutRow(rows[1].map { it.toString() }, sideSpacerWeight = 0.45f)
+        addShortcutRow(listOf("清空") + rows[2].map { it.toString() } + listOf("⌫")) { s ->
+            if (s == "清空" || s == "⌫") 1.45f else 1f
+        }
+    }
+
+    private fun toggleClipboardPin(item: ClipboardItemSnapshot) {
+        val nextPinned = !item.pinned
+        val seq = ++clipboardMutationSeq
+        val current = clipboardItems.orEmpty()
+        val optimistic = applyOptimisticPin(current, item.id, pinned = nextPinned)
+        clipboardItems = optimistic
+        showRing(optimistic)
+
+        val cmd = if (nextPinned) "clipboard-pin" else "clipboard-unpin"
+        val id = editor
+        Core.call(this, cmd, json("id" to item.id)) { result ->
+            if (!active || editor != id) return@call
+            result
+                .onSuccess { v ->
+                    syncClipboardInBackground()
+                    if (v is JSONObject && seq == clipboardMutationSeq) {
+                        val parsed = parseClipboardRing(v)
+                        clipboardItems = parsed
+                        if (mode == "clipboard" && parsed != optimistic) {
+                            showRing(parsed)
+                        }
+                    }
+                }
+                .onFailure { e ->
+                    message(e.message.orEmpty())
+                    if (seq == clipboardMutationSeq && mode == "clipboard") {
+                        call("clipboard-state") {
+                            if (mode == "clipboard" && seq == clipboardMutationSeq) {
+                                val parsed = parseClipboardRing(it)
+                                clipboardItems = parsed
+                                showRing(parsed)
+                            }
+                        }
+                    }
+                }
+        }
+    }
+
+    private fun showRing(items: List<ClipboardItemSnapshot>) {
+        val dark = isDarkTheme
+        clipboardScrollView?.scrollY?.let { clipboardScrollY = it }
         val scroll = ScrollView(this)
         val list =
             LinearLayout(this).apply {
@@ -2036,9 +2378,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         scroll.addView(list)
         body.removeAllViews()
         body.addView(scroll, -1, -1)
+        clipboardScrollView = scroll
 
-        val ring = state.optJSONArray("ring") ?: JSONArray()
-        if (ring.length() == 0) {
+        if (items.isEmpty()) {
+            clipboardScrollY = 0
             list.addView(
                 TextView(this).apply {
                     text = "暂无剪贴板记录\n复制文本后将自动同步并显示在此处"
@@ -2060,7 +2403,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         headerRow.addView(
             TextView(this).apply {
-                text = "共 ${ring.length()} 条 · 点击粘贴 · 长按设简码"
+                text = "共 ${items.size} 条 · 点击粘贴 · 长按收藏设简码"
                 textSize = 11.5f
                 setTextColor(
                     (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
@@ -2070,16 +2413,45 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         )
         headerRow.addView(
             label("清空未置顶", subtle = true) {
-                call("clipboard-clear-unpinned") { showRing(it) }
+                val seq = ++clipboardMutationSeq
+                val optimistic = applyOptimisticClearUnpinned(clipboardItems.orEmpty())
+                clipboardItems = optimistic
+                showRing(optimistic)
+                val id = editor
+                Core.call(this, "clipboard-clear-unpinned") { result ->
+                    if (!active || editor != id) return@call
+                    result
+                        .onSuccess { v ->
+                            syncClipboardInBackground()
+                            if (v is JSONObject && seq == clipboardMutationSeq) {
+                                val parsed = parseClipboardRing(v)
+                                clipboardItems = parsed
+                                if (mode == "clipboard" && parsed != optimistic) {
+                                    showRing(parsed)
+                                }
+                            }
+                        }
+                        .onFailure { e ->
+                            message(e.message.orEmpty())
+                            if (seq == clipboardMutationSeq && mode == "clipboard") {
+                                call("clipboard-state") {
+                                    if (mode == "clipboard" && seq == clipboardMutationSeq) {
+                                        val parsed = parseClipboardRing(it)
+                                        clipboardItems = parsed
+                                        showRing(parsed)
+                                    }
+                                }
+                            }
+                        }
+                }
             }
         )
         list.addView(headerRow)
 
         for (pinnedGroup in listOf(true, false)) {
             var headerAdded = false
-            for (i in 0 until ring.length()) {
-                val item = ring.getJSONObject(i)
-                val isPinned = item.optBoolean("pinned")
+            for (item in items) {
+                val isPinned = item.pinned
                 if (isPinned != pinnedGroup) continue
                 if (!headerAdded) {
                     headerAdded = true
@@ -2119,15 +2491,22 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                                 else (if (dark) 0x14FFFFFFL else 0x100F172AL),
                             )
                     }
-                val content = item.getString("content")
-                val codeText =
-                    item.optString("shortcut_code").takeUnless { it.isEmpty() || it == "null" }
+                val content = item.content
+                val codeText = item.shortcutCode
                 if (codeText != null) {
-                    card.addView(
+                    val codeBadge =
                         label(codeText, highlight = true, mono = true) {
                             currentInputConnection?.commitText(content, 1)
                             switch("keys")
-                        },
+                        }
+                    if (canEditClipboardShortcut(item)) {
+                        codeBadge.setOnLongClickListener {
+                            startEditShortcutCode(item)
+                            true
+                        }
+                    }
+                    card.addView(
+                        codeBadge,
                         LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(8), 0) },
                     )
                 }
@@ -2144,71 +2523,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                             currentInputConnection?.commitText(content, 1)
                             switch("keys")
                         }
-                        setOnLongClickListener {
-                            list.removeAllViews()
-                            val editorCard =
-                                LinearLayout(this@VitralIme).apply {
-                                    orientation = LinearLayout.VERTICAL
-                                    setPadding(dp(12), dp(12), dp(12), dp(12))
-                                    background =
-                                        pillDrawable(
-                                            if (dark) 0x18FFFFFFL else 0xF0FFFFFFL,
-                                            14,
-                                            if (dark) 0x26FFFFFFL else 0x180F172AL,
-                                        )
-                                }
-                            editorCard.addView(
-                                TextView(this@VitralIme).apply {
-                                    text = "为该收藏设置快捷简码"
-                                    textSize = 13f
-                                    typeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
-                                    setTextColor(
-                                        (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb)
-                                            .toInt()
-                                    )
-                                }
-                            )
-                            val code =
-                                EditText(this@VitralIme).apply {
-                                    hint = "纯字母简码（例如 ksb）"
-                                    setText(codeText.orEmpty())
-                                    setSingleLine(true)
-                                    setTextColor(
-                                        (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb)
-                                            .toInt()
-                                    )
-                                    setHintTextColor(
-                                        (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb)
-                                            .toInt()
-                                    )
-                                }
-                            editorCard.addView(
-                                code,
-                                LinearLayout.LayoutParams(-1, -2).apply {
-                                    setMargins(0, dp(8), 0, dp(10))
-                                },
-                            )
-                            val btns = LinearLayout(this@VitralIme)
-                            btns.addView(
-                                label("置顶并保存", solidAccent = true) {
-                                    call(
-                                        "clipboard-pin",
-                                        json(
-                                            "id" to item.getString("id"),
-                                            "shortcut_code" to code.text.toString().trim(),
-                                        ),
-                                    ) {
-                                        showRing(it)
-                                    }
-                                }
-                            )
-                            btns.addView(
-                                label("取消", subtle = true) { showRing(state) },
-                                LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(8), 0, 0, 0) },
-                            )
-                            editorCard.addView(btns)
-                            list.addView(editorCard)
-                            true
+                        if (canEditClipboardShortcut(item)) {
+                            setOnLongClickListener {
+                                startEditShortcutCode(item)
+                                true
+                            }
                         }
                     }
                 card.addView(textView, LinearLayout.LayoutParams(0, -2, 1f))
@@ -2236,8 +2555,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         contentDescription = if (isPinned) "取消置顶" else "置顶"
                         setPadding(dp(6), dp(5), dp(6), dp(5))
                         setOnClickListener {
-                            val cmd = if (isPinned) "clipboard-unpin" else "clipboard-pin"
-                            call(cmd, json("id" to item.getString("id"))) { showRing(it) }
+                            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                            toggleClipboardPin(item)
                         }
                     }
                 card.addView(pinBtn, LinearLayout.LayoutParams(dp(34), dp(30)))
@@ -2246,6 +2565,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(3), 0, dp(3)) }
                 list.addView(card, lp)
             }
+        }
+        val targetScrollY = clipboardScrollY
+        if (targetScrollY > 0) {
+            scroll.post { scroll.scrollTo(0, targetScrollY) }
         }
     }
 

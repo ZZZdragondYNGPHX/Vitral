@@ -337,7 +337,6 @@ impl VitralCore {
             self.save_local("clipboard-changes.json", &s.clipboard_changes);
         }
         self.save_local("clipboard-history.json", &after);
-        self.save_local("clipboard-current.json", s.clipboard.current());
     }
 
     /// Apply settings without replacing composing, clipboard or retention state.
@@ -944,6 +943,7 @@ impl VitralCore {
         let before = sync.clipboard.export_ring();
         let state = sync.clipboard.push(payload);
         self.record_clipboard_change(&mut sync, &before);
+        self.save_local("clipboard-current.json", sync.clipboard.current());
         drop(sync);
         self.harvest_clipboard_payload(&harvest);
         state
@@ -1310,7 +1310,8 @@ impl VitralCore {
             self.record_clipboard_change(&mut sync_st, &before);
             state
         };
-        let _ = self.poll_clipboard();
+        let background_sync = self.input.lock().engine.config.background_sync;
+        if !background_sync { let _ = self.poll_clipboard(); }
         Ok(state)
     }
 
@@ -1322,7 +1323,8 @@ impl VitralCore {
             self.record_clipboard_change(&mut sync_st, &before);
             state
         };
-        let _ = self.poll_clipboard();
+        let background_sync = self.input.lock().engine.config.background_sync;
+        if !background_sync { let _ = self.poll_clipboard(); }
         Ok(state)
     }
 
@@ -1334,7 +1336,8 @@ impl VitralCore {
             self.record_clipboard_change(&mut sync_st, &before);
             state
         };
-        let _ = self.poll_clipboard();
+        let background_sync = self.input.lock().engine.config.background_sync;
+        if !background_sync { let _ = self.poll_clipboard(); }
         state
     }
 
@@ -4930,6 +4933,75 @@ mod m1c_tests {
                 .unwrap()
                 .is_empty()
         );
+        drop(core);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn clipboard_background_edits_persist_without_network_until_services_poll() {
+        let mock = InProcessWebDavMock::start();
+        let dir = std::env::temp_dir().join(format!(
+            "vitral-clipboard-background-{}-{}",
+            std::process::id(),
+            RetentionEngine::now_epoch_ms()
+        ));
+        let cfg = EngineConfig {
+            data_dir: dir.to_string_lossy().into_owned(),
+            assets_dir: "/nonexistent-vitral-assets".into(),
+            background_sync: true,
+            koofr_endpoint: Some(mock.koofr_endpoint()),
+            ..Default::default()
+        };
+        let core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        core.clipboard_push_local(ClipboardPayload {
+            id: Some("saved-copy".into()),
+            content: "saved text".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 10,
+        });
+        core.poll_services().unwrap();
+        let dav_cfg = DavConfig::from_engine_config(&cfg).unwrap();
+
+        for operation in ["pin", "unpin", "clear"] {
+            let before = core.clipboard_state().ring;
+            mock.clear_log();
+            // History edits must not recreate the unchanged current-copy file.
+            std::fs::remove_file(dir.join("clipboard-current.json")).unwrap();
+            let state = match operation {
+                "pin" => core.clipboard_pin("saved-copy", Some("saved")).unwrap(),
+                "unpin" => core.clipboard_unpin("saved-copy").unwrap(),
+                "clear" => core.clipboard_clear_unpinned(),
+                _ => unreachable!(),
+            };
+            assert!(mock.log().is_empty(), "{operation} must defer WebDAV requests");
+            assert!(!dir.join("clipboard-current.json").exists());
+            assert_ne!(state.ring, before);
+            assert_eq!(
+                local::load::<Vec<clip::ClipboardEntry>>(&dir, "clipboard-history.json")
+                    .unwrap()
+                    .unwrap(),
+                state.ring
+            );
+            let changes = local::load::<clip::RingChanges>(&dir, "clipboard-changes.json")
+                .unwrap()
+                .unwrap();
+            assert!(!changes.is_empty(), "{operation} must persist pending changes");
+            assert_eq!(changes.merge(before, &state.ring, state.capacity), state.ring);
+
+            core.poll_services().unwrap();
+            assert!(!mock.log().is_empty());
+            assert_eq!(
+                dav::download_clipboard_ring(&core.offline_guard, &dav_cfg).unwrap(),
+                Some(state.ring)
+            );
+            assert!(
+                local::load::<clip::RingChanges>(&dir, "clipboard-changes.json")
+                    .unwrap()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
         drop(core);
         std::fs::remove_dir_all(dir).unwrap();
     }
