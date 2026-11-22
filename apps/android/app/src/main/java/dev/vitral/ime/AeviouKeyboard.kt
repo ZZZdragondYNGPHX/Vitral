@@ -8,6 +8,8 @@ import android.graphics.Path
 import android.graphics.PointF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import dev.vitral.ime.theme.VitralTokens as T
@@ -164,11 +166,38 @@ internal class AeviouKeyboard(
     private var armedSlide = false
     private var stepAnchor = PointF()
     private var pressedAction: HexCell? = null
+    private var actionDownX = 0f
+    private var actionDownY = 0f
+    private var actionPressedAt = 0L
+    private var repeatingDelete = false
+    private var clearAllPending = false
+    private var clearAllArmed = false
+    private var clearAllSwipeUp = false
     private val stepStack = ArrayList<String>()
     private val centerHistory = ArrayList<PointF>()
     private var activeCenter = PointF()
     private var petals: List<Petal> = emptyList()
     private val trail = ArrayList<PointF>()
+
+    private val repeatDelete =
+        object : Runnable {
+            override fun run() {
+                if (pressedAction?.id != "⌫" || clearAllArmed) return
+                repeatingDelete = true
+                onActionKey("⌫")
+                postDelayed(this, 65L)
+            }
+        }
+
+    private val armClearAll = Runnable {
+        if (pressedAction?.id == "⌫" && clearAllPending) {
+            clearAllPending = false
+            clearAllArmed = true
+            removeCallbacks(repeatDelete)
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            invalidate()
+        }
+    }
 
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private val borderPaint =
@@ -485,9 +514,12 @@ internal class AeviouKeyboard(
                 }
             buildHexPath(cell.cx, cell.cy, r * scaleFactor, hexPath)
             val isPressedAct = pressedAction == cell || (cell.id == "⇧" && shiftState > 0)
+            val isClearAllCell = cell.id == "⌫" && clearAllArmed
             val dim = sliding && !cell.isAction
             val topCol =
                 when {
+                    isClearAllCell && clearAllSwipeUp -> 0xFFEF4444.toInt()
+                    isClearAllCell -> if (dark) 0x55EF4444 else 0x38EF4444
                     cell.isAccent -> if (dark) 0xFF19B5FA.toInt() else 0xFF0A93D9.toInt()
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xCC0369A1.toInt() else 0xF5BAE6FD.toInt()
                     isPressedAct || isCtxGlow -> (if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb).toInt()
@@ -498,6 +530,8 @@ internal class AeviouKeyboard(
                 }
             val botCol =
                 when {
+                    isClearAllCell && clearAllSwipeUp -> 0xFFDC2626.toInt()
+                    isClearAllCell -> if (dark) 0x38DC2626 else 0x24DC2626
                     cell.isAccent -> accentSolid
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xCC075985.toInt() else 0xF0E0F2FE.toInt()
                     isCtxGlow -> if (dark) 0x330EA5E9 else 0x260284C7
@@ -512,6 +546,7 @@ internal class AeviouKeyboard(
 
             borderPaint.color =
                 when {
+                    isClearAllCell -> 0xFFEF4444.toInt()
                     cell.isAccent -> 0x55FFFFFF
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xFF38BDF8.toInt() else 0xFF0284C7.toInt()
                     isCtxGlow || isPressedAct -> accentSolid
@@ -519,12 +554,14 @@ internal class AeviouKeyboard(
                     dark -> 0x26FFFFFF
                     else -> 0x220F172A
                 }
-            borderPaint.strokeWidth = context.dpF(if (isCtxGlow && ctxHit.third == 0) 2.0f else if (isCtxGlow) 1.5f else 1.1f)
+            borderPaint.strokeWidth = context.dpF(if (isClearAllCell || (isCtxGlow && ctxHit.third == 0)) 2.0f else if (isCtxGlow) 1.5f else 1.1f)
             c.drawPath(hexPath, borderPaint)
             borderPaint.strokeWidth = context.dpF(1.1f)
 
             textPaint.color =
                 when {
+                    isClearAllCell && clearAllSwipeUp -> 0xFFFFFFFF.toInt()
+                    isClearAllCell -> if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
                     cell.isAccent -> 0xFFFFFFFF.toInt()
                     isCtxGlow && ctxHit.third == 0 && dark -> 0xFFFFFFFF.toInt()
                     isCtxGlow || isPressedAct -> accentText
@@ -537,19 +574,25 @@ internal class AeviouKeyboard(
                     contextTargets.isNotEmpty() && !isCtxGlow && !cell.isAction && !sliding -> 195
                     else -> 255
                 }
+            val displayCellLabel =
+                when {
+                    isClearAllCell && clearAllSwipeUp -> "松手清空"
+                    isClearAllCell -> "↑ 清空"
+                    else -> cell.label
+                }
             textPaint.textSize =
                 context.dpF(
                     when {
-                        cell.label.length >= 6 -> 8.8f
-                        cell.label.length >= 4 -> 10.0f
-                        cell.label.length >= 2 -> 11.5f
+                        displayCellLabel.length >= 6 -> 8.8f
+                        displayCellLabel.length >= 4 -> 9.6f
+                        displayCellLabel.length >= 2 -> 11.2f
                         isCtxGlow && ctxHit.third == 0 -> if (isPureEnglish) 16.0f else 18.0f
                         else -> if (isPureEnglish) 14.5f else 16.5f
                     }
                 )
             val yShift = if (isCtxGlow) -context.dpF(4.2f) else 0f
             val ty = cell.cy + yShift - (textPaint.descent() + textPaint.ascent()) * 0.5f
-            c.drawText(cell.label, cell.cx, ty, textPaint)
+            c.drawText(displayCellLabel, cell.cx, ty, textPaint)
 
             if (isCtxGlow) {
                 subPaint.color = if (ctxHit.third == 0 && dark) 0xE6FFFFFF.toInt() else accentText
@@ -697,6 +740,45 @@ internal class AeviouKeyboard(
             subPaint.alpha = 255
             val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
             c.drawText(hudSummary, width * 0.5f, hudTextY, subPaint)
+        } else if (pressedAction?.id == "⌫" && (clearAllArmed || clearAllPending)) {
+            val elapsed = (SystemClock.uptimeMillis() - actionPressedAt).coerceAtLeast(0L)
+            if (clearAllArmed || elapsed >= 600L) {
+                val hudText =
+                    when {
+                        clearAllArmed && clearAllSwipeUp -> "松手立即清空输入框全文"
+                        clearAllArmed -> "↑ 向上滑动清空输入框全文"
+                        else -> {
+                            val remain = ((CLEAR_ALL_HOLD_MS - elapsed) / 1000f).coerceAtLeast(0.1f)
+                            String.format(java.util.Locale.US, "继续按住 %.1fs 后上滑清空全文", remain)
+                        }
+                    }
+                subPaint.textSize = context.dpF(11f)
+                val hudW = (subPaint.measureText(hudText) + context.dpF(24f)).coerceAtMost(width - context.dpF(16f))
+                val hudH = context.dpF(24f)
+                val hudL = (width - hudW) * 0.5f
+                val hudT = context.dpF(3f)
+                fillPaint.color =
+                    when {
+                        clearAllArmed && clearAllSwipeUp -> 0xFFDC2626.toInt()
+                        clearAllArmed -> if (dark) 0xEB450A0A.toInt() else 0xF5FEF2F2.toInt()
+                        else -> if (dark) 0xEB0F172A.toInt() else 0xF5FFFFFF.toInt()
+                    }
+                c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, fillPaint)
+                borderPaint.color = if (clearAllArmed) 0xFFEF4444.toInt() else 0x88EF4444.toInt()
+                c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, borderPaint)
+                subPaint.color =
+                    when {
+                        clearAllArmed && clearAllSwipeUp -> 0xFFFFFFFF.toInt()
+                        clearAllArmed -> if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
+                        else -> if (dark) 0xFFFCA5A5.toInt() else 0xFFB91C1C.toInt()
+                    }
+                subPaint.alpha = 255
+                val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
+                c.drawText(hudText, width * 0.5f, hudTextY, subPaint)
+            }
+            if (!clearAllArmed && elapsed < CLEAR_ALL_HOLD_MS) {
+                postInvalidateOnAnimation()
+            }
         }
     }
 
@@ -726,10 +808,24 @@ internal class AeviouKeyboard(
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 val hit = hitCell(e.x, e.y) ?: return true
+                removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
+                repeatingDelete = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 if (hit.isAction) {
                     pressedAction = hit
+                    actionDownX = e.x
+                    actionDownY = e.y
+                    actionPressedAt = e.eventTime
                     sliding = false
                     armedSlide = false
+                    if (hit.id == "⌫") {
+                        clearAllPending = true
+                        postDelayed(repeatDelete, 360L)
+                        postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
+                    }
                 } else {
                     pressedAction = null
                     sliding = true
@@ -748,6 +844,20 @@ internal class AeviouKeyboard(
                 invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
+                if (pressedAction?.id == "⌫") {
+                    if (!clearAllArmed && hypot(e.x - actionDownX, e.y - actionDownY) > context.dpF(14f)) {
+                        removeCallbacks(repeatDelete)
+                        removeCallbacks(armClearAll)
+                        clearAllPending = false
+                    }
+                    if (clearAllArmed) {
+                        clearAllSwipeUp =
+                            if (clearAllSwipeUp) actionDownY - e.y >= context.dpF(16f)
+                            else actionDownY - e.y >= context.dpF(24f)
+                    }
+                    invalidate()
+                    return true
+                }
                 if (!sliding) return true
                 trail.add(PointF(e.x, e.y))
                 if (trail.size > 48) trail.removeAt(0)
@@ -783,11 +893,26 @@ internal class AeviouKeyboard(
                 invalidate()
             }
             MotionEvent.ACTION_UP -> {
+                removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
                 val act = pressedAction
+                val didRepeat = repeatingDelete
+                val didClearAllArmed = clearAllArmed
+                val didClearAllSwipeUp = clearAllSwipeUp
                 pressedAction = null
+                repeatingDelete = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 if (act != null) {
-                    if (hitCell(e.x, e.y) == act) {
-                        onActionKey(act.id)
+                    when {
+                        didClearAllArmed && didClearAllSwipeUp -> {
+                            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                            onActionKey("clear-all")
+                        }
+                        didClearAllArmed || didRepeat -> Unit
+                        act.id == "⌫" && e.x - actionDownX < -context.dpF(20f) -> onActionKey("delete-word")
+                        hitCell(e.x, e.y) == act -> onActionKey(act.id)
                     }
                 } else if (sliding) {
                     val token = currentPrefix()
@@ -808,7 +933,13 @@ internal class AeviouKeyboard(
                 invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
+                removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
                 pressedAction = null
+                repeatingDelete = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 sliding = false
                 petals = emptyList()
                 trail.clear()
@@ -819,7 +950,14 @@ internal class AeviouKeyboard(
         return true
     }
 
+    override fun onDetachedFromWindow() {
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armClearAll)
+        super.onDetachedFromWindow()
+    }
+
     companion object {
+        private const val CLEAR_ALL_HOLD_MS = 3000L
         // Compact frequency-ranked English everyday + tech lexicon: (lowercase, display, weight)
         private val ENGLISH_WORDS: List<Triple<String, String, Int>> =
             listOf(

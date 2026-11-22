@@ -56,6 +56,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var lastSpaceTapMs = 0L
     private var lastCommittedText = ""
     private var lastDeletedText = ""
+    private var lastDeletedAtMs = 0L
     private var emojiCategory = 0
     private var composing = false
     private var preeditText = ""
@@ -309,7 +310,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val moved = oldSelStart != newSelStart || oldSelEnd != newSelEnd
         if (moved && !composing) {
             if (predictionText.isNotEmpty()) cancelPrediction()
-            if (lastDeletedText.isNotEmpty()) {
+            if (lastDeletedText.isNotEmpty() && SystemClock.uptimeMillis() - lastDeletedAtMs > 400L) {
                 lastDeletedText = ""
                 candidates()
             }
@@ -2588,6 +2589,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 deleteWordSafely(ic)
                 return
             }
+            "clear-all" -> {
+                clearAllInputText(ic)
+                return
+            }
         }
         val effectiveLabel =
             if (english && shiftState > 0 && label.length == 1 && label[0] in 'a'..'z') {
@@ -2675,10 +2680,17 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
+    private fun recordDeletedForUndo(text: String) {
+        if (!passwordEditor && text.isNotEmpty()) {
+            lastDeletedText = text
+            lastDeletedAtMs = SystemClock.uptimeMillis()
+        }
+    }
+
     private fun deleteWithSelectionOrSingle(ic: android.view.inputmethod.InputConnection) {
         val selected = ic.getSelectedText(0)?.toString().orEmpty()
         if (selected.isNotEmpty()) {
-            if (!passwordEditor) lastDeletedText = selected
+            recordDeletedForUndo(selected)
             ic.commitText("", 1)
             if (lastDeletedText.isNotEmpty()) candidates()
         } else {
@@ -2693,7 +2705,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
         val selected = ic.getSelectedText(0)?.toString().orEmpty()
         if (selected.isNotEmpty()) {
-            if (!passwordEditor) lastDeletedText = selected
+            recordDeletedForUndo(selected)
             ic.commitText("", 1)
             if (lastDeletedText.isNotEmpty()) candidates()
             return
@@ -2734,9 +2746,61 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         ic.deleteSurroundingText(n, 0)
         if (deleted.isNotEmpty()) {
-            lastDeletedText = deleted
+            recordDeletedForUndo(deleted)
             candidates()
         }
+    }
+
+    private fun clearAllInputText(ic: android.view.inputmethod.InputConnection) {
+        ic.finishComposingText()
+        val captured =
+            if (!passwordEditor) {
+                val full =
+                    ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
+                        ?.text
+                        ?.toString()
+                if (!full.isNullOrEmpty()) {
+                    full
+                } else {
+                    val before = ic.getTextBeforeCursor(100_000, 0)?.toString().orEmpty()
+                    val selected = ic.getSelectedText(0)?.toString().orEmpty()
+                    val after = ic.getTextAfterCursor(100_000, 0)?.toString().orEmpty()
+                    before + selected + after
+                }
+            } else {
+                ""
+            }
+
+        if (ic.performContextMenuAction(android.R.id.selectAll)) {
+            ic.commitText("", 1)
+        }
+        val remBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
+        val remAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
+        if (remBefore > 0 || remAfter > 0) {
+            ic.beginBatchEdit()
+            ic.setSelection(0, remBefore + remAfter)
+            ic.commitText("", 1)
+            val stillBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
+            val stillAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
+            if (stillBefore > 0 || stillAfter > 0) {
+                ic.deleteSurroundingText(stillBefore, stillAfter)
+            }
+            ic.endBatchEdit()
+        }
+
+        lastCommittedText = ""
+        predictionText = ""
+        if (composing) {
+            call("process-key", json("keycode" to "Escape")) {
+                applyAction(it)
+                recordDeletedForUndo(captured)
+                candidates()
+            }
+        } else {
+            recordDeletedForUndo(captured)
+            candidates()
+        }
+        updateAutoCap(redraw = true)
     }
 
     private fun detectAeviouEnvFromContext(): AeviouEnv {

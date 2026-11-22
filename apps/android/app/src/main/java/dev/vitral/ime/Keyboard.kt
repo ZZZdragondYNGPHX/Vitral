@@ -12,6 +12,7 @@ import android.graphics.Shader
 import android.graphics.Typeface
 import android.os.SystemClock
 import android.provider.Settings
+import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
 import dev.vitral.ime.theme.VitralTokens as T
@@ -109,6 +110,9 @@ internal class Key(
     private var spaceAnchorX = 0f
     private var recording = false
     private var repeatingDelete = false
+    private var clearAllPending = false
+    private var clearAllArmed = false
+    private var clearAllSwipeUp = false
     private var pressedAt = 0L
     private var releasedAt = 0L
 
@@ -123,12 +127,22 @@ internal class Key(
     private val repeatDelete =
         object : Runnable {
             override fun run() {
-                if (!isPressed) return
+                if (!isPressed || clearAllArmed) return
                 repeatingDelete = true
                 action("⌫")
                 postDelayed(this, 65L)
             }
         }
+
+    private val armClearAll = Runnable {
+        if (isPressed && clearAllPending && label == "⌫") {
+            clearAllPending = false
+            clearAllArmed = true
+            removeCallbacks(repeatDelete)
+            performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            invalidate()
+        }
+    }
 
     init {
         contentDescription = displayLabel.ifEmpty { label }
@@ -282,11 +296,20 @@ internal class Key(
         }
 
         val shiftActive = label == "⇧" && shiftState > 0
+        val clearAllActive = label == "⌫" && clearAllArmed
 
         // Vertical liquid-glass keycap fill (gentle top-to-bottom luminance instead of flat box)
         val topFill: Int
         val bottomFill: Int
         when {
+            clearAllActive && clearAllSwipeUp -> {
+                topFill = 0xFFEF4444.toInt()
+                bottomFill = 0xFFDC2626.toInt()
+            }
+            clearAllActive -> {
+                topFill = if (dark) 0x55EF4444 else 0x38EF4444
+                bottomFill = if (dark) 0x38DC2626 else 0x24DC2626
+            }
             role == KeyRole.ACCENT -> {
                 topFill = if (dark) 0xFF19B5FA.toInt() else 0xFF0A93D9.toInt()
                 bottomFill = (if (dark) T.Dark.accentPrimaryArgb else T.Light.accentPrimaryArgb).toInt()
@@ -348,6 +371,7 @@ internal class Key(
                 0f,
                 keyRect.bottom,
                 when {
+                    clearAllActive -> 0xFFEF4444.toInt()
                     glowStrength > 0.2f -> (if (dark) T.Dark.accentTextArgb else T.Light.accentPrimaryArgb).toInt()
                     shiftActive -> (if (dark) 0x557DD3FC else 0x440284C7)
                     role == KeyRole.ACCENT -> 0x55FFFFFF
@@ -355,6 +379,7 @@ internal class Key(
                     else -> 0xE8FFFFFF.toInt()
                 },
                 when {
+                    clearAllActive -> 0xCCDC2626.toInt()
                     glowStrength > 0.2f -> (if (dark) 0x4438BDF8 else 0x440284C7)
                     role == KeyRole.ACCENT -> 0x18FFFFFF
                     dark -> 0x0AFFFFFF
@@ -364,6 +389,30 @@ internal class Key(
             )
         c.drawRoundRect(keyRect, r, r, borderPaint)
         borderPaint.shader = null
+
+        // Subtle charging progress bar during a continuous 3-second hold on Backspace
+        if (label == "⌫" && isPressed && clearAllPending && !clearAllArmed && pressedAt > 0L) {
+            val elapsed = (now - pressedAt).coerceAtLeast(0L)
+            if (elapsed >= 600L) {
+                val frac = ((elapsed - 600f) / (CLEAR_ALL_HOLD_MS - 600f)).coerceIn(0f, 1f)
+                val barInset = context.dpF(4f)
+                val barH = context.dpF(2.5f)
+                val barW = ((keyRect.width() - barInset * 2f) * frac).coerceAtLeast(0f)
+                paint.shader = null
+                paint.style = Paint.Style.FILL
+                paint.color = if (dark) 0xDDF87171.toInt() else 0xDDEF4444.toInt()
+                c.drawRoundRect(
+                    keyRect.left + barInset,
+                    keyRect.top + context.dpF(2.5f),
+                    keyRect.left + barInset + barW,
+                    keyRect.top + context.dpF(2.5f) + barH,
+                    barH * 0.5f,
+                    barH * 0.5f,
+                    paint,
+                )
+            }
+            if (elapsed < CLEAR_ALL_HOLD_MS) postInvalidateOnAnimation()
+        }
 
         val primaryText =
             when {
@@ -409,7 +458,24 @@ internal class Key(
 
         when (label) {
             "⇧" -> drawShiftGlyph(c, cx, cy, primaryText)
-            "⌫" -> drawBackspaceGlyph(c, cx, cy, primaryText)
+            "⌫" -> {
+                when {
+                    clearAllArmed && clearAllSwipeUp ->
+                        drawCenteredText(c, "松手清空", cx, cy, 10.5f, 0xFFFFFFFF.toInt(), Paint.Align.CENTER, bold = true)
+                    clearAllArmed ->
+                        drawCenteredText(
+                            c,
+                            "↑ 清空",
+                            cx,
+                            cy,
+                            11.5f,
+                            if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt(),
+                            Paint.Align.CENTER,
+                            bold = true,
+                        )
+                    else -> drawBackspaceGlyph(c, cx, cy, primaryText)
+                }
+            }
             "↵" -> {
                 if (displayLabel == "↵" || displayLabel.isEmpty()) {
                     drawReturnGlyph(c, cx, cy, primaryText)
@@ -515,6 +581,9 @@ internal class Key(
                 spaceScrubbing = false
                 swipeUpActive = false
                 repeatingDelete = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 pressedAt = e.eventTime
                 releasedAt = 0L
                 isPressed = true
@@ -522,13 +591,22 @@ internal class Key(
                     postDelayed(startVoice, T.Ergonomics.spacebarVoiceHoldThresholdMs.toLong())
                 }
                 if (label == "⌫") {
+                    clearAllPending = true
                     postDelayed(repeatDelete, 360L)
+                    postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
                 }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14)) {
+                if (!clearAllArmed && (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14))) {
                     removeCallbacks(startVoice)
                     removeCallbacks(repeatDelete)
+                    removeCallbacks(armClearAll)
+                    clearAllPending = false
+                }
+                if (label == "⌫" && clearAllArmed) {
+                    clearAllSwipeUp =
+                        if (clearAllSwipeUp) downY - e.y >= context.dp(16)
+                        else downY - e.y >= context.dp(24)
                 }
                 if (label == "空格" && !recording) {
                     val step = context.dpF(14f)
@@ -547,24 +625,35 @@ internal class Key(
                         }
                     }
                 }
-                swipeUpActive = !spaceScrubbing && upper.isNotEmpty() && downY - e.y > context.dp(16)
+                swipeUpActive = !spaceScrubbing && !clearAllArmed && upper.isNotEmpty() && downY - e.y > context.dp(16)
             }
             MotionEvent.ACTION_UP -> {
                 removeCallbacks(startVoice)
                 removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
                 isPressed = false
                 releasedAt = SystemClock.uptimeMillis()
                 val didSwipeUp = swipeUpActive
                 val didRepeat = repeatingDelete
                 val didScrub = spaceScrubbing
+                val didClearAllArmed = clearAllArmed
+                val didClearAllSwipeUp = clearAllSwipeUp
                 swipeUpActive = false
                 repeatingDelete = false
                 spaceScrubbing = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 when {
                     recording -> {
                         recording = false
                         voice?.invoke(false)
                     }
+                    didClearAllArmed && didClearAllSwipeUp -> {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                        action("clear-all")
+                    }
+                    didClearAllArmed -> Unit
                     didRepeat || didScrub -> Unit
                     label == "⌫" && e.x - downX < -context.dp(20) -> action("delete-word")
                     didSwipeUp || (upper.isNotEmpty() && downY - e.y > context.dp(16)) ->
@@ -576,11 +665,15 @@ internal class Key(
             MotionEvent.ACTION_CANCEL -> {
                 removeCallbacks(startVoice)
                 removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
                 isPressed = false
                 releasedAt = SystemClock.uptimeMillis()
                 swipeUpActive = false
                 repeatingDelete = false
                 spaceScrubbing = false
+                clearAllPending = false
+                clearAllArmed = false
+                clearAllSwipeUp = false
                 if (recording) {
                     recording = false
                     action("cancel-voice")
@@ -594,7 +687,12 @@ internal class Key(
     override fun onDetachedFromWindow() {
         removeCallbacks(startVoice)
         removeCallbacks(repeatDelete)
+        removeCallbacks(armClearAll)
         super.onDetachedFromWindow()
+    }
+
+    companion object {
+        private const val CLEAR_ALL_HOLD_MS = 3000L
     }
 }
 
