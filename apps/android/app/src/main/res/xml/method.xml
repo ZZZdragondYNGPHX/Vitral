@@ -1,3 +1,17 @@
-<input-method xmlns:android="http://schemas.android.com/apk/res/android" android:settingsActivity="dev.vitral.ime.SettingsActivity">
-    <subtype android:label="Vitral" android:imeSubtypeLocale="zh_CN" android:imeSubtypeMode="keyboard" android:languageTag="zh-CN"/>
+<?xml version="1.0" encoding="utf-8"?>
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:isDefault="@bool/im_is_default"
+    android:settingsActivity="dev.vitral.ime.SettingsActivity"
+    android:showInInputMethodPicker="true"
+    android:supportsSwitchingToNextInputMethod="true">
+    <subtype
+        android:icon="@drawable/vitral"
+        android:imeSubtypeExtraValue="AsciiCapable"
+        android:imeSubtypeLocale="zh_CN"
+        android:imeSubtypeMode="keyboard"
+        android:isAsciiCapable="true"
+        android:isAuxiliary="false"
+        android:label="@string/subtype_zh_cn"
+        android:languageTag="zh-CN"
+        android:overridesImplicitlyEnabledSubtype="true" />
 </input-method>

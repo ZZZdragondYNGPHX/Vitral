@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Vitral</string>
+    <string name="ime_service_label">Vitral</string>
+    <string name="subtype_zh_cn">Vitral</string>
+</resources>
