@@ -25,8 +25,8 @@ android {
         applicationId = "dev.vitral.ime"
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.2"
+        versionCode = 6
+        versionName = "0.4.3"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
     buildFeatures { compose = true }

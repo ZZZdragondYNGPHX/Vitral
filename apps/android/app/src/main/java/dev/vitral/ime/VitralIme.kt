@@ -194,7 +194,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     .toSet()
             } ?: setOf("Shift")
         flypy = cfg.optString("schema", "double_pinyin_flypy") == "double_pinyin_flypy"
-        syllableSplit = cfg.optBoolean("syllable_split", false)
+        syllableSplit = false
         aeviouExperimental = cfg.optBoolean("mobile_experimental_aeviou", false)
         font = cfg.optInt("candidate_font_px", 16).coerceIn(13, 22).toFloat()
         themePref = cfg.optString("theme", "system")
@@ -1595,14 +1595,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 addBarItem(
                     label("分词", solidAccent = syllableSplit, subtle = !syllableSplit) {
                         syllableSplit = !syllableSplit
-                        val cfg = Core.settings(this).put("syllable_split", syllableSplit)
-                        Core.save(this, cfg) {}
                         call("set-syllable-split", json("enabled" to syllableSplit)) {
                             applyAction(it)
                         }
                     }.apply {
                         setPadding(dp(8), dp(2), dp(8), dp(2))
-                        contentDescription = if (syllableSplit) "关闭全拼分词模式" else "开启全拼分词模式"
+                        contentDescription = if (syllableSplit) "恢复整音节连词" else "拆分当前音节"
                     },
                     marginHorizontalDp = 2,
                 )
@@ -2915,6 +2913,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (pre.isNotEmpty()) ic.setComposingText(pre, 1)
         else if (composing && committed.isEmpty()) ic.setComposingText("", 1)
         composing = pre.isNotEmpty()
+        if (!composing && syllableSplit) {
+            syllableSplit = false
+            Core.call(this, "set-syllable-split", json("enabled" to false))
+        }
         if (!composing && mode == "candidates") {
             mode = "keys"
             render()

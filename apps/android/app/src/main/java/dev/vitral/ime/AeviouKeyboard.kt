@@ -85,7 +85,7 @@ internal class AeviouKeyboard(
 
     private val baseRows: List<List<Triple<String, String, Int>>> =
         if (isPureEnglish) {
-            // 30-hex pure English probability honeycomb (all 26 letters + 4 actions, 8/7/8/7 staggered)
+            // 31-hex pure English probability honeycomb (all 26 letters + 123 + 4 actions, 8/7/8/8)
             listOf(
                 listOf(
                     Triple("q", "q", 0), Triple("w", "w", 0), Triple("e", "e", 0), Triple("r", "r", 0),
@@ -100,12 +100,12 @@ internal class AeviouKeyboard(
                     Triple("v", "v", 0), Triple("b", "b", 0), Triple("n", "n", 0), Triple("p", "p", 0),
                 ),
                 listOf(
-                    Triple("j", "j", 0), Triple("k", "k", 0), Triple("l", "l", 0), Triple("m", "m", 0),
-                    Triple("空格", "空格", 1), Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                    Triple("123", "123", 1), Triple("j", "j", 0), Triple("k", "k", 0), Triple("l", "l", 0),
+                    Triple("m", "m", 0), Triple("空格", "空格", 1), Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
                 ),
             )
         } else {
-            // 24-hex Chinese Quanpin / Mixed-English honeycomb (6/6/6/6 staggered)
+            // 25-hex Chinese Quanpin / Mixed-English honeycomb (6/6/6/7 with dedicated 123 symbols key)
             listOf(
                 listOf(
                     Triple("b", "B", 0), Triple("p", "P", 0), Triple("m", "M", 0),
@@ -120,7 +120,7 @@ internal class AeviouKeyboard(
                     Triple("c", "C", 0), Triple("s", "S", 0), Triple("r", "R", 0),
                 ),
                 listOf(
-                    Triple("y", "Y", 0), Triple("w", "W", 0),
+                    Triple("123", "123", 1), Triple("y", "Y", 0), Triple("w", "W", 0),
                     Triple("aeiou", if (allowMixedEnglish) "a·e·i·o·u" else "a·e·o", 0),
                     Triple("空格", "空格", 1), Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
                 ),
@@ -138,6 +138,8 @@ internal class AeviouKeyboard(
 
     private var hexRadius = 0f
     private var sliding = false
+    private var armedSlide = false
+    private var stepAnchor = PointF()
     private var pressedAction: HexCell? = null
     private val stepStack = ArrayList<String>()
     private val centerHistory = ArrayList<PointF>()
@@ -188,23 +190,30 @@ internal class AeviouKeyboard(
 
     private fun layoutHexGrid(w: Float, h: Float) {
         if (w <= 0f || h <= 0f) return
-        val padX = context.dpF(8f)
-        val padY = context.dpF(8f)
+        val padX = context.dpF(14f)
+        val padY = context.dpF(10f)
         val availW = (w - padX * 2).coerceAtLeast(1f)
         val availH = (h - padY * 2).coerceAtLeast(1f)
-        val colSpan = if (isPureEnglish) 8.0f else 6.5f
+        val colSpan = if (isPureEnglish) 8.5f else 7.0f
         val rByW = availW / (colSpan * 1.73205f)
-        val rByH = availH / 6.55f
+        val rByH = availH / 6.75f
         hexRadius = min(rByW, rByH)
         val hexW = hexRadius * 1.73205f
         val rowStepY = hexRadius * 1.52f
-        val totalGridW = colSpan * hexW
         val totalGridH = 3f * rowStepY + 2f * hexRadius
-        val startX = (w - totalGridW) * 0.5f + hexW * 0.5f
         val startY = (h - totalGridH) * 0.5f + hexRadius
+        val gridLeft = (w - colSpan * hexW) * 0.5f
         for (cell in cells) {
-            val stagger = if (cell.row % 2 == 1) hexW * 0.5f else 0f
-            cell.cx = startX + cell.col * hexW + stagger
+            if (isPureEnglish) {
+                val xOffset = if (cell.row % 2 == 1) hexW else hexW * 0.5f
+                cell.cx = gridLeft + xOffset + cell.col * hexW
+            } else {
+                val rowCount = baseRows[cell.row].size
+                val rowW = rowCount * hexW
+                val stagger = if (cell.row == 1) hexW * 0.36f else if (cell.row == 0 || cell.row == 2) -hexW * 0.14f else 0f
+                val rowStartX = (w - rowW) * 0.5f + hexW * 0.5f + stagger
+                cell.cx = rowStartX + cell.col * hexW
+            }
             cell.cy = startY + cell.row * rowStepY
         }
     }
@@ -233,13 +242,9 @@ internal class AeviouKeyboard(
     }
 
     private fun computePetals(center: PointF, prefix: String) {
-        val stepDist = hexRadius * 1.82f
-        val margin = hexRadius * 2.45f
-        val clampedX =
-            if (width > margin * 2) center.x.coerceIn(margin, width - margin) else width * 0.5f
-        val clampedY =
-            if (height > margin * 2) center.y.coerceIn(margin, height - margin) else height * 0.5f
-        activeCenter = PointF(clampedX, clampedY)
+        val stepDist = hexRadius * 1.88f
+        // Keep activeCenter strictly on the real touched key/petal so petals NEVER spawn under a stationary finger!
+        activeCenter = PointF(center.x, center.y)
 
         data class Choice(val append: String, val hint: String, val shortcut: Boolean)
         val choices = ArrayList<Choice>(6)
@@ -339,16 +344,54 @@ internal class AeviouKeyboard(
             }
         }
 
-        val anglesDeg = floatArrayOf(-60f, 0f, -120f, 60f, 120f, 180f)
+        // Right-hand friendly & edge-safe petal fanning:
+        // - Right side of screen (e.g. J/H/T/R): fan ALL petals into the open upper-left & left arc
+        //   so neither the screen edge nor the right thumb blocks them.
+        // - Left edge (e.g. B/N/Q): fan into the open upper-right & right arc.
+        // - Center: prioritize upper-left / top / left slots first (unobstructed by right thumb).
+        val nearRight = width > 0 && activeCenter.x > width * 0.56f
+        val nearLeft = width > 0 && activeCenter.x < width * 0.24f
+        val nearTop = height > 0 && activeCenter.y < height * 0.30f
+        val nearBottom = height > 0 && activeCenter.y > height * 0.72f
+        val anglesDeg =
+            when {
+                nearRight && nearTop -> floatArrayOf(180f, 145f, 110f, 162f, 128f, 82f)
+                nearRight && nearBottom -> floatArrayOf(-115f, -150f, 180f, -80f, -132f, 150f)
+                nearRight -> floatArrayOf(-120f, -155f, 180f, 145f, -85f, 110f)
+                nearLeft && nearTop -> floatArrayOf(0f, 35f, 70f, 18f, 52f, 95f)
+                nearLeft && nearBottom -> floatArrayOf(-65f, -30f, 0f, -100f, -48f, 25f)
+                nearLeft -> floatArrayOf(-60f, -25f, 0f, 35f, -95f, 70f)
+                nearTop -> floatArrayOf(180f, 135f, 90f, 45f, 0f, 158f)
+                nearBottom -> floatArrayOf(-120f, -60f, 180f, -90f, 0f, -150f)
+                else -> floatArrayOf(-120f, -60f, 180f, 120f, 0f, 60f)
+            }
+        val pad = hexRadius * 1.05f
+        fun petalPos(deg: Float): PointF {
+            val rad = Math.toRadians(deg.toDouble())
+            var px = activeCenter.x + stepDist * cos(rad).toFloat()
+            var py = activeCenter.y + stepDist * sin(rad).toFloat()
+            if (width > pad * 2) px = px.coerceIn(pad, width - pad)
+            if (height > pad * 2) py = py.coerceIn(pad + context.dpF(26f), height - pad)
+            // Enforce minimum separation so no clamped petal can ever overlap activeCenter
+            val dx = px - activeCenter.x
+            val dy = py - activeCenter.y
+            val dist = hypot(dx, dy)
+            val minSep = hexRadius * 1.48f
+            if (dist < minSep) {
+                val nx = if (dist > 1f) dx / dist else if (nearRight) -1f else 1f
+                val ny = if (dist > 1f) dy / dist else -0.5f
+                px = activeCenter.x + nx * minSep
+                py = activeCenter.y + ny * minSep
+            }
+            return PointF(px, py)
+        }
         var backtrackSlot = -1
         if (centerHistory.size >= 2) {
             val prev = centerHistory[centerHistory.size - 2]
             var bestD = Float.MAX_VALUE
             for (slot in 0 until 6) {
-                val rad = Math.toRadians(anglesDeg[slot].toDouble())
-                val px = activeCenter.x + stepDist * cos(rad).toFloat()
-                val py = activeCenter.y + stepDist * sin(rad).toFloat()
-                val d = hypot(px - prev.x, py - prev.y)
+                val p = petalPos(anglesDeg[slot])
+                val d = hypot(p.x - prev.x, p.y - prev.y)
                 if (d < bestD) {
                     bestD = d
                     backtrackSlot = slot
@@ -359,26 +402,26 @@ internal class AeviouKeyboard(
         val result = ArrayList<Petal>(6)
         choices.take(6).forEachIndexed { idx, ch ->
             val slot = availableSlots.getOrElse(idx) { idx % 6 }
-            val rad = Math.toRadians(anglesDeg[slot].toDouble())
+            val p = petalPos(anglesDeg[slot])
             result.add(
                 Petal(
                     append = ch.append,
                     hintChar = ch.hint,
-                    cx = activeCenter.x + stepDist * cos(rad).toFloat(),
-                    cy = activeCenter.y + stepDist * sin(rad).toFloat(),
+                    cx = p.x,
+                    cy = p.y,
                     isShortcut = ch.shortcut,
                     weightRank = idx,
                 )
             )
         }
         if (backtrackSlot >= 0 && choices.size < 6) {
-            val rad = Math.toRadians(anglesDeg[backtrackSlot].toDouble())
+            val p = petalPos(anglesDeg[backtrackSlot])
             result.add(
                 Petal(
                     append = "↩",
                     hintChar = "",
-                    cx = activeCenter.x + stepDist * cos(rad).toFloat(),
-                    cy = activeCenter.y + stepDist * sin(rad).toFloat(),
+                    cx = p.x,
+                    cy = p.y,
                     isBacktrack = true,
                 )
             )
@@ -598,6 +641,32 @@ internal class AeviouKeyboard(
                 val chY = activeCenter.y + context.dpF(10f) - (subPaint.descent() + subPaint.ascent()) * 0.5f
                 c.drawText(chText, activeCenter.x, chY, subPaint)
             }
+
+            // 3. Unobstructed Top-Center Floating HUD Capsule (always visible above right/left thumb!)
+            val hudSummary =
+                buildString {
+                    append(cur.ifEmpty { "韵母" })
+                    if (centerHint.isNotEmpty()) append(" · ").append(centerHint)
+                    val previewPetals =
+                        petals.filter { !it.isBacktrack }.take(4).joinToString("  ") { p ->
+                            val lbl = if (isPureEnglish) p.append else p.append.uppercase()
+                            if (p.hintChar.isNotEmpty()) "$lbl:${p.hintChar.take(2)}" else lbl
+                        }
+                    if (previewPetals.isNotEmpty()) append("   |   ").append(previewPetals)
+                }
+            subPaint.textSize = context.dpF(11f)
+            val hudW = (subPaint.measureText(hudSummary) + context.dpF(22f)).coerceAtMost(width - context.dpF(16f))
+            val hudH = context.dpF(24f)
+            val hudL = (width - hudW) * 0.5f
+            val hudT = context.dpF(3f)
+            fillPaint.color = if (dark) 0xEB0F172A.toInt() else 0xF5FFFFFF.toInt()
+            c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, fillPaint)
+            borderPaint.color = if (dark) 0x6638BDF8 else 0x550284C7
+            c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, borderPaint)
+            subPaint.color = if (dark) 0xFF7DD3FC.toInt() else 0xFF0369A1.toInt()
+            subPaint.alpha = 255
+            val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
+            c.drawText(hudSummary, width * 0.5f, hudTextY, subPaint)
         } else {
             subPaint.color = secondaryText
             subPaint.alpha = 135
@@ -645,9 +714,12 @@ internal class AeviouKeyboard(
                 if (hit.isAction) {
                     pressedAction = hit
                     sliding = false
+                    armedSlide = false
                 } else {
                     pressedAction = null
                     sliding = true
+                    armedSlide = false
+                    stepAnchor = PointF(e.x, e.y)
                     stepStack.clear()
                     centerHistory.clear()
                     trail.clear()
@@ -664,12 +736,23 @@ internal class AeviouKeyboard(
                 if (!sliding) return true
                 trail.add(PointF(e.x, e.y))
                 if (trail.size > 48) trail.removeAt(0)
-                val triggerR = hexRadius * 0.86f
+                // Require genuine finger displacement before triggering any petal so tapping edge keys (e.g. J) NEVER misfires!
+                val armThreshold = if (stepStack.size <= 1) hexRadius * 0.68f else hexRadius * 0.48f
+                if (!armedSlide) {
+                    if (hypot(e.x - stepAnchor.x, e.y - stepAnchor.y) < armThreshold) {
+                        invalidate()
+                        return true
+                    }
+                    armedSlide = true
+                }
+                val triggerR = hexRadius * 0.72f
                 val entered =
                     petals.minByOrNull { hypot(e.x - it.cx, e.y - it.cy) }?.takeIf {
                         hypot(e.x - it.cx, e.y - it.cy) <= triggerR
                     }
                 if (entered != null) {
+                    armedSlide = false
+                    stepAnchor = PointF(e.x, e.y)
                     if (entered.isBacktrack) {
                         if (stepStack.isNotEmpty()) stepStack.removeAt(stepStack.lastIndex)
                         if (centerHistory.size > 1) centerHistory.removeAt(centerHistory.lastIndex)

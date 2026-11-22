@@ -359,7 +359,6 @@ class SettingsActivity : ComponentActivity() {
                 )
             }
             var fuzzyPinyin by remember { mutableStateOf(config.optBoolean("fuzzy_pinyin", false)) }
-            var syllableSplit by remember { mutableStateOf(config.optBoolean("syllable_split", false)) }
             var openccMode by remember { mutableStateOf(config.optString("opencc_mode", "simplified")) }
             var sublabelMode by remember { mutableStateOf(config.optString("mobile_sublabel_mode", "dual")) }
             var keyboardHeight by remember { mutableStateOf(config.optString("mobile_keyboard_height", "standard")) }
@@ -405,7 +404,6 @@ class SettingsActivity : ComponentActivity() {
                 config
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
                     .put("fuzzy_pinyin", fuzzyPinyin)
-                    .put("syllable_split", syllableSplit)
                     .put("opencc_mode", openccMode)
                     .put("theme", themeMode)
                     .put("mobile_sublabel_mode", sublabelMode)
@@ -773,20 +771,10 @@ class SettingsActivity : ComponentActivity() {
                                             "模糊音容错",
                                             "平翘舌（z/zh、c/ch、s/sh）、前后鼻音（an/ang、en/eng、in/ing）及 l/n、f/h 互通",
                                             checked = fuzzyPinyin,
-                                            showDivider = true,
+                                            showDivider = false,
                                             onCheckedChange = {
                                                 fuzzyPinyin = it
                                                 persistConfig(if (it) "已开启模糊音容错" else "已关闭模糊音容错")
-                                            },
-                                        )
-                                        GlassToggleRow(
-                                            "全拼分词模式",
-                                            "开启后零声母歧义只显示拆分词（如 dian → di'an）；关闭时优先连词，分词权重低",
-                                            checked = syllableSplit,
-                                            showDivider = false,
-                                            onCheckedChange = {
-                                                syllableSplit = it
-                                                persistConfig(if (it) "已开启全拼分词模式" else "已关闭全拼分词模式（优先连词）")
                                             },
                                         )
 
