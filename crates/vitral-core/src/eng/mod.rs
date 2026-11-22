@@ -14,7 +14,7 @@ use crate::imp::polyphone::default_assets_dir_candidates;
 use crate::imp::ImportedLexiconIndex;
 use crate::ret::{expand_time_macro, match_paired_punctuation, RetentionEngine};
 use crate::sync::RelayDevice;
-use pure_rust::{pure_rust_opencc, PureRustEngine};
+use pure_rust::{pure_rust_opencc, DecodedCandidate, PureRustEngine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 #[cfg(all(target_os = "linux", feature = "native-rime"))]
@@ -24,6 +24,19 @@ use vitral_tokens::TOKENS;
 
 pub const MOD_LANG_TOGGLE: u32 = 1 << 30;
 pub const MOD_VOICE_HOLD: u32 = 1 << 29;
+
+fn map_zh_punctuation(ch: char) -> Option<&'static str> {
+    match ch {
+        ',' | '，' => Some("，"),
+        '.' | '。' => Some("。"),
+        '?' | '？' => Some("？"),
+        '!' | '！' => Some("！"),
+        ';' | '；' => Some("；"),
+        ':' | '：' => Some("："),
+        '\\' | '、' => Some("、"),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -81,6 +94,10 @@ pub struct EngineConfig {
     pub linux_english_mode: bool,
     #[serde(default = "default_enabled")]
     pub adaptive_learning: bool,
+    #[serde(default)]
+    pub fuzzy_pinyin: bool,
+    #[serde(default)]
+    pub syllable_split: bool,
     #[serde(default = "default_enabled")]
     pub learn_from_clipboard: bool,
     #[serde(default)]
@@ -236,6 +253,8 @@ impl Default for EngineConfig {
             shortcuts: crate::shortcuts::defaults(),
             linux_english_mode: true,
             adaptive_learning: true,
+            fuzzy_pinyin: false,
+            syllable_split: false,
             learn_from_clipboard: true,
             data_dir: String::new(),
             cache_dir: String::new(),
@@ -355,6 +374,7 @@ enum CandidateOrigin {
         rime_page_idx: usize,
     },
     PureRust {
+        consumed_len: usize,
         features: [f64; 9],
         canonical: String,
         commit_text: String,
@@ -410,6 +430,9 @@ pub struct EngineState {
     pub app_lang_memory: HashMap<String, LangMode>,
     pub composing: String,
     pub raw_input: String,
+    pending_phrase_text: String,
+    pending_phrase_code: String,
+    pending_phrase_selections: usize,
     pub cursor_utf8: usize,
     pub current_candidates: Vec<CandidateItem>,
     pub current_page: PageInfo,
@@ -471,9 +494,10 @@ impl EngineState {
             }
         }
         let resolved_assets_dir = resolve_assets_dir(&config.assets_dir);
-        let pure_rust = PureRustEngine::new(resolved_assets_dir.as_deref());
-        let page_size = TOKENS.ergonomics.desktop_candidate_page_size as usize;
-        Self {
+        let mut pure_rust = PureRustEngine::new(resolved_assets_dir.as_deref());
+        pure_rust.fuzzy_pinyin = config.fuzzy_pinyin;
+        pure_rust.syllable_split = config.syllable_split;
+        let mut engine = Self {
             schema: config.schema,
             opencc_mode: config.opencc_mode,
             model_paths: crate::models::ModelPaths::bundled(resolved_assets_dir.as_deref()),
@@ -495,11 +519,14 @@ impl EngineState {
             app_lang_memory: HashMap::new(),
             composing: String::new(),
             raw_input: String::new(),
+            pending_phrase_text: String::new(),
+            pending_phrase_code: String::new(),
+            pending_phrase_selections: 0,
             cursor_utf8: 0,
             current_candidates: Vec::new(),
             current_page: PageInfo {
                 page_index: 0,
-                page_size,
+                page_size: 0,
                 has_prev: false,
                 has_next: false,
             },
@@ -514,6 +541,16 @@ impl EngineState {
             rime_first_has_next: false,
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             rime_session_id: None,
+        };
+        engine.current_page.page_size = engine.candidate_page_size();
+        engine
+    }
+
+    fn candidate_page_size(&self) -> usize {
+        if self.config.platform == "android" {
+            24
+        } else {
+            TOKENS.ergonomics.desktop_candidate_page_size as usize
         }
     }
 
@@ -525,6 +562,9 @@ impl EngineState {
             let (pairs, _) = self.build_overlay_candidates(clipboard, imported, retention, false);
             self.set_current_candidates(pairs.into_iter().filter(|(c, _)| c.quick_paste_id.is_some()).collect());
             return Ok(self.empty_action(None));
+        }
+        if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
+            return self.process_key_pure_rust(0, clipboard, imported, retention);
         }
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         if let (Some(sid), Some(assets)) = (self.rime_session_id, self.resolved_assets_dir.clone()) {
@@ -553,6 +593,19 @@ impl EngineState {
             .flatten()
     }
 
+    fn prefix_prediction_context(&self, now_ms: u64) -> Option<String> {
+        let previous = self.previous_context(now_ms)?;
+        let mut tail: Vec<char> = if self.context_window.is_empty() {
+            previous.chars().rev().take(4).collect()
+        } else {
+            self.context_window.iter().rev().take(4).copied().collect()
+        };
+        tail.reverse();
+        tail.iter()
+            .all(|ch| crate::ret::is_cjk(*ch))
+            .then(|| tail.into_iter().collect())
+    }
+
     pub(crate) fn is_clipboard_candidate(&self, index: usize) -> bool {
         matches!(
             self.candidate_origins.get(index),
@@ -574,6 +627,9 @@ impl EngineState {
         now_ms: u64,
     ) {
         let prev = self.previous_context(now_ms).map(str::to_string);
+        if prev.is_none() {
+            self.context_window.clear();
+        }
         let correction = self.config.adaptive_learning
             && self.regret_backspaces > 0
             && self.last_committed_code.as_deref() == Some(code)
@@ -659,14 +715,11 @@ impl EngineState {
             }
         }
         if self.config.adaptive_learning
-            && (2..=6).contains(&canonical.chars().count())
+            && (2..=8).contains(&canonical.chars().count())
             && canonical.chars().all(crate::ret::is_cjk)
-            && (retention.frecency.get(canonical).copied().unwrap_or(0.0) >= 2.0
+            && (retention.frecency.get(canonical).copied().unwrap_or(0.0) >= 1.5
+                || retention.user_phrases.contains_key(canonical)
                 || retention.pinned_words.contains(canonical))
-            && !retention
-                .user_phrases
-                .get(canonical)
-                .is_some_and(|p| p.source == "typed")
         {
             let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
                 imported.corpus(),
@@ -701,7 +754,7 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) {
-        let code = self.raw_input.clone();
+        let code = self.candidate_code_at(selected_index).to_string();
         self.record_candidate_commit(
             canonical,
             &code,
@@ -797,11 +850,118 @@ impl EngineState {
         origin.set_features(features);
     }
 
+    fn promote_prefix_prediction(
+        &self,
+        pairs: &mut Vec<(CandidateItem, CandidateOrigin)>,
+        word: &str,
+        prediction_score: f64,
+        retention: &RetentionEngine,
+        now_ms: u64,
+    ) {
+        let Some(index) = pairs
+            .iter()
+            .position(|(_, origin)| origin.canonical() == word)
+        else {
+            return;
+        };
+        let predicted = pairs.remove(index);
+        let context = self.prefix_prediction_context(now_ms);
+        // Cached language-model priors may refine ordinary candidates, but must not
+        // undo the explicit context/prefix match. Preserve stronger personal choices.
+        let at = pairs
+            .iter()
+            .rposition(|(item, origin)| {
+                item.pinned
+                    || item.is_clipboard_shortcut
+                    || item.quick_paste_id.is_some()
+                    || item.function_action.is_some()
+                    || matches!(
+                        origin,
+                        CandidateOrigin::Overlay {
+                            is_clipboard: true,
+                            ..
+                        }
+                    )
+                    || (!predicted.0.pinned
+                        && retention
+                            .contextual_score_at(
+                                origin.canonical(),
+                                &self.raw_input,
+                                context.as_deref(),
+                                self.active_app_id.as_deref(),
+                                now_ms,
+                                self.config.adaptive_learning,
+                            )
+                            .max(0.0)
+                            > prediction_score.max(0.0))
+            })
+            .map_or(0, |index| index + 1);
+        pairs.insert(at, predicted);
+    }
+
+    pub(crate) fn candidate_code_at(&self, index: usize) -> &str {
+        let consumed_len = match self.candidate_origins.get(index) {
+            Some(CandidateOrigin::PureRust { consumed_len, .. }) => *consumed_len,
+            _ => self.raw_input.len(),
+        };
+        &self.raw_input[..consumed_len]
+    }
+
     pub(crate) fn canonical_at(&self, index: usize) -> Option<&str> {
         self.candidate_origins.get(index).map(CandidateOrigin::canonical)
     }
 
+    fn clear_pending_phrase(&mut self) {
+        self.pending_phrase_text.clear();
+        self.pending_phrase_code.clear();
+        self.pending_phrase_selections = 0;
+    }
+
+    fn track_phrase_selection(
+        &mut self,
+        canonical: &str,
+        code: &str,
+        finished: bool,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) {
+        if !self.config.adaptive_learning || !canonical.chars().all(crate::ret::is_cjk) {
+            self.clear_pending_phrase();
+            return;
+        }
+        // A whole-word choice by itself is not a manual composition.
+        if finished && self.pending_phrase_selections == 0 {
+            return;
+        }
+        self.pending_phrase_text.push_str(canonical);
+        self.pending_phrase_code.push_str(code);
+        self.pending_phrase_selections += 1;
+        if finished
+            && self.pending_phrase_selections >= 2
+            && (2..=8).contains(&self.pending_phrase_text.chars().count())
+        {
+            let word = self.pending_phrase_text.clone();
+            let code = self.pending_phrase_code.clone();
+            let now = RetentionEngine::now_epoch_ms();
+            let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
+                imported.corpus(),
+            ))
+            .annotate_text(&word);
+            let (quanpin, xiaohe) = if self.schema == SchemaKind::RimeIce {
+                (
+                    code.clone(),
+                    crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned),
+                )
+            } else {
+                (ann.untoned, code.clone())
+            };
+            self.record_candidate_commit(&word, &code, None, imported, retention, now);
+            retention.register_typed_phrase(&word, &quanpin, &xiaohe, now);
+        }
+    }
+
     pub(crate) fn clear_composition_state(&mut self) {
+        self.clear_pending_phrase();
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             self.rime_first_page.clear();
@@ -898,6 +1058,44 @@ impl EngineState {
         }
     }
 
+    pub(crate) fn set_syllable_split(&mut self, enabled: bool) -> Result<(), VitralError> {
+        if self.config.syllable_split == enabled {
+            return Ok(());
+        }
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if self.schema == SchemaKind::RimeIce {
+            if let Some(assets) = self
+                .resolved_assets_dir
+                .clone()
+                .filter(|p| p.join("rime").is_dir())
+            {
+                let sid = self.ensure_rime_session(&assets)?;
+                rime_ffi::with_runtime(
+                    &assets,
+                    &self.config.cache_dir,
+                    &self.config.data_dir,
+                    |rt| {
+                        rt.clear_composition(sid);
+                        // Restore native input before switching back, without committing or learning.
+                        if !enabled {
+                            for ch in self.raw_input.chars() {
+                                rt.process_key(sid, ch as u32, 0)?;
+                            }
+                        }
+                        Ok(())
+                    },
+                )?;
+            }
+            self.rime_first_page.clear();
+            self.rime_overlay_page = 0;
+        }
+        self.config.syllable_split = enabled;
+        self.pure_rust.syllable_split = enabled;
+        self.pure_rust.page_index = 0;
+        self.current_page.page_index = 0;
+        Ok(())
+    }
+
     pub fn set_opencc_mode(&mut self, mode: OpenCcMode) {
         self.opencc_mode = mode;
     }
@@ -992,6 +1190,7 @@ impl EngineState {
             _ => keycode,
         };
         let now_ms = RetentionEngine::now_epoch_ms();
+        if matches!(keycode, 0x08 | 0x1b) { self.clear_pending_phrase(); }
         if keycode == 0x1b {
             self.reset_commit_context();
             self.last_committed_char = None;
@@ -1076,6 +1275,10 @@ impl EngineState {
             return Ok(act);
         }
 
+        if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
+            return self.process_key_pure_rust(keycode, clipboard, imported, retention);
+        }
+
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             if let Some(assets_dir) = self.resolved_assets_dir.clone() {
@@ -1141,7 +1344,7 @@ impl EngineState {
     }
 
     fn build_passthrough_action(&mut self) -> InputAction {
-        let page_size = TOKENS.ergonomics.desktop_candidate_page_size as usize;
+        let page_size = self.candidate_page_size();
         self.composing = self.raw_input.clone();
         self.cursor_utf8 = self.composing.len();
         let token = self.raw_input.clone();
@@ -1437,12 +1640,20 @@ impl EngineState {
                     OpenCcMode::Simplified,
                     Some(imported),
                     Some(retention),
-                    self.previous_context(RetentionEngine::now_epoch_ms()),
+                    self.prefix_prediction_context(RetentionEngine::now_epoch_ms()).as_deref(),
                     self.active_app_id.as_deref(),
                     self.config.adaptive_learning,
                 );
                 let mut added_full_alt = 0usize;
-                for (offset, (pr_item, canonical)) in pr.into_iter().enumerate() {
+                for (
+                    offset,
+                    DecodedCandidate {
+                        item: pr_item,
+                        canonical,
+                        consumed_len,
+                    },
+                ) in pr.into_iter().enumerate()
+                {
                     if retention.erased_words.contains(&canonical) {
                         continue;
                     }
@@ -1469,6 +1680,7 @@ impl EngineState {
                         frecency_score: frec,
                     };
                     let origin = CandidateOrigin::PureRust {
+                        consumed_len,
                         features: [0.0; 9],
                         canonical,
                         commit_text: converted,
@@ -1526,6 +1738,7 @@ impl EngineState {
                                 frecency_score: self.contextual_score(retention, &word, now_ms),
                             },
                             CandidateOrigin::PureRust {
+                                consumed_len: self.raw_input.len(),
                                 features: [0.0; 9],
                                 canonical: word,
                                 commit_text: text,
@@ -1612,6 +1825,114 @@ impl EngineState {
                     priority_overlay.push((c, orig));
                 }
             }
+            if (self.config.fuzzy_pinyin && self.schema == SchemaKind::RimeIce)
+                || pure_rust::mixed_english(&self.raw_input, Some(retention)).is_some()
+            {
+                let decoded = self.pure_rust.query_all_candidates_contextual(
+                    &self.raw_input,
+                    self.schema,
+                    self.opencc_mode,
+                    Some(imported),
+                    Some(retention),
+                    self.prefix_prediction_context(now_ms).as_deref(),
+                    self.active_app_id.as_deref(),
+                    self.config.adaptive_learning,
+                );
+                let english_at = decoded.iter().position(|c| c.item.comment == "英文");
+                let priority_count = priority_overlay
+                    .iter()
+                    .take_while(|(c, _)| {
+                        c.quick_paste_id.is_some()
+                            || c.function_action.is_some()
+                            || c.is_clipboard_shortcut
+                    })
+                    .count();
+                let mut fuzzy_added = 0;
+                for (rank, candidate) in decoded.into_iter().enumerate() {
+                    let english = candidate.item.comment == "英文";
+                    let fuzzy = self.config.fuzzy_pinyin
+                        && self.schema == SchemaKind::RimeIce
+                        && candidate.canonical.chars().all(crate::ret::is_cjk)
+                        && candidate.consumed_len == self.raw_input.len()
+                        && candidate.item.comment.replace(' ', "") != self.raw_input
+                        && fuzzy_added < 3;
+                    if !(english || fuzzy) {
+                        continue;
+                    }
+                    if english {
+                        priority_overlay
+                            .retain(|(_, origin)| origin.canonical() != candidate.canonical);
+                        seen.remove(&candidate.item.text);
+                    }
+                    if !seen.insert(candidate.item.text.clone()) {
+                        continue;
+                    }
+                    let at = if english {
+                        english_at.unwrap_or(0)
+                    } else {
+                        fuzzy_added + 1
+                    };
+                    let origin = CandidateOrigin::PureRust {
+                        consumed_len: candidate.consumed_len,
+                        features: [0.0; 9],
+                        canonical: candidate.canonical,
+                        commit_text: candidate.item.text.clone(),
+                    };
+                    let mut item = candidate.item;
+                    let mut origin = origin;
+                    self.score_pair(&mut item, &mut origin, retention, now_ms, rank);
+                    priority_overlay.insert(
+                        (priority_count + at).min(priority_overlay.len()),
+                        (item, origin),
+                    );
+                    if fuzzy {
+                        fuzzy_added += 1;
+                    }
+                }
+            }
+            if let Some(context) = self.prefix_prediction_context(now_ms) {
+                if let Some((word, _)) = self.pure_rust.contextual_prefix_candidate(
+                    &self.raw_input,
+                    self.schema,
+                    Some(imported),
+                    Some(retention),
+                    &context,
+                    self.config.adaptive_learning,
+                ) {
+                    // Reuse the portable ranking guard for explicitly typed longer sentences.
+                    let decoded = self.pure_rust.query_all_candidates_contextual(
+                        &self.raw_input,
+                        self.schema,
+                        self.opencc_mode,
+                        Some(imported),
+                        Some(retention),
+                        Some(&context),
+                        self.active_app_id.as_deref(),
+                        self.config.adaptive_learning,
+                    );
+                    if let Some(candidate) = decoded.into_iter().next().filter(|c| c.canonical == word) {
+                        let prediction_score = candidate.item.frecency_score;
+                        let mut item = candidate.item;
+                        let mut origin = CandidateOrigin::PureRust {
+                            consumed_len: candidate.consumed_len,
+                            features: [0.0; 9],
+                            canonical: candidate.canonical,
+                            commit_text: item.text.clone(),
+                        };
+                        self.score_pair(&mut item, &mut origin, retention, now_ms, 0);
+                        priority_overlay.retain(|(_, other)| other.canonical() != word);
+                        priority_overlay.push((item, origin));
+                        self.promote_prefix_prediction(
+                            &mut priority_overlay,
+                            &word,
+                            prediction_score,
+                            retention,
+                            now_ms,
+                        );
+                    }
+                }
+            }
+
             // Keep the existing first-page ranking, plus the word displaced by Quick Paste.
             priority_overlay.truncate(page_size + priority_overlay.iter().filter(|(c, _)| c.quick_paste_id.is_some() || c.function_action.is_some()).count());
             self.rime_first_page = priority_overlay;
@@ -1719,141 +2040,25 @@ impl EngineState {
         let is_space = keycode == 0x20;
         let is_return = keycode == 0x0D || keycode == 0xFF0D;
 
-        // Space commit: handle overlay, PureRust, or Rime candidate #0 directly
-        if is_space && !self.raw_input.is_empty() {
-            if let Some(origin) = self.candidate_origins.first().cloned() {
-                match origin {
-                    CandidateOrigin::Overlay {
-                        canonical,
-                        commit_text,
-                        is_clipboard,
-                        ..
-                    } => {
-                        if !is_clipboard {
-                            self.learn_current_candidate(&canonical, 0, imported, retention);
-                        }
-                        let prefix = self.confirmed_non_ascii_prefix();
-                        let final_commit = if !is_clipboard && !prefix.is_empty() {
-                            format!("{}{}", self.convert_opencc(&prefix), commit_text)
-                        } else {
-                            commit_text
-                        };
-                        self.clear_composition_state();
-                        return Ok(self.empty_action(Some(final_commit)));
-                    }
-                    CandidateOrigin::PureRust {
-                        canonical,
-                        commit_text,
-                        ..
-                    } => {
-                        self.learn_current_candidate(&canonical, 0, imported, retention);
-                        let prefix = self.confirmed_non_ascii_prefix();
-                        let final_commit = if !prefix.is_empty() {
-                            format!("{}{}", self.convert_opencc(&prefix), commit_text)
-                        } else {
-                            commit_text
-                        };
-                        self.clear_composition_state();
-                        return Ok(self.empty_action(Some(final_commit)));
-                    }
-                    CandidateOrigin::Rime {
-                        canonical,
-                        rime_page_idx,
-                        ..
-                    } => {
-                        let snap = rime_ffi::with_runtime(
-                            assets_dir,
-                            &self.config.cache_dir,
-                            &self.config.data_dir,
-                            |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
-                        )?;
-                        self.learn_current_candidate(&canonical, 0, imported, retention);
-                        return Ok(self.apply_rime_snapshot(
-                            snap, is_return, false, clipboard, imported, retention,
-                        ));
-                    }
-                }
+        // All selection entry points share partial-selection bookkeeping.
+        let selection = if is_space && !self.raw_input.is_empty() {
+            Some(0)
+        } else if !self.raw_input.is_empty() {
+            char::from_u32(keycode)
+                .and_then(|ch| ch.to_digit(10))
+                .filter(|digit| (1..=self.current_page.page_size as u32).contains(digit))
+                .map(|digit| digit as usize - 1)
+        } else {
+            None
+        };
+        if let Some(index) = selection.filter(|i| *i < self.candidate_origins.len()) {
+            if !self.is_clipboard_candidate(index) {
+                let canonical = self.candidate_origins[index].canonical().to_string();
+                self.learn_current_candidate(&canonical, index, imported, retention);
             }
-        }
-
-        // Digit '1'..='5' selection while composing: respect overlay offset & Rime menu mapping
-        if !self.raw_input.is_empty() {
-            if let Some(ch) = char::from_u32(keycode) {
-                if ch.is_ascii_digit() && ch != '0' {
-                    let digit = ch.to_digit(10).unwrap_or(0) as usize;
-                    let page_size = self.current_page.page_size.max(5);
-                    if (1..=page_size).contains(&digit) {
-                        if let Some(origin) = self.candidate_origins.get(digit - 1).cloned() {
-                            match origin {
-                                CandidateOrigin::Overlay {
-                                    canonical,
-                                    commit_text,
-                                    is_clipboard,
-                                    ..
-                                } => {
-                                    if !is_clipboard {
-                                        self.learn_current_candidate(
-                                            &canonical,
-                                            digit - 1,
-                                            imported,
-                                            retention,
-                                        );
-                                    }
-                                    let prefix = self.confirmed_non_ascii_prefix();
-                                    let final_commit = if !is_clipboard && !prefix.is_empty() {
-                                        format!("{}{}", self.convert_opencc(&prefix), commit_text)
-                                    } else {
-                                        commit_text
-                                    };
-                                    self.clear_composition_state();
-                                    return Ok(self.empty_action(Some(final_commit)));
-                                }
-                                CandidateOrigin::Rime {
-                                    canonical,
-                                    rime_page_idx,
-                                    ..
-                                } => {
-                                    let snap = rime_ffi::with_runtime(
-                                        assets_dir,
-                                        &self.config.cache_dir,
-                                        &self.config.data_dir,
-                                        |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
-                                    )?;
-                                    self.learn_current_candidate(
-                                        &canonical,
-                                        digit - 1,
-                                        imported,
-                                        retention,
-                                    );
-                                    return Ok(self.apply_rime_snapshot(
-                                        snap, false, false, clipboard, imported, retention,
-                                    ));
-                                }
-                                CandidateOrigin::PureRust {
-                                    canonical,
-                                    commit_text,
-                                    ..
-                                } => {
-                                    self.learn_current_candidate(
-                                        &canonical,
-                                        digit - 1,
-                                        imported,
-                                        retention,
-                                    );
-                                    let prefix = self.confirmed_non_ascii_prefix();
-                                    let final_commit = if !prefix.is_empty() {
-                                        format!("{}{}", self.convert_opencc(&prefix), commit_text)
-                                    } else {
-                                        commit_text
-                                    };
-                                    self.clear_composition_state();
-                                    return Ok(self.empty_action(Some(final_commit)));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            let committed =
+                self.select_candidate_on_backend(index, clipboard, imported, retention)?;
+            return Ok(self.empty_action(committed));
         }
 
         if is_backspace {
@@ -1906,35 +2111,28 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) -> Result<InputAction, VitralError> {
-        let page_size = TOKENS.ergonomics.desktop_candidate_page_size as usize;
+        let page_size = self.candidate_page_size();
 
+        // process_key normalizes X11 Escape; U+FF1B here is the Chinese semicolon.
         if keycode == 0x08 || keycode == 0xFF08 {
             self.raw_input.pop();
             self.pure_rust.page_index = 0;
-        } else if keycode == 0x1B || keycode == 0xFF1B {
+        } else if keycode == 0x1B {
             self.clear_composition_state();
             return Ok(self.empty_action(None));
         } else if keycode == 0x20 {
             if !self.raw_input.is_empty() {
                 if let Some(origin) = self.candidate_origins.first().cloned() {
-                    let is_clip = matches!(
-                        origin,
-                        CandidateOrigin::Overlay {
-                            is_clipboard: true,
-                            ..
-                        }
-                    );
-                    if !is_clip {
+                    if !self.is_clipboard_candidate(0) {
                         self.learn_current_candidate(origin.canonical(), 0, imported, retention);
                     }
+                    let committed =
+                        self.select_candidate_on_backend(0, clipboard, imported, retention)?;
+                    return Ok(self.empty_action(committed));
                 }
-                let commit = self
-                    .current_candidates
-                    .first()
-                    .map(|c| c.text.clone())
-                    .unwrap_or_else(|| std::mem::take(&mut self.raw_input));
+                let committed = self.raw_input.clone();
                 self.clear_composition_state();
-                return Ok(self.empty_action(Some(commit)));
+                return Ok(self.empty_action(Some(committed)));
             }
             return Ok(self.empty_action(Some(" ".to_string())));
         } else if keycode == 0x0D || keycode == 0xFF0D {
@@ -1959,35 +2157,51 @@ impl EngineState {
                 self.pure_rust.page_index = 0;
             } else if ch.is_ascii_digit() && !self.raw_input.is_empty() {
                 let digit = ch.to_digit(10).unwrap_or(0) as usize;
-                if (1..=page_size).contains(&digit) {
-                    if let Some(cand) = self.current_candidates.get(digit - 1).cloned() {
-                        if let Some(origin) = self.candidate_origins.get(digit - 1).cloned() {
-                            let is_clip = matches!(
-                                origin,
-                                CandidateOrigin::Overlay {
-                                    is_clipboard: true,
-                                    ..
-                                }
-                            );
-                            if !is_clip {
-                                self.learn_current_candidate(
-                                    origin.canonical(),
-                                    digit - 1,
-                                    imported,
-                                    retention,
-                                );
+                if (1..=page_size.min(9)).contains(&digit)
+                    && self.current_candidates.get(digit - 1).is_some()
+                {
+                    if let Some(origin) = self.candidate_origins.get(digit - 1).cloned() {
+                        let is_clip = matches!(
+                            origin,
+                            CandidateOrigin::Overlay {
+                                is_clipboard: true,
+                                ..
                             }
+                        );
+                        if !is_clip {
+                            self.learn_current_candidate(
+                                origin.canonical(),
+                                digit - 1,
+                                imported,
+                                retention,
+                            );
                         }
-                        self.clear_composition_state();
-                        return Ok(self.empty_action(Some(cand.text)));
                     }
+                    let committed = self.select_candidate_on_backend(
+                        digit - 1,
+                        clipboard,
+                        imported,
+                        retention,
+                    )?;
+                    return Ok(self.empty_action(committed));
                 }
-            } else if !ch.is_control() && self.raw_input.is_empty() {
-                let text = match ch {
-                    '.' => "。".into(),
-                    ':' => "：".into(),
-                    _ => ch.to_string(),
+            } else if let Some(punctuation) = map_zh_punctuation(ch) {
+                let mut text = if self.raw_input.is_empty() {
+                    String::new()
+                } else if let Some(origin) = self.candidate_origins.first().cloned() {
+                    if !self.is_clipboard_candidate(0) {
+                        self.learn_current_candidate(origin.canonical(), 0, imported, retention);
+                    }
+                    self.select_candidate_on_backend(0, clipboard, imported, retention)?
+                        .unwrap_or_default()
+                } else {
+                    self.raw_input.clone()
                 };
+                self.clear_composition_state();
+                text.push_str(punctuation);
+                return Ok(self.empty_action(Some(text)));
+            } else if !ch.is_control() && self.raw_input.is_empty() {
+                let text = ch.to_string();
                 return Ok(self.empty_action(Some(text)));
             }
         }
@@ -1997,26 +2211,56 @@ impl EngineState {
             return Ok(self.empty_action(None));
         }
 
+        let now_ms = RetentionEngine::now_epoch_ms();
+        let prefix_context = self.prefix_prediction_context(now_ms);
         let base_pairs = self.pure_rust.query_all_candidates_contextual(
             &self.raw_input,
             self.schema,
             self.opencc_mode,
             Some(imported),
             Some(retention),
-            self.previous_context(RetentionEngine::now_epoch_ms()),
+            prefix_context.as_deref(),
             self.active_app_id.as_deref(),
             self.config.adaptive_learning,
         );
 
+        let contextual_prediction = prefix_context
+            .as_deref()
+            .and_then(|context| {
+                self.pure_rust.contextual_prefix_candidate(
+                    &self.raw_input,
+                    self.schema,
+                    Some(imported),
+                    Some(retention),
+                    context,
+                    self.config.adaptive_learning,
+                )
+            })
+            .and_then(|(word, _)| {
+                base_pairs
+                    .first()
+                    .filter(|c| c.canonical == word)
+                    .map(|c| (word, c.item.frecency_score))
+            });
+
+        let english_at = base_pairs.iter().position(|c| c.item.comment == "英文");
         let (mut merged, mut seen) =
             self.build_overlay_candidates(clipboard, imported, retention, false);
-        let now_ms = RetentionEngine::now_epoch_ms();
-        for (base_rank, (item, canonical)) in base_pairs.into_iter().enumerate() {
+        for (
+            base_rank,
+            DecodedCandidate {
+                item,
+                canonical,
+                consumed_len,
+            },
+        ) in base_pairs.into_iter().enumerate()
+        {
             let converted = self.convert_opencc(&canonical);
             if seen.insert(converted.clone()) {
                 let mut item = item;
                 item.text = converted.clone();
                 let origin = CandidateOrigin::PureRust {
+                    consumed_len,
                     features: [0.0; 9],
                     canonical,
                     commit_text: converted,
@@ -2050,6 +2294,23 @@ impl EngineState {
                 }),
             }
         });
+        if let Some((word, score)) = contextual_prediction {
+            self.promote_prefix_prediction(&mut merged, &word, score, retention, now_ms);
+        }
+        if let Some(at) = english_at {
+            if let Some(index) = merged.iter().position(|(c, _)| c.comment == "英文") {
+                let english = merged.remove(index);
+                let priority = merged
+                    .iter()
+                    .take_while(|(c, _)| {
+                        c.quick_paste_id.is_some()
+                            || c.function_action.is_some()
+                            || c.is_clipboard_shortcut
+                    })
+                    .count();
+                merged.insert((priority + at).min(merged.len()), english);
+            }
+        }
         if let Some(mut pair) = self.recover_transposition(
             merged.iter().map(|(_, origin)| origin.canonical()),
             imported,
@@ -2187,6 +2448,7 @@ impl EngineState {
             (
                 item,
                 CandidateOrigin::PureRust {
+                    consumed_len: self.raw_input.len(),
                     canonical,
                     commit_text,
                     features: [0.0; 9],
@@ -2359,15 +2621,16 @@ impl EngineState {
                     self.contextual_score(retention, word, now_ms) + 1.5,
                 ));
             }
-            if let Some(word) = retention.query_user_english(&compact) {
-                learned.push((
-                    word,
-                    "英文",
-                    self.contextual_score(retention, word, now_ms) + 1.0,
-                ));
-            }
             learned.sort_by(|a, b| b.2.total_cmp(&a.2));
             for (canonical, comment, score) in learned {
+                if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
+                    let reading = crate::imp::polyphone::PolyphoneAnnotator::new(
+                        std::sync::Arc::clone(imported.corpus()),
+                    ).annotate_text(canonical);
+                    if reading.untoned.split_whitespace().any(quanpin::can_zero_initial_split) {
+                        continue;
+                    }
+                }
                 let text = self.convert_opencc(canonical);
                 if seen.insert(text.clone()) {
                     overlay.push((
@@ -2438,6 +2701,9 @@ impl EngineState {
                 SchemaKind::DoublePinyinFlypy => imported.query_xiaohe(&compact),
             };
             for imp in imp_matches {
+                if self.config.syllable_split && self.schema == SchemaKind::RimeIce
+                    && imp.pinyin.split_whitespace().any(quanpin::can_zero_initial_split)
+                { continue; }
                 if retention.erased_words.contains(&imp.text) {
                     continue;
                 }
@@ -2446,7 +2712,9 @@ impl EngineState {
                     let item = CandidateItem {
                         index: 0,
                         text: converted.clone(),
-                        comment: imp.toned_pinyin.clone(),
+                        comment: if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
+                            imp.pinyin.clone()
+                        } else { imp.toned_pinyin.clone() },
                         pinned: retention.pinned_words.contains(&imp.text),
                         is_clipboard_shortcut: false,
                         quick_paste_id: None,
@@ -2483,13 +2751,19 @@ impl EngineState {
                     OpenCcMode::Simplified,
                     Some(imported),
                     Some(retention),
-                    self.previous_context(RetentionEngine::now_epoch_ms()),
+                    self.prefix_prediction_context(RetentionEngine::now_epoch_ms()).as_deref(),
                     self.active_app_id.as_deref(),
                     self.config.adaptive_learning,
                 );
-                for (item, canonical) in decoded
+                for DecodedCandidate {
+                    item, canonical, ..
+                } in decoded
                     .into_iter()
-                    .filter(|(_, c)| imported.contains_hotword(c) && !retention.erased_words.contains(c))
+                    .filter(|c| {
+                        c.consumed_len == self.raw_input.len()
+                            && imported.contains_hotword(&c.canonical)
+                            && !retention.erased_words.contains(&c.canonical)
+                    })
                     .take(3)
                 {
                     let converted = self.convert_opencc(&canonical);
@@ -2529,21 +2803,17 @@ impl EngineState {
         index: usize,
         clipboard: &ClipboardManager,
         imported: &ImportedLexiconIndex,
-        retention: &RetentionEngine,
+        retention: &mut RetentionEngine,
     ) -> Result<Option<String>, VitralError> {
-        let origin = self
-            .candidate_origins
-            .get(index)
-            .cloned()
-            .ok_or_else(|| VitralError::NotFound(format!("candidate index {index} out of range")))?;
-
-        #[cfg(not(all(target_os = "linux", feature = "native-rime")))]
-        let _ = (clipboard, imported, retention);
+        let origin = self.candidate_origins.get(index).cloned().ok_or_else(|| {
+            VitralError::NotFound(format!("candidate index {index} out of range"))
+        })?;
 
         match origin {
             CandidateOrigin::Overlay {
                 commit_text,
                 is_clipboard,
+                canonical,
                 ..
             } => {
                 let prefix = self.confirmed_non_ascii_prefix();
@@ -2552,6 +2822,10 @@ impl EngineState {
                 } else {
                     commit_text
                 };
+                if !is_clipboard {
+                    let code = self.raw_input.clone();
+                    self.track_phrase_selection(&canonical, &code, true, imported, retention);
+                }
                 self.clear_composition_state();
                 Ok(Some(final_commit))
             }
@@ -2559,6 +2833,7 @@ impl EngineState {
             CandidateOrigin::Rime {
                 rime_page_idx,
                 commit_text,
+                canonical,
                 ..
             } => {
                 if let (Some(sid), Some(ref assets_dir)) =
@@ -2571,27 +2846,67 @@ impl EngineState {
                         |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
                     )?;
                     if let Some(committed) = snap.commit_text {
+                        let code = self.raw_input.clone();
+                        self.track_phrase_selection(&canonical, &code, true, imported, retention);
                         self.clear_composition_state();
                         return Ok(Some(self.convert_opencc(&committed)));
                     }
                     if !snap.preedit.is_empty() || !snap.candidates.is_empty() {
+                        let before = self.raw_input.clone();
                         let _ = self.apply_rime_snapshot(
                             snap, false, false, clipboard, imported, retention,
                         );
+                        if let Some(consumed) = before.strip_suffix(&self.raw_input) {
+                            if !consumed.is_empty() {
+                                self.track_phrase_selection(
+                                    &canonical, consumed, false, imported, retention,
+                                );
+                            }
+                        }
                         return Ok(None);
                     }
                 }
                 self.clear_composition_state();
                 Ok(Some(commit_text))
             }
-            CandidateOrigin::PureRust { commit_text, .. } => {
+            CandidateOrigin::PureRust {
+                commit_text,
+                consumed_len,
+                canonical,
+                ..
+            } => {
                 let prefix = self.confirmed_non_ascii_prefix();
                 let final_commit = if !prefix.is_empty() {
                     format!("{}{}", self.convert_opencc(&prefix), commit_text)
                 } else {
                     commit_text
                 };
+                let remaining = self.raw_input[consumed_len..]
+                    .trim_start_matches(['\'', ' '])
+                    .to_string();
+                let code = self.raw_input[..consumed_len].to_string();
+                self.track_phrase_selection(
+                    &canonical,
+                    &code,
+                    remaining.is_empty(),
+                    imported,
+                    retention,
+                );
+                let pending = (
+                    std::mem::take(&mut self.pending_phrase_text),
+                    std::mem::take(&mut self.pending_phrase_code),
+                    self.pending_phrase_selections,
+                );
                 self.clear_composition_state();
+                if !remaining.is_empty() {
+                    (
+                        self.pending_phrase_text,
+                        self.pending_phrase_code,
+                        self.pending_phrase_selections,
+                    ) = pending;
+                    self.raw_input = remaining;
+                    self.process_key_pure_rust(0, clipboard, imported, retention)?;
+                }
                 Ok(Some(final_commit))
             }
         }
@@ -2683,6 +2998,9 @@ impl EngineState {
     pub fn empty_action(&mut self, commit_text: Option<String>) -> InputAction {
         if let Some(ch) = commit_text.as_deref().and_then(|text| text.chars().next_back()) {
             self.last_committed_char = Some(ch);
+            if !crate::ret::is_cjk(ch) {
+                self.reset_commit_context();
+            }
         }
         let page_size = self.current_page.page_size.max(1);
         let page_items: Vec<CandidateItem> = self
@@ -2769,11 +3087,125 @@ mod personalization_tests {
                 frecency_score: 0.0,
             },
             CandidateOrigin::PureRust {
+                consumed_len: code.len(),
                 features: [0.0; 9],
                 canonical: word.into(),
                 commit_text: word.into(),
             },
         )]);
+    }
+
+    #[test]
+    fn portable_homophones_span_many_five_item_desktop_pages() {
+        let (mut e, clip, imp, mut r) = fixture();
+        for platform in ["", "linux", "windows"] {
+            e.config.platform = platform.into();
+            for (schema, code, minimum) in [
+                (SchemaKind::RimeIce, "shi", 40),
+                (SchemaKind::DoublePinyinFlypy, "ui", 40),
+                (SchemaKind::RimeIce, "yishi", 13),
+            ] {
+                e.clear_composition_state();
+                e.schema = schema;
+                e.raw_input = code.into();
+                let mut action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+                assert_eq!(action.page.page_size, 5);
+                assert_eq!(action.candidates.len(), 5);
+                assert!(action.page.has_next);
+                let first_page = action.candidates.clone();
+                let ignored = e
+                    .process_key_pure_rust('6' as u32, &clip, &imp, &mut r)
+                    .unwrap();
+                assert!(ignored.commit_text.is_none());
+                assert!(ignored
+                    .candidates
+                    .iter()
+                    .map(|c| (&c.text, &c.comment, c.index))
+                    .eq(first_page.iter().map(|c| (&c.text, &c.comment, c.index))));
+                let mut seen = HashSet::new();
+                loop {
+                    assert_eq!(action.page.page_size, 5);
+                    assert!(action.candidates.len() <= 5);
+                    for candidate in &action.candidates {
+                        assert!(seen.insert(candidate.text.clone()), "{platform} {code}");
+                    }
+                    if !action.page.has_next {
+                        break;
+                    }
+                    assert!(seen.len() < 300, "pagination did not terminate");
+                    action = e
+                        .process_key_pure_rust(0xFF56, &clip, &imp, &mut r)
+                        .unwrap();
+                    assert!(action.page.has_prev);
+                }
+                assert!(seen.len() >= minimum, "{platform} {code}: {}", seen.len());
+            }
+        }
+    }
+
+    #[test]
+    fn android_pages_have_twenty_four_items_and_select_beyond_five() {
+        for (platform, expected_size) in [("android", 24), ("linux", 5), ("windows", 5), ("", 5)] {
+            let mut e = EngineState::new(EngineConfig {
+                platform: platform.into(),
+                schema: SchemaKind::RimeIce,
+                ..Default::default()
+            });
+            assert_eq!(e.current_page.page_size, expected_size);
+            e.raw_input = "github".into();
+            assert_eq!(e.build_passthrough_action().page.page_size, expected_size);
+        }
+        let (mut e, clip, imp, mut r) = fixture();
+        e.config.platform = "android".into();
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "shi"),
+            (SchemaKind::DoublePinyinFlypy, "ui"),
+        ] {
+            e.schema = schema;
+            e.raw_input = code.into();
+            let first = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            assert_eq!(first.page.page_size, 24);
+            assert_eq!(first.candidates.len(), 24);
+            assert!(first.page.has_next);
+            let second = e
+                .process_key_pure_rust(0xFF56, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(second.page.page_size, 24);
+            assert_eq!(second.page.page_index, 1);
+            assert!(second.page.has_prev);
+            assert!(second
+                .candidates
+                .iter()
+                .all(|c| !first.candidates.iter().any(|p| p.text == c.text)));
+            let back = e
+                .process_key_pure_rust(0xFF55, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(back.page.page_index, 0);
+            assert!(!back.page.has_prev);
+            assert!(back
+                .candidates
+                .iter()
+                .map(|c| (&c.text, &c.comment, c.index))
+                .eq(first
+                    .candidates
+                    .iter()
+                    .map(|c| (&c.text, &c.comment, c.index))));
+            let expected = first.candidates[10].text.clone();
+            assert_eq!(
+                e.select_candidate_on_backend(10, &clip, &imp, &mut r)
+                    .unwrap(),
+                Some(expected)
+            );
+            assert!(e.raw_input.is_empty());
+            e.raw_input = code.into();
+            let first = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            let expected = first.candidates[8].text.clone();
+            let selected = e
+                .process_key_pure_rust('9' as u32, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(selected.commit_text, Some(expected));
+            assert!(e.raw_input.is_empty());
+        }
     }
 
     #[test]
@@ -2872,6 +3304,252 @@ mod personalization_tests {
         assert!(!overlay.iter().any(|(c, _)| c.comment == "简拼"));
     }
 
+    fn assert_personal_acronym(
+        e: &mut EngineState,
+        clip: &ClipboardManager,
+        imp: &ImportedLexiconIndex,
+        r: &mut RetentionEngine,
+        word: &str,
+        acronym: &str,
+    ) {
+        e.reset_commit_context();
+        type_code(e, acronym, clip, imp, r);
+        assert!(
+            e.current_candidates
+                .iter()
+                .take(3)
+                .any(|c| c.text == word && c.comment == "简拼"),
+            "PureRust {:?}: {acronym} -> {:?}",
+            e.schema,
+            e.current_candidates
+        );
+        e.clear_composition_state();
+
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        {
+            // Exercise the native overlay merge with a synthetic Rime snapshot.
+            e.raw_input = acronym.into();
+            let snapshot = rime_ffi::RimeSnapshot {
+                commit_text: None,
+                preedit: acronym.into(),
+                cursor_utf8: acronym.len(),
+                page_index: 0,
+                page_size: 5,
+                has_prev: false,
+                has_next: false,
+                candidates: vec![rime_ffi::RimeRawCandidate {
+                    text: "词".into(),
+                    comment: String::new(),
+                }],
+            };
+            let action = e.apply_rime_snapshot(snapshot, false, false, clip, imp, r);
+            assert!(
+                action
+                    .candidates
+                    .iter()
+                    .take(3)
+                    .any(|c| c.text == word && c.comment == "简拼"),
+                "native overlay {:?}: {acronym} -> {:?}",
+                e.schema,
+                action.candidates
+            );
+            e.clear_composition_state();
+        }
+    }
+
+    #[test]
+    fn spaced_typed_commits_gain_personal_acronyms_in_both_schemas() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            for (word, pinyin, acronym) in [
+                ("测试词组", "ce shi ci zu", "cscz"),
+                ("我要打卡", "wo yao da ka", "wydk"),
+                ("我要打卡新词组", "wo yao da ka xin ci zu", "wydkxcz"),
+                (
+                    "我要打卡你好世界",
+                    "wo yao da ka ni hao shi jie",
+                    "wydknhsj",
+                ),
+            ] {
+                for interval_ms in [5_000, 60_000, 3_600_000] {
+                    let (mut e, clip, imp, mut r) = fixture();
+                    e.schema = schema;
+                    let code = if schema == SchemaKind::RimeIce {
+                        pinyin.split_whitespace().collect::<String>()
+                    } else {
+                        crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin)
+                    };
+                    let now = RetentionEngine::now_epoch_ms();
+                    e.record_candidate_commit(word, &code, None, &imp, &mut r, now);
+                    assert!(!r.user_phrases.contains_key(word));
+                    e.record_candidate_commit(word, &code, None, &imp, &mut r, now + interval_ms);
+                    assert!(r.frecency[word] < 2.0);
+                    let phrase = r.user_phrases.get(word).unwrap();
+                    assert_eq!(phrase.source, "typed");
+                    assert_eq!(phrase.count, 2);
+                    assert_eq!(phrase.acronym, acronym);
+                    assert_eq!(phrase.updated_ms, now + interval_ms);
+                    assert_personal_acronym(&mut e, &clip, &imp, &mut r, word, acronym);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn composed_phrase_gains_count_and_acronym_after_later_commit() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.schema = schema;
+            let codes = if schema == SchemaKind::RimeIce {
+                ["wo", "yao", "da", "ka"]
+            } else {
+                ["wo", "yk", "da", "ka"]
+            };
+            for (i, (word, code)) in ["我", "要", "打", "卡"].into_iter().zip(codes).enumerate() {
+                e.track_phrase_selection(word, code, i == 3, &imp, &mut r);
+            }
+            let phrase = &r.user_phrases["我要打卡"];
+            assert_eq!(phrase.source, "typed");
+            assert_eq!(phrase.count, 1);
+            let now = phrase.updated_ms + 10_000;
+            // Legacy entries may have no stored acronym yet.
+            r.user_phrases.get_mut("我要打卡").unwrap().acronym.clear();
+            r.frecency.insert("我要打卡".into(), 0.1);
+            e.record_candidate_commit("我要打卡", &codes.concat(), None, &imp, &mut r, now);
+            assert!(r.frecency["我要打卡"] < 1.5);
+            let phrase = &r.user_phrases["我要打卡"];
+            assert_eq!(phrase.count, 2);
+            assert_eq!(phrase.updated_ms, now);
+            assert_eq!(phrase.acronym, "wydk");
+            // Count must keep the acronym eligible after frecency decays.
+            r.frecency.insert("我要打卡".into(), 0.0);
+            assert_eq!(r.query_acronym_phrases("wydk")[0].word, "我要打卡");
+            assert_personal_acronym(&mut e, &clip, &imp, &mut r, "我要打卡", "wydk");
+        }
+    }
+
+    #[test]
+    fn contextual_prefix_prediction_commits_in_both_schemas() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            for (context, code, expected) in [
+                ("正", "q", "确"),
+                ("输入", "f", "法"),
+                ("人工", "z", "智能"),
+                ("人工", "zn", "智能"),
+                ("没", "g", "关系"),
+                ("没", "gx", "关系"),
+            ] {
+                let (mut e, clip, imp, mut r) = fixture();
+                e.schema = schema;
+                // Load bundled resources before starting the six-second context window.
+                type_code(&mut e, "q", &clip, &imp, &mut r);
+                e.clear_composition_state();
+                offer(&mut e, context, "test");
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                type_code(&mut e, code, &clip, &imp, &mut r);
+                assert_eq!(
+                    e.canonical_at(0),
+                    Some(expected),
+                    "{schema:?}: {context} + {code}"
+                );
+                assert!(
+                    matches!(&e.candidate_origins[0], CandidateOrigin::PureRust { consumed_len, .. } if *consumed_len == code.len())
+                );
+                let selected = e
+                    .process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                assert_eq!(selected.commit_text.as_deref(), Some(expected));
+                assert_eq!(e.speech_context_before(), format!("{context}{expected}"));
+                assert!(r.context_bigrams[context].contains_key(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_prefix_prediction_preserves_pins_and_stronger_personal_words() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "q", &clip, &imp, &mut r);
+        e.clear_composition_state();
+        offer(&mut e, "正", "zheng");
+        e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+            .unwrap();
+        r.context_bigrams.insert(
+            "正".into(),
+            HashMap::from([("确".into(), 8.0), ("情绪".into(), 1.0)]),
+        );
+        r.pinned_words.insert("确".into());
+        type_code(&mut e, "q", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some("确"));
+        assert!(e.current_candidates[0].pinned);
+        e.clear_composition_state();
+        r.pinned_words.clear();
+        r.record_selection_at("情绪", RetentionEngine::now_epoch_ms(), 100.0);
+        type_code(&mut e, "q", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some("情绪"));
+    }
+
+    #[test]
+    fn contextual_prefix_prediction_uses_accumulated_context_and_resets() {
+        let (mut e, clip, imp, mut r) = fixture();
+        type_code(&mut e, "q", &clip, &imp, &mut r);
+        e.clear_composition_state();
+        for word in ["输", "入"] {
+            offer(&mut e, word, "test");
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+        }
+        type_code(&mut e, "f", &clip, &imp, &mut r);
+        assert_eq!(e.canonical_at(0), Some("法"));
+        let (mut expired, _, imp, mut r) = fixture();
+        let now = RetentionEngine::now_epoch_ms();
+        expired.record_candidate_commit("人", "ren", None, &imp, &mut r, now.saturating_sub(7000));
+        expired.record_candidate_commit("工", "gong", None, &imp, &mut r, now);
+        assert_eq!(expired.speech_context_before(), "工");
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let (mut baseline, clip, imp, mut r) = fixture();
+            baseline.schema = schema;
+            type_code(&mut baseline, "q", &clip, &imp, &mut r);
+            let expected = baseline.canonical_at(0).unwrap().to_string();
+            assert_ne!(expected, "确");
+            for reset_key in [0x0d, '.' as u32, '。' as u32, 0x1b] {
+                let (mut e, clip, imp, mut r) = fixture();
+                e.schema = schema;
+                offer(&mut e, "正", "zheng");
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                e.process_key(reset_key, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                assert!(e.context_window.is_empty());
+                type_code(&mut e, "q", &clip, &imp, &mut r);
+                assert_eq!(
+                    e.canonical_at(0),
+                    Some(expected.as_str()),
+                    "{schema:?}: {reset_key}"
+                );
+                e.clear_composition_state();
+                offer(&mut e, "正", "zheng");
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                type_code(&mut e, "q", &clip, &imp, &mut r);
+                assert_eq!(e.canonical_at(0), Some("确"));
+                e.process_key(reset_key, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+                assert!(
+                    e.context_window.is_empty(),
+                    "composing reset: {schema:?}: {reset_key}"
+                );
+            }
+            let (mut e, clip, imp, mut r) = fixture();
+            e.schema = schema;
+            offer(&mut e, "正", "zheng");
+            e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+            e.last_committed_ms = RetentionEngine::now_epoch_ms().saturating_sub(6001);
+            type_code(&mut e, "q", &clip, &imp, &mut r);
+            assert_eq!(e.canonical_at(0), Some(expected.as_str()));
+        }
+    }
+
     #[test]
     fn one_key_context_continuation_commits_and_expires_without_idle_space_change() {
         let (mut e, clip, imp, mut r) = fixture();
@@ -2927,6 +3605,49 @@ mod personalization_tests {
         e.config.adaptive_learning = false;
         type_code(&mut e, "nihoa", &clip, &imp, &mut r);
         assert!(!e.current_candidates.iter().any(|c| c.comment == "纠错"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_page_zero_promotes_contextual_prefix_with_portable_origin() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.schema = schema;
+            type_code(&mut e, "q", &clip, &imp, &mut r);
+            e.clear_composition_state();
+            e.record_candidate_commit(
+                "正",
+                "zheng",
+                None,
+                &imp,
+                &mut r,
+                RetentionEngine::now_epoch_ms(),
+            );
+            e.raw_input = "q".into();
+            let snapshot = rime_ffi::RimeSnapshot {
+                commit_text: None,
+                preedit: "q".into(),
+                cursor_utf8: 1,
+                page_index: 0,
+                page_size: 5,
+                has_prev: false,
+                has_next: false,
+                candidates: vec![rime_ffi::RimeRawCandidate {
+                    text: "去".into(),
+                    comment: String::new(),
+                }],
+            };
+            let action = e.apply_rime_snapshot(snapshot, false, false, &clip, &imp, &r);
+            assert_eq!(action.candidates[0].text, "确");
+            assert!(
+                matches!(&e.candidate_origins[0], CandidateOrigin::PureRust { consumed_len: 1, canonical, .. } if canonical == "确")
+            );
+            let commit = e
+                .process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(commit.commit_text.as_deref(), Some("确"));
+            assert_eq!(e.speech_context_before(), "正确");
+        }
     }
 
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
@@ -3050,6 +3771,75 @@ mod personalization_tests {
                 "{latency:?}"
             );
         }
+    }
+
+    #[test]
+    fn chinese_punctuation_commits_composition_and_learns_selection() {
+        let punctuation = [
+            (',', "，"),
+            ('.', "。"),
+            ('?', "？"),
+            ('!', "！"),
+            (';', "；"),
+            (':', "："),
+            ('\\', "、"),
+            ('，', "，"),
+            ('。', "。"),
+            ('？', "？"),
+            ('！', "！"),
+            ('；', "；"),
+            ('：', "："),
+            ('、', "、"),
+        ];
+        for (ch, expected) in punctuation {
+            let (mut e, clip, imp, mut r) = fixture();
+            assert_eq!(
+                e.process_key_pure_rust(ch as u32, &clip, &imp, &mut r)
+                    .unwrap()
+                    .commit_text
+                    .as_deref(),
+                Some(expected),
+            );
+            type_code(&mut e, "nihao", &clip, &imp, &mut r);
+            assert_eq!(
+                e.process_key_pure_rust(ch as u32, &clip, &imp, &mut r)
+                    .unwrap()
+                    .commit_text,
+                Some(format!("你好{expected}")),
+            );
+            assert!(r.decayed_score_at("你好", RetentionEngine::now_epoch_ms()) > 0.0);
+            assert!(e.raw_input.is_empty() && e.composing.is_empty());
+            assert!(e.current_candidates.is_empty() && e.candidate_origins.is_empty());
+            assert_eq!(e.last_committed_char, expected.chars().last());
+        }
+        for ch in [',', '，'] {
+            let (mut e, clip, imp, mut r) = fixture();
+            type_code(&mut e, "nihao", &clip, &imp, &mut r);
+            assert_eq!(
+                e.process_key(ch as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap()
+                    .commit_text
+                    .as_deref(),
+                Some("你好，"),
+            );
+            assert!(r.decayed_score_at("你好", RetentionEngine::now_epoch_ms()) > 0.0);
+            assert!(e.raw_input.is_empty() && e.current_candidates.is_empty());
+        }
+        let (mut e, clip, imp, mut r) = fixture();
+        offer(&mut e, "我", "woyao");
+        if let CandidateOrigin::PureRust { consumed_len, .. } = &mut e.candidate_origins[0] {
+            *consumed_len = 2;
+        }
+        assert_eq!(
+            e.process_key(',' as u32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                .unwrap()
+                .commit_text
+                .as_deref(),
+            Some("我，"),
+        );
+        assert!(
+            e.raw_input.is_empty() && e.composing.is_empty() && e.current_candidates.is_empty()
+        );
     }
 
     #[test]

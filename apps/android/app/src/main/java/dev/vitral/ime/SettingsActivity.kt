@@ -57,6 +57,9 @@ import org.json.JSONObject
 class SettingsActivity : ComponentActivity() {
     private var toastText by mutableStateOf("")
     private var toastSeq by mutableIntStateOf(0)
+    private var requestedTab by mutableIntStateOf(0)
+    private var requestedModelGroup by mutableStateOf<String?>(null)
+    private var requestedModelCap by mutableStateOf<String?>(null)
     private var busy by mutableStateOf(false)
     private var imeEnabled by mutableStateOf(false)
     private var imeDefault by mutableStateOf(false)
@@ -64,9 +67,28 @@ class SettingsActivity : ComponentActivity() {
     private var aiOutput by mutableStateOf("")
     private var clipboardState by mutableStateOf<JSONObject?>(null)
 
+    private fun summarizeNotice(raw: String): String {
+        val compact = raw.replace(Regex("\\s+"), " ").trim()
+        if (compact.isEmpty()) return ""
+        val lower = compact.lowercase(Locale.US)
+        if ("401" in lower && ("webdav" in lower || "propfind" in lower || "authorization" in lower)) {
+            return "WebDAV 认证失败 (401)：请检查账户、密码或端点路径"
+        }
+        if ("403" in lower && ("webdav" in lower || "propfind" in lower)) {
+            return "WebDAV 权限被拒 (403)：请检查目录权限"
+        }
+        if ("404" in lower && ("webdav" in lower || "propfind" in lower)) {
+            return "WebDAV 路径不存在 (404)：请检查端点路径"
+        }
+        val stripped = compact.substringBefore("<html").substringBefore("<!DOCTYPE").trim()
+        val chosen = stripped.ifEmpty { compact }
+        return if (chosen.length > 140) chosen.take(137) + "…" else chosen
+    }
+
     private fun showToast(msg: String) {
-        if (msg.isBlank()) return
-        toastText = msg
+        val clean = summarizeNotice(msg)
+        if (clean.isBlank()) return
+        toastText = clean
         toastSeq++
     }
 
@@ -276,15 +298,39 @@ class SettingsActivity : ComponentActivity() {
 
     private var discoveryStarted = false
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.hasExtra("tab")) {
+            requestedTab = intent.getIntExtra("tab", 0).coerceIn(0, 3)
+        }
+        if (intent.hasExtra("model_group")) {
+            requestedModelGroup = intent.getStringExtra("model_group")
+            requestedModelCap = intent.getStringExtra("model_cap")
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        requestedTab = intent.getIntExtra("tab", 0).coerceIn(0, 3)
+        requestedModelGroup = intent.getStringExtra("model_group")
+        requestedModelCap = intent.getStringExtra("model_cap")
         refreshInbox()
         refreshImeStatus()
 
         setContent {
             val config = remember { Core.settings(this@SettingsActivity) }
-            var tab by remember { mutableIntStateOf(0) }
+            var tab by remember { mutableIntStateOf(requestedTab) }
+            var modelGroup by remember { mutableStateOf(requestedModelGroup) }
+            var modelCap by remember { mutableStateOf(requestedModelCap) }
+            LaunchedEffect(requestedTab, requestedModelGroup, requestedModelCap) {
+                tab = requestedTab
+                if (requestedModelGroup != null) {
+                    modelGroup = requestedModelGroup
+                    modelCap = requestedModelCap
+                }
+            }
             var themeMode by remember { mutableStateOf(config.optString("theme", "system")) }
             val systemDark = isSystemInDarkTheme()
             val dark =
@@ -312,6 +358,8 @@ class SettingsActivity : ComponentActivity() {
                     config.optString("schema", "double_pinyin_flypy") == "double_pinyin_flypy"
                 )
             }
+            var fuzzyPinyin by remember { mutableStateOf(config.optBoolean("fuzzy_pinyin", false)) }
+            var syllableSplit by remember { mutableStateOf(config.optBoolean("syllable_split", false)) }
             var openccMode by remember { mutableStateOf(config.optString("opencc_mode", "simplified")) }
             var sublabelMode by remember { mutableStateOf(config.optString("mobile_sublabel_mode", "dual")) }
             var keyboardHeight by remember { mutableStateOf(config.optString("mobile_keyboard_height", "standard")) }
@@ -342,9 +390,22 @@ class SettingsActivity : ComponentActivity() {
             var source by remember { mutableStateOf("") }
             var textFieldsDirty by remember { mutableStateOf(false) }
 
-            fun persistConfig(feedback: String? = null) {
+            fun persistConfig(feedback: String? = null, onSaved: (() -> Unit)? = null) {
+                for (trimKey in listOf("koofr_endpoint", "koofr_username", "ai_endpoint", "ai_model")) {
+                    if (config.has(trimKey) && !config.isNull(trimKey)) {
+                        config.put(trimKey, config.optString(trimKey).trim())
+                    }
+                }
+                if (config.has("koofr_password") && !config.isNull("koofr_password")) {
+                    config.put(
+                        "koofr_password",
+                        config.optString("koofr_password").trim('\r', '\n'),
+                    )
+                }
                 config
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
+                    .put("fuzzy_pinyin", fuzzyPinyin)
+                    .put("syllable_split", syllableSplit)
                     .put("opencc_mode", openccMode)
                     .put("theme", themeMode)
                     .put("mobile_sublabel_mode", sublabelMode)
@@ -362,7 +423,11 @@ class SettingsActivity : ComponentActivity() {
                     r.onSuccess {
                         textFieldsDirty = false
                         if (!feedback.isNullOrBlank()) showToast(feedback)
-                    }.onFailure { showToast(it.message.orEmpty()) }
+                        onSaved?.invoke()
+                    }.onFailure {
+                        busy = false
+                        showToast(it.message.orEmpty())
+                    }
                 }
             }
 
@@ -385,7 +450,7 @@ class SettingsActivity : ComponentActivity() {
 
             LaunchedEffect(toastSeq) {
                 if (toastSeq > 0) {
-                    delay(2400)
+                    delay(if (toastText.length > 24) 3600 else 2400)
                     toastText = ""
                 }
             }
@@ -700,6 +765,28 @@ class SettingsActivity : ComponentActivity() {
                                             onSelect = {
                                                 flypy = it
                                                 persistConfig(if (it) "已切换小鹤双拼" else "已切换雾凇全拼")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(10.dp))
+                                        GlassToggleRow(
+                                            "模糊音容错",
+                                            "平翘舌（z/zh、c/ch、s/sh）、前后鼻音（an/ang、en/eng、in/ing）及 l/n、f/h 互通",
+                                            checked = fuzzyPinyin,
+                                            showDivider = true,
+                                            onCheckedChange = {
+                                                fuzzyPinyin = it
+                                                persistConfig(if (it) "已开启模糊音容错" else "已关闭模糊音容错")
+                                            },
+                                        )
+                                        GlassToggleRow(
+                                            "全拼分词模式",
+                                            "开启后零声母歧义只显示拆分词（如 dian → di'an）；关闭时优先连词，分词权重低",
+                                            checked = syllableSplit,
+                                            showDivider = false,
+                                            onCheckedChange = {
+                                                syllableSplit = it
+                                                persistConfig(if (it) "已开启全拼分词模式" else "已关闭全拼分词模式（优先连词）")
                                             },
                                         )
 
@@ -1050,11 +1137,12 @@ class SettingsActivity : ComponentActivity() {
                                                 enabled = !busy && !offline,
                                                 modifier = Modifier.weight(1f),
                                                 onClick = {
-                                                    persistConfig()
                                                     busy = true
-                                                    Core.call(this@SettingsActivity, "poll-services", background = true) { r ->
-                                                        busy = false
-                                                        showToast(r.fold({ "已完成 Koofr 同步" }, { it.message.orEmpty() }))
+                                                    persistConfig {
+                                                        Core.call(this@SettingsActivity, "poll-services", background = true) { r ->
+                                                            busy = false
+                                                            showToast(r.fold({ "已完成 Koofr 同步" }, { it.message.orEmpty() }))
+                                                        }
                                                     }
                                                 },
                                             )
@@ -1064,30 +1152,32 @@ class SettingsActivity : ComponentActivity() {
                                                 enabled = !busy && !offline,
                                                 onClick = {
                                                     busy = true
-                                                    Core.call(
-                                                        this@SettingsActivity,
-                                                        "restore-from-koofr",
-                                                        json("config" to config),
-                                                        true,
-                                                    ) { r ->
-                                                        r.onSuccess { value ->
-                                                            val result = value as JSONObject
-                                                            val restored = result.getJSONObject("preferences")
-                                                            for (key in restored.keys()) config.put(key, restored.get(key))
-                                                            flypy = config.optString("schema") == "double_pinyin_flypy"
-                                                            capacity = config.optInt("clipboard_ring_capacity", 50).toFloat()
-                                                            Core.save(this@SettingsActivity, config) { saved ->
-                                                                busy = false
-                                                                showToast(
-                                                                    saved.fold(
-                                                                        { "已恢复 ${result.optInt("snapshots_applied")} 项" },
-                                                                        { it.message.orEmpty() },
+                                                    persistConfig {
+                                                        Core.call(
+                                                            this@SettingsActivity,
+                                                            "restore-from-koofr",
+                                                            json("config" to config),
+                                                            true,
+                                                        ) { r ->
+                                                            r.onSuccess { value ->
+                                                                val result = value as JSONObject
+                                                                val restored = result.getJSONObject("preferences")
+                                                                for (key in restored.keys()) config.put(key, restored.get(key))
+                                                                flypy = config.optString("schema") == "double_pinyin_flypy"
+                                                                capacity = config.optInt("clipboard_ring_capacity", 50).toFloat()
+                                                                Core.save(this@SettingsActivity, config) { saved ->
+                                                                    busy = false
+                                                                    showToast(
+                                                                        saved.fold(
+                                                                            { "已恢复 ${result.optInt("snapshots_applied")} 项" },
+                                                                            { it.message.orEmpty() },
+                                                                        )
                                                                     )
-                                                                )
+                                                                }
+                                                            }.onFailure {
+                                                                busy = false
+                                                                showToast(it.message.orEmpty())
                                                             }
-                                                        }.onFailure {
-                                                            busy = false
-                                                            showToast(it.message.orEmpty())
                                                         }
                                                     }
                                                 },
@@ -1098,13 +1188,15 @@ class SettingsActivity : ComponentActivity() {
                                                 enabled = !busy && !offline,
                                                 onClick = {
                                                     busy = true
-                                                    Core.call(this@SettingsActivity, "storage", background = true) { r ->
-                                                        busy = false
-                                                        r.onSuccess {
-                                                            val v = it as JSONObject
-                                                            storageUsage = Triple(v.optLong("lexicon"), v.optLong("clipboard"), v.optLong("relay"))
-                                                            showToast("已刷新云端用量")
-                                                        }.onFailure { showToast(it.message.orEmpty()) }
+                                                    persistConfig {
+                                                        Core.call(this@SettingsActivity, "storage", background = true) { r ->
+                                                            busy = false
+                                                            r.onSuccess {
+                                                                val v = it as JSONObject
+                                                                storageUsage = Triple(v.optLong("lexicon"), v.optLong("clipboard"), v.optLong("relay"))
+                                                                showToast("已刷新云端用量")
+                                                            }.onFailure { showToast(it.message.orEmpty()) }
+                                                        }
                                                     }
                                                 },
                                             )
@@ -1242,206 +1334,459 @@ class SettingsActivity : ComponentActivity() {
                                             Text("正在读取本机模型状态…", fontSize = 13.sp, color = palette.textSecondary)
                                         }
                                     } else {
-                                        for (idx in 0 until models.length()) {
-                                            val m = models.getJSONObject(idx)
-                                            val id = m.getString("id")
-                                            val name = m.getString("name")
-                                            val desc = m.optString("description")
-                                            val version = m.optString("version")
-                                            val fit = m.optString("fit")
-                                            val installed = m.optBoolean("installed")
-                                            val bundled = m.optBoolean("bundled")
-                                            val enabled = m.optBoolean("enabled")
-                                            val active = m.optBoolean("active")
-                                            val minRam = m.optLong("min_ram_mb", 0L)
-                                            val recRam = m.optLong("recommended_ram_mb", 0L)
-                                            val files = m.optJSONArray("files")
-                                            var totalBytes = 0L
-                                            if (files != null) {
-                                                for (fi in 0 until files.length()) {
-                                                    totalBytes += files.getJSONObject(fi).optLong("size", 0L)
+                                        data class ModelGroupDef(
+                                            val id: String,
+                                            val title: String,
+                                            val subtitle: String,
+                                            val caps: List<String>,
+                                        )
+                                        data class CapDef(
+                                            val id: String,
+                                            val title: String,
+                                            val subtitle: String,
+                                        )
+                                        val groupDefs =
+                                            listOf(
+                                                ModelGroupDef(
+                                                    "input",
+                                                    "输入与语言增强",
+                                                    "万象长句语法解码与上下文语义重排",
+                                                    listOf("grammar", "reranker"),
+                                                ),
+                                                ModelGroupDef(
+                                                    "multimodal",
+                                                    "多模态交互",
+                                                    "离线手写认字与本地语音转写",
+                                                    listOf("handwriting", "voice"),
+                                                ),
+                                                ModelGroupDef(
+                                                    "ai",
+                                                    "本地大模型与智能预测",
+                                                    "端侧语境预测、用户画像蒸馏与离线 AI 工具",
+                                                    listOf("local_llm"),
+                                                ),
+                                            )
+                                        val capDefs =
+                                            mapOf(
+                                                "grammar" to CapDef("grammar", "中文语法模型", "提升全拼与双拼长句切分及语境排序"),
+                                                "reranker" to CapDef("reranker", "语义重排模型", "连续手写模糊字位重排与语义增强"),
+                                                "handwriting" to CapDef("handwriting", "离线手写识别", "单字查音与连续手写联句（含生僻字索引）"),
+                                                "voice" to CapDef("voice", "离线语音转写", "按硬件档位选择轻快均衡或高精多语方言"),
+                                                "local_llm" to CapDef("local_llm", "本地 Qwen3 推理", "按内存档位选择低 / 中 / 高精端侧预测与 AI"),
+                                            )
+                                        val allModels = (0 until models.length()).map { models.getJSONObject(it) }
+                                        fun modelCapOf(m: JSONObject) =
+                                            m.optString("capability").ifEmpty {
+                                                m.optJSONObject("model")?.optString("capability").orEmpty()
+                                            }
+                                        fun modelTierLabel(m: JSONObject): String {
+                                            val rec = m.optLong("recommended_ram_mb", 0L)
+                                            return when {
+                                                rec <= 2048L -> "低配 · 轻量档"
+                                                rec <= 6144L -> "中配 · 均衡档"
+                                                else -> "高配 · 旗舰档"
+                                            }
+                                        }
+                                        val knownCaps = groupDefs.flatMap { it.caps }.toSet()
+                                        val extraCaps = allModels.map(::modelCapOf).filter { it.isNotEmpty() && it !in knownCaps }.distinct()
+                                        val effectiveGroups =
+                                            if (extraCaps.isEmpty()) groupDefs
+                                            else groupDefs + ModelGroupDef("other", "扩展模型", "自定义目录中的扩展能力模型", extraCaps)
+
+                                        // Active downloads summary strip on root/mid levels
+                                        val activeDls = allModels.filter { it.optJSONObject("download")?.optString("status") == "downloading" }
+                                        if (activeDls.isNotEmpty() && modelCap == null) {
+                                            GlassPanel(tinted = true) {
+                                                Text("正在下载 (${activeDls.size})", fontSize = 12.5.sp, fontWeight = FontWeight.SemiBold, color = palette.accentText)
+                                                Spacer(Modifier.height(6.dp))
+                                                activeDls.forEach { dm ->
+                                                    val dl = dm.optJSONObject("download")
+                                                    val total = dl?.optLong("total_bytes", 1L)?.coerceAtLeast(1L) ?: 1L
+                                                    val done = dl?.optLong("downloaded_bytes", 0L)?.coerceIn(0L, total) ?: 0L
+                                                    val pct = ((done * 100L) / total).toInt()
+                                                    Row(
+                                                        Modifier.fillMaxWidth().padding(vertical = 3.dp),
+                                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                                    ) {
+                                                        Text(dm.optString("name"), fontSize = 12.sp, color = palette.textPrimary, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                                        Text("$pct%", fontSize = 12.sp, fontFamily = FontFamily.Monospace, color = palette.accentText)
+                                                    }
                                                 }
                                             }
-                                            val dl = m.optJSONObject("download")
-                                            val dlStatus = dl?.optString("status").orEmpty()
-                                            val downloading = dlStatus == "downloading"
-                                            val statusText =
-                                                when {
-                                                    downloading -> "下载中"
-                                                    active && installed -> "已启用"
-                                                    active && bundled -> "内置启用"
-                                                    installed -> "已下载"
-                                                    bundled -> "本地内置"
-                                                    else -> "未下载"
-                                                }
-                                            val (badgeFg, badgeBg) =
-                                                when {
-                                                    downloading -> palette.accentText to palette.accentSoft
-                                                    active -> palette.success to palette.successSoft
-                                                    fit == "exceeds_ram" -> palette.warning to palette.warningSoft
-                                                    installed || bundled -> palette.accentText to palette.accentSoft
-                                                    else -> palette.textSecondary to palette.elevated
-                                                }
+                                        }
 
-                                            GlassPanel {
-                                                GlassSectionHeader(
-                                                    name,
-                                                    desc,
-                                                    trailing = { GlassPillBadge(statusText, badgeFg, badgeBg) },
-                                                )
-                                                Row(
-                                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                                    verticalAlignment = Alignment.CenterVertically,
-                                                ) {
-                                                    GlassPillBadge("v$version", palette.textSecondary, palette.elevated)
-                                                    GlassPillBadge(formatBytes(totalBytes), palette.accentText, palette.accentSoft)
-                                                    GlassPillBadge(
-                                                        when (fit) {
-                                                            "recommended" -> "内存推荐"
-                                                            "compatible" -> "内存兼容"
-                                                            "exceeds_ram" -> "超出推荐内存"
-                                                            else -> fit
-                                                        },
-                                                        if (fit == "exceeds_ram") palette.warning else palette.success,
-                                                        if (fit == "exceeds_ram") palette.warningSoft else palette.successSoft,
-                                                    )
-                                                }
-                                                Spacer(Modifier.height(6.dp))
-                                                Text(
-                                                    String.format(
-                                                        Locale.US,
-                                                        "内存要求：最低 %.1f GB · 推荐 %.1f GB",
-                                                        minRam / 1024.0,
-                                                        recRam / 1024.0,
-                                                    ),
-                                                    fontSize = 11.5.sp,
-                                                    color = palette.textSecondary,
-                                                )
-
-                                                if (downloading && dl != null) {
-                                                    val dlTotal = dl.optLong("total_bytes", totalBytes).coerceAtLeast(1L)
-                                                    val dlDone = dl.optLong("downloaded_bytes", 0L).coerceIn(0L, dlTotal)
-                                                    val prog = dlDone.toFloat() / dlTotal.toFloat()
-                                                    Spacer(Modifier.height(10.dp))
-                                                    Box(
-                                                        Modifier.fillMaxWidth()
-                                                            .height(6.dp)
-                                                            .clip(CircleShape)
-                                                            .background(palette.elevated)
-                                                    ) {
-                                                        Box(
-                                                            Modifier.fillMaxWidth(prog)
-                                                                .fillMaxHeight()
-                                                                .clip(CircleShape)
-                                                                .background(palette.accent)
-                                                        )
-                                                    }
-                                                    Spacer(Modifier.height(4.dp))
-                                                    Text(
-                                                        "${formatBytes(dlDone)} / ${formatBytes(dlTotal)} (${(prog * 100).roundToInt()}%)",
-                                                        fontSize = 11.5.sp,
-                                                        fontFamily = FontFamily.Monospace,
-                                                        color = palette.textSecondary,
-                                                    )
-                                                } else if (dlStatus == "failed") {
-                                                    val err = dl?.optString("error").orEmpty()
-                                                    if (err.isNotBlank()) {
-                                                        Spacer(Modifier.height(6.dp))
-                                                        Text("下载失败：$err", fontSize = 12.sp, color = palette.danger)
-                                                    }
-                                                }
-
-                                                Spacer(Modifier.height(10.dp))
-                                                GlassHairline()
-                                                Spacer(Modifier.height(10.dp))
+                                        // Breadcrumb navigation when drilled into a category
+                                        if (modelGroup != null) {
+                                            val curGroup = effectiveGroups.find { it.id == modelGroup }
+                                            val curCapDef = modelCap?.let { capDefs[it] ?: CapDef(it, it, "") }
+                                            GlassPanel(padding = PaddingValues(horizontal = 14.dp, vertical = 10.dp)) {
                                                 Row(
                                                     Modifier.fillMaxWidth(),
                                                     horizontalArrangement = Arrangement.SpaceBetween,
                                                     verticalAlignment = Alignment.CenterVertically,
                                                 ) {
-                                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                                        if (downloading) {
-                                                            GlassButton(
-                                                                "取消下载",
-                                                                style = GlassButtonStyle.Ghost,
-                                                                compact = true,
-                                                                enabled = !busy,
-                                                                onClick = {
-                                                                    Core.call(this@SettingsActivity, "models-cancel", json("id" to id), true) { r ->
-                                                                        r.onSuccess {
-                                                                            modelsState = it as? JSONObject
-                                                                            showToast("已取消下载")
-                                                                        }.onFailure { showToast(it.message.orEmpty()) }
-                                                                    }
-                                                                },
-                                                            )
-                                                        } else if (!installed) {
-                                                            GlassButton(
-                                                                when {
-                                                                    dlStatus == "failed" -> "重试下载"
-                                                                    fit == "exceeds_ram" -> "仍要下载"
-                                                                    else -> "下载并启用"
-                                                                },
-                                                                style = GlassButtonStyle.AccentSoft,
-                                                                compact = true,
-                                                                enabled = !busy && !offline,
-                                                                onClick = {
-                                                                    busy = true
-                                                                    Core.call(this@SettingsActivity, "models-download", json("id" to id), true) { r ->
-                                                                        busy = false
-                                                                        r.onSuccess {
-                                                                            modelsState = it as? JSONObject
-                                                                            showToast("开始下载「$name」")
-                                                                        }.onFailure { showToast(it.message.orEmpty()) }
-                                                                    }
-                                                                },
+                                                    Row(
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                        modifier = Modifier.weight(1f),
+                                                    ) {
+                                                        Text(
+                                                            "模型目录",
+                                                            fontSize = 12.5.sp,
+                                                            color = palette.accentText,
+                                                            fontWeight = FontWeight.Medium,
+                                                            modifier = Modifier.clickable {
+                                                                modelGroup = null
+                                                                modelCap = null
+                                                            },
+                                                        )
+                                                        if (curGroup != null) {
+                                                            Text("›", fontSize = 12.5.sp, color = palette.textSecondary)
+                                                            Text(
+                                                                curGroup.title,
+                                                                fontSize = 12.5.sp,
+                                                                color = if (curCapDef != null) palette.accentText else palette.textPrimary,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                modifier = Modifier.clickable { modelCap = null },
                                                             )
                                                         }
-                                                        if (installed && !downloading) {
-                                                            GlassButton(
-                                                                if (confirmDeleteModelId == id) "确认删除" else "删除",
-                                                                style = GlassButtonStyle.DangerGhost,
-                                                                compact = true,
-                                                                enabled = !busy,
-                                                                onClick = {
-                                                                    if (confirmDeleteModelId != id) {
-                                                                        confirmDeleteModelId = id
-                                                                        showToast("再次点击「确认删除」以清理「$name」")
-                                                                        return@GlassButton
+                                                        if (curCapDef != null) {
+                                                            Text("›", fontSize = 12.5.sp, color = palette.textSecondary)
+                                                            Text(
+                                                                curCapDef.title,
+                                                                fontSize = 12.5.sp,
+                                                                color = palette.textPrimary,
+                                                                fontWeight = FontWeight.SemiBold,
+                                                                maxLines = 1,
+                                                                overflow = TextOverflow.Ellipsis,
+                                                            )
+                                                        }
+                                                    }
+                                                    GlassButton(
+                                                        "← 返回",
+                                                        style = GlassButtonStyle.Ghost,
+                                                        compact = true,
+                                                        onClick = {
+                                                            if (modelCap != null) modelCap = null
+                                                            else modelGroup = null
+                                                        },
+                                                    )
+                                                }
+                                            }
+                                        }
+
+                                        when {
+                                            // Level 1: Primary Categories
+                                            modelGroup == null -> {
+                                                effectiveGroups.forEach { grp ->
+                                                    val grpModels = allModels.filter { modelCapOf(it) in grp.caps }
+                                                    if (grpModels.isEmpty()) return@forEach
+                                                    val activeCnt = grpModels.count { it.optBoolean("active") }
+                                                    val installedCnt = grpModels.count { it.optBoolean("installed") || it.optBoolean("bundled") }
+                                                    GlassPanel {
+                                                        Row(
+                                                            Modifier.fillMaxWidth().clickable {
+                                                                modelGroup = grp.id
+                                                                val availCaps = grp.caps.filter { cap -> grpModels.any { modelCapOf(it) == cap } }
+                                                                modelCap = if (availCaps.size == 1) availCaps.first() else null
+                                                            },
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                        ) {
+                                                            Column(Modifier.weight(1f).padding(end = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                                Text(grp.title, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold, color = palette.textPrimary)
+                                                                Text(grp.subtitle, fontSize = 12.sp, lineHeight = 17.sp, color = palette.textSecondary)
+                                                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                                    GlassPillBadge(
+                                                                        if (activeCnt > 0) "已启用 $activeCnt 项" else "共 ${grpModels.size} 个模型",
+                                                                        if (activeCnt > 0) palette.success else palette.textSecondary,
+                                                                        if (activeCnt > 0) palette.successSoft else palette.elevated,
+                                                                    )
+                                                                    if (installedCnt > 0) {
+                                                                        GlassPillBadge("已安装 $installedCnt", palette.accentText, palette.accentSoft)
                                                                     }
-                                                                    confirmDeleteModelId = null
+                                                                }
+                                                            }
+                                                            Text("›", fontSize = 22.sp, color = palette.textSecondary)
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // Level 2: Sub-feature Categories within Selected Primary Category
+                                            modelCap == null -> {
+                                                val grp = effectiveGroups.find { it.id == modelGroup }
+                                                val subCaps = grp?.caps.orEmpty().filter { cap -> allModels.any { modelCapOf(it) == cap } }
+                                                subCaps.forEach { cap ->
+                                                    val capDef = capDefs[cap] ?: CapDef(cap, cap, "")
+                                                    val capModels = allModels.filter { modelCapOf(it) == cap }.sortedBy { it.optLong("recommended_ram_mb", 0L) }
+                                                    val activeCnt = capModels.count { it.optBoolean("active") }
+                                                    val tiers = capModels.map(::modelTierLabel).distinct().joinToString(" / ")
+                                                    GlassPanel {
+                                                        Row(
+                                                            Modifier.fillMaxWidth().clickable { modelCap = cap },
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                        ) {
+                                                            Column(Modifier.weight(1f).padding(end = 10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                                                Text(capDef.title, fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = palette.textPrimary)
+                                                                if (capDef.subtitle.isNotBlank()) {
+                                                                    Text(capDef.subtitle, fontSize = 12.sp, lineHeight = 17.sp, color = palette.textSecondary)
+                                                                }
+                                                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                                    GlassPillBadge(
+                                                                        if (activeCnt > 0) "已启用" else "未启用",
+                                                                        if (activeCnt > 0) palette.success else palette.textSecondary,
+                                                                        if (activeCnt > 0) palette.successSoft else palette.elevated,
+                                                                    )
+                                                                    GlassPillBadge(tiers, palette.accentText, palette.accentSoft)
+                                                                }
+                                                            }
+                                                            Text("›", fontSize = 22.sp, color = palette.textSecondary)
+                                                        }
+                                                    }
+                                                }
+                                            }
+
+                                            // Level 3: Tiered Models (Low / Mid / High) under Selected Sub-feature
+                                            else -> {
+                                                if (modelCap == "local_llm") {
+                                                    GlassPanel {
+                                                        GlassSectionHeader(
+                                                            "低配 · 内置算法预测引擎",
+                                                            "无需下载大模型，基于本地词典前缀续写与个人习惯记忆实现零延迟预测",
+                                                            trailing = { GlassPillBadge("内置已启用", palette.success, palette.successSoft) },
+                                                        )
+                                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                            GlassPillBadge("低配 · 零体积", palette.accentText, palette.accentSoft)
+                                                            GlassPillBadge("0 MB", palette.textSecondary, palette.elevated)
+                                                            GlassPillBadge("全机型推荐", palette.success, palette.successSoft)
+                                                        }
+                                                    }
+                                                }
+                                                val tiered =
+                                                    allModels
+                                                        .filter { modelCapOf(it) == modelCap }
+                                                        .sortedBy { it.optLong("recommended_ram_mb", 0L) }
+                                                tiered.forEach { m ->
+                                                    val id = m.getString("id")
+                                                    val name = m.getString("name")
+                                                    val desc = m.optString("description")
+                                                    val version = m.optString("version")
+                                                    val fit = m.optString("fit")
+                                                    val installed = m.optBoolean("installed")
+                                                    val bundled = m.optBoolean("bundled")
+                                                    val enabled = m.optBoolean("enabled")
+                                                    val active = m.optBoolean("active")
+                                                    val minRam = m.optLong("min_ram_mb", 0L)
+                                                    val recRam = m.optLong("recommended_ram_mb", 0L)
+                                                    val files = m.optJSONArray("files")
+                                                    var totalBytes = 0L
+                                                    if (files != null) {
+                                                        for (fi in 0 until files.length()) {
+                                                            totalBytes += files.getJSONObject(fi).optLong("size", 0L)
+                                                        }
+                                                    }
+                                                    val dl = m.optJSONObject("download")
+                                                    val dlStatus = dl?.optString("status").orEmpty()
+                                                    val downloading = dlStatus == "downloading"
+                                                    val statusText =
+                                                        when {
+                                                            downloading -> "下载中"
+                                                            active && installed -> "已启用"
+                                                            active && bundled -> "内置启用"
+                                                            installed -> "已下载"
+                                                            bundled -> "本地内置"
+                                                            else -> "未下载"
+                                                        }
+                                                    val (badgeFg, badgeBg) =
+                                                        when {
+                                                            downloading -> palette.accentText to palette.accentSoft
+                                                            active -> palette.success to palette.successSoft
+                                                            fit == "exceeds_ram" -> palette.warning to palette.warningSoft
+                                                            installed || bundled -> palette.accentText to palette.accentSoft
+                                                            else -> palette.textSecondary to palette.elevated
+                                                        }
+
+                                                    GlassPanel {
+                                                        GlassSectionHeader(
+                                                            name,
+                                                            desc,
+                                                            trailing = { GlassPillBadge(statusText, badgeFg, badgeBg) },
+                                                        )
+                                                        Row(
+                                                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                        ) {
+                                                            GlassPillBadge(modelTierLabel(m), palette.accentText, palette.accentSoft)
+                                                            GlassPillBadge(formatBytes(totalBytes), palette.textSecondary, palette.elevated)
+                                                            GlassPillBadge(
+                                                                when (fit) {
+                                                                    "recommended" -> "内存推荐"
+                                                                    "compatible" -> "内存兼容"
+                                                                    "exceeds_ram" -> "超出推荐内存"
+                                                                    else -> fit
+                                                                },
+                                                                if (fit == "exceeds_ram") palette.warning else palette.success,
+                                                                if (fit == "exceeds_ram") palette.warningSoft else palette.successSoft,
+                                                            )
+                                                        }
+                                                        Spacer(Modifier.height(6.dp))
+                                                        Text(
+                                                            String.format(
+                                                                Locale.US,
+                                                                "版本 v%s · 内存要求：最低 %.1f GB · 推荐 %.1f GB",
+                                                                version,
+                                                                minRam / 1024.0,
+                                                                recRam / 1024.0,
+                                                            ),
+                                                            fontSize = 11.5.sp,
+                                                            color = palette.textSecondary,
+                                                        )
+
+                                                        if (downloading && dl != null) {
+                                                            val dlTotal = dl.optLong("total_bytes", totalBytes).coerceAtLeast(1L)
+                                                            val dlDone = dl.optLong("downloaded_bytes", 0L).coerceIn(0L, dlTotal)
+                                                            val prog = dlDone.toFloat() / dlTotal.toFloat()
+                                                            Spacer(Modifier.height(10.dp))
+                                                            Box(
+                                                                Modifier.fillMaxWidth()
+                                                                    .height(6.dp)
+                                                                    .clip(CircleShape)
+                                                                    .background(palette.elevated)
+                                                            ) {
+                                                                Box(
+                                                                    Modifier.fillMaxWidth(prog)
+                                                                        .fillMaxHeight()
+                                                                        .clip(CircleShape)
+                                                                        .background(palette.accent)
+                                                                )
+                                                            }
+                                                            Spacer(Modifier.height(4.dp))
+                                                            Text(
+                                                                "${formatBytes(dlDone)} / ${formatBytes(dlTotal)} (${(prog * 100).roundToInt()}%)",
+                                                                fontSize = 11.5.sp,
+                                                                fontFamily = FontFamily.Monospace,
+                                                                color = palette.textSecondary,
+                                                            )
+                                                        } else if (dlStatus == "failed") {
+                                                            val err = dl?.optString("error").orEmpty()
+                                                            if (err.isNotBlank()) {
+                                                                Spacer(Modifier.height(6.dp))
+                                                                Text("下载失败：$err", fontSize = 12.sp, color = palette.danger)
+                                                            }
+                                                        }
+
+                                                        Spacer(Modifier.height(10.dp))
+                                                        GlassHairline()
+                                                        Spacer(Modifier.height(10.dp))
+                                                        Row(
+                                                            Modifier.fillMaxWidth(),
+                                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                                            verticalAlignment = Alignment.CenterVertically,
+                                                        ) {
+                                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                                if (downloading) {
+                                                                    GlassButton(
+                                                                        "取消下载",
+                                                                        style = GlassButtonStyle.Ghost,
+                                                                        compact = true,
+                                                                        enabled = !busy,
+                                                                        onClick = {
+                                                                            Core.call(this@SettingsActivity, "models-cancel", json("id" to id), true) { r ->
+                                                                                r.onSuccess {
+                                                                                    modelsState = it as? JSONObject
+                                                                                    showToast("已取消下载")
+                                                                                }.onFailure { showToast(it.message.orEmpty()) }
+                                                                            }
+                                                                        },
+                                                                    )
+                                                                } else if (!installed) {
+                                                                    GlassButton(
+                                                                        when {
+                                                                            dlStatus == "failed" -> "重试下载"
+                                                                            fit == "exceeds_ram" -> "仍要下载"
+                                                                            else -> "下载并启用"
+                                                                        },
+                                                                        style = GlassButtonStyle.AccentSoft,
+                                                                        compact = true,
+                                                                        enabled = !busy && !offline,
+                                                                        onClick = {
+                                                                            busy = true
+                                                                            Core.call(this@SettingsActivity, "models-download", json("id" to id), true) { r ->
+                                                                                busy = false
+                                                                                r.onSuccess {
+                                                                                    modelsState = it as? JSONObject
+                                                                                    showToast("开始下载「$name」")
+                                                                                }.onFailure { showToast(it.message.orEmpty()) }
+                                                                            }
+                                                                        },
+                                                                    )
+                                                                }
+                                                                if (installed && !downloading) {
+                                                                    GlassButton(
+                                                                        if (confirmDeleteModelId == id) "确认删除" else "删除",
+                                                                        style = GlassButtonStyle.DangerGhost,
+                                                                        compact = true,
+                                                                        enabled = !busy,
+                                                                        onClick = {
+                                                                            if (confirmDeleteModelId != id) {
+                                                                                confirmDeleteModelId = id
+                                                                                showToast("再次点击「确认删除」以清理「$name」")
+                                                                                return@GlassButton
+                                                                            }
+                                                                            confirmDeleteModelId = null
+                                                                            busy = true
+                                                                            Core.call(this@SettingsActivity, "models-delete", json("id" to id), true) { r ->
+                                                                                busy = false
+                                                                                r.onSuccess {
+                                                                                    modelsState = it as? JSONObject
+                                                                                    showToast("已删除「$name」")
+                                                                                }.onFailure { showToast(it.message.orEmpty()) }
+                                                                            }
+                                                                        },
+                                                                    )
+                                                                }
+                                                            }
+                                                            GlassSwitch(
+                                                                checked = enabled && (installed || bundled),
+                                                                enabled = !busy && !downloading && (installed || bundled),
+                                                                contentDesc = "启用$name",
+                                                                onCheckedChange = { next ->
+                                                                    val replacedPeer =
+                                                                        if (next) {
+                                                                            tiered
+                                                                                .firstOrNull {
+                                                                                    it.optString("id") != id &&
+                                                                                        it.optBoolean("active")
+                                                                                }
+                                                                                ?.optString("name")
+                                                                                .orEmpty()
+                                                                        } else ""
                                                                     busy = true
-                                                                    Core.call(this@SettingsActivity, "models-delete", json("id" to id), true) { r ->
+                                                                    Core.call(
+                                                                        this@SettingsActivity,
+                                                                        "models-set-enabled",
+                                                                        json("id" to id, "enabled" to next),
+                                                                        true,
+                                                                    ) { r ->
                                                                         busy = false
                                                                         r.onSuccess {
                                                                             modelsState = it as? JSONObject
-                                                                            showToast("已删除「$name」")
+                                                                            showToast(
+                                                                                when {
+                                                                                    next && replacedPeer.isNotEmpty() ->
+                                                                                        "已切换为「$name」，已自动关闭「$replacedPeer」"
+                                                                                    next -> "已启用「$name」"
+                                                                                    else -> "已停用「$name」"
+                                                                                }
+                                                                            )
                                                                         }.onFailure { showToast(it.message.orEmpty()) }
                                                                     }
                                                                 },
                                                             )
                                                         }
                                                     }
-                                                    GlassSwitch(
-                                                        checked = enabled && (installed || bundled),
-                                                        enabled = !busy && !downloading && (installed || bundled),
-                                                        contentDesc = "启用$name",
-                                                        onCheckedChange = { next ->
-                                                            busy = true
-                                                            Core.call(
-                                                                this@SettingsActivity,
-                                                                "models-set-enabled",
-                                                                json("id" to id, "enabled" to next),
-                                                                true,
-                                                            ) { r ->
-                                                                busy = false
-                                                                r.onSuccess {
-                                                                    modelsState = it as? JSONObject
-                                                                    showToast(if (next) "已启用「$name」" else "已停用「$name」")
-                                                                }.onFailure { showToast(it.message.orEmpty()) }
-                                                            }
-                                                        },
-                                                    )
                                                 }
                                             }
                                         }
@@ -1638,7 +1983,7 @@ class SettingsActivity : ComponentActivity() {
                             }
                         }
 
-                        // Floating Translucent Toast Pill
+                        // Floating Translucent Toast Banner (compact rounded card, never expands into a giant oval)
                         AnimatedVisibility(
                             visible = toastText.isNotBlank() && !textFieldsDirty,
                             enter = fadeIn(),
@@ -1646,16 +1991,27 @@ class SettingsActivity : ComponentActivity() {
                             modifier =
                                 Modifier.align(Alignment.BottomCenter)
                                     .navigationBarsPadding()
-                                    .padding(bottom = 86.dp, start = 24.dp, end = 24.dp),
+                                    .padding(bottom = 86.dp, start = 20.dp, end = 20.dp),
                         ) {
+                            val toastShape = RoundedCornerShape(16.dp)
                             Box(
-                                Modifier.shadow(10.dp, CircleShape)
-                                    .clip(CircleShape)
+                                Modifier.widthIn(max = 336.dp)
+                                    .shadow(10.dp, toastShape)
+                                    .clip(toastShape)
                                     .background(if (dark) Color(0xEB1B2438) else Color(0xF5FFFFFF))
-                                    .border(1.dp, palette.borderTop, CircleShape)
-                                    .padding(horizontal = 16.dp, vertical = 9.dp)
+                                    .border(1.dp, palette.borderTop, toastShape)
+                                    .clickable { toastText = "" }
+                                    .padding(horizontal = 16.dp, vertical = 10.dp)
                             ) {
-                                Text(toastText, fontSize = 12.5.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
+                                Text(
+                                    toastText,
+                                    fontSize = 12.5.sp,
+                                    lineHeight = 18.sp,
+                                    maxLines = 3,
+                                    overflow = TextOverflow.Ellipsis,
+                                    fontWeight = FontWeight.Medium,
+                                    color = palette.textPrimary,
+                                )
                             }
                         }
 

@@ -1,7 +1,8 @@
 //! Cancellable local continuation requests. Generation never learns or commits text.
 use crate::{
     ai::local_llm::{LocalLlmEngine, LocalLlmRequest},
-    eng::EngineConfig,
+    eng::{gram::RimeGramDb, EngineConfig},
+    imp::polyphone::RimeDictCorpus,
     models::LocalLlmModel,
     profile::{safe_text, UserProfile},
     ret::RetentionEngine,
@@ -157,6 +158,45 @@ fn memory(
         .filter(|(w, _)| !ret.erased_words.contains(w))
         .find_map(|(w, _)| clean_suggestion(&w, &request.context_before))
 }
+fn dictionary_continuation(
+    corpus: &RimeDictCorpus,
+    gram: Option<&RimeGramDb>,
+    request: &PredictRequest,
+    ret: &RetentionEngine,
+) -> Option<String> {
+    let tail: Vec<char> = request
+        .context_before
+        .trim_end()
+        .chars()
+        .rev()
+        .take_while(|c| crate::ret::is_cjk(*c))
+        .take(3)
+        .collect();
+    let mut best: Option<(String, f64)> = None;
+    for length in 1..=tail.len() {
+        let prefix: String = tail[..length].iter().rev().collect();
+        for (rest, weight) in corpus.continuations.get(&prefix).into_iter().flatten() {
+            if ret.erased_words.contains(&format!("{prefix}{rest}"))
+                || ret.erased_words.contains(rest)
+            {
+                continue;
+            }
+            let Some(text) = clean_suggestion(rest, &request.context_before) else {
+                continue;
+            };
+            let score = (*weight as f64 + 1.0).ln()
+                + length as f64 * 8.0
+                + gram.and_then(|g| g.lookup(&prefix, rest)).unwrap_or(0.0);
+            if best.as_ref().is_none_or(|(old, old_score)| {
+                score > *old_score || (score == *old_score && text < *old)
+            }) {
+                best = Some((text, score));
+            }
+        }
+    }
+    best.map(|(text, _)| text)
+}
+
 impl PredictEngine {
     fn invalidate(st: &mut State) {
         st.cancel.store(true, Ordering::Release);
@@ -211,6 +251,7 @@ impl PredictEngine {
         model: Option<&LocalLlmModel>,
         engine: &LocalLlmEngine,
         reserved_generation: Option<u64>,
+        lexicon: Option<(&RimeDictCorpus, Option<&RimeGramDb>)>,
     ) -> PredictResult {
         let mut st = self.state.lock();
         if let Some(id) = reserved_generation {
@@ -290,7 +331,16 @@ impl PredictEngine {
         } else {
             let cancel = st.cancel.clone();
             drop(st);
-            self.finish(id, &cancel, key, fallback, "personal_memory");
+            let source = if fallback.is_some() {
+                "personal_memory"
+            } else {
+                "dictionary"
+            };
+            let suggestion = fallback.or_else(|| {
+                lexicon
+                    .and_then(|(corpus, gram)| dictionary_continuation(corpus, gram, &request, ret))
+            });
+            self.finish(id, &cancel, key, suggestion, source);
             return self.poll(Some(id));
         }
         st.result.clone()
@@ -348,13 +398,38 @@ mod tests {
         ret
     }
     #[test]
+    fn indexed_dictionary_continuation_respects_erasure_and_prefixes() {
+        let corpus = RimeDictCorpus::load_or_fallback(None);
+        assert!(corpus
+            .continuations
+            .values()
+            .all(|bucket| bucket.len() <= 6));
+        let mut r = RetentionEngine::default();
+        let mut q = req();
+        assert_eq!(
+            dictionary_continuation(&corpus, None, &q, &r).as_deref(),
+            Some("世界")
+        );
+        r.erase_word("你好世界");
+        assert_eq!(dictionary_continuation(&corpus, None, &q, &r), None);
+        r.erased_words.clear();
+        r.erase_word("世界");
+        assert_eq!(dictionary_continuation(&corpus, None, &q, &r), None);
+        q.context_before = "你".into();
+        assert_eq!(
+            dictionary_continuation(&corpus, None, &q, &r).as_deref(),
+            Some("好")
+        );
+    }
+    #[test]
     fn gating_fallback_cache_and_feedback_ids() {
         let e = PredictEngine::default();
         let r = ret();
         let p = UserProfile::default();
         let mut cfg = EngineConfig::default();
         let llm = LocalLlmEngine::default();
-        let run = |q, cfg: &EngineConfig| e.request(q, cfg, &p, None, "", &r, None, &llm, None);
+        let run =
+            |q, cfg: &EngineConfig| e.request(q, cfg, &p, None, "", &r, None, &llm, None, None);
         for (composing, password) in [(true, false), (false, true)] {
             let mut q = req();
             q.is_composing = composing;
@@ -381,7 +456,7 @@ mod tests {
         q.context_before.clear();
         assert_eq!(run(q.clone(), &cfg).status, "skipped");
         assert_eq!(
-            e.request(q, &cfg, &p, Some("你好"), "", &r, None, &llm, None)
+            e.request(q, &cfg, &p, Some("你好"), "", &r, None, &llm, None, None)
                 .text,
             "世界"
         );
@@ -394,7 +469,7 @@ mod tests {
         let cfg = EngineConfig::default();
         let llm = LocalLlmEngine::default();
         let run = |q, p: &UserProfile, clip: &str| {
-            e.request(q, &cfg, p, None, clip, &r, None, &llm, None)
+            e.request(q, &cfg, p, None, clip, &r, None, &llm, None, None)
         };
         assert!(!run(req(), &p, "a").cached);
         assert!(run(req(), &p, "a").cached);
@@ -419,8 +494,19 @@ mod tests {
         let reserved = e.cancel().id;
         e.cancel();
         assert_eq!(
-            e.request(req(), &cfg, &p, None, "", &r, None, &llm, Some(reserved))
-                .status,
+            e.request(
+                req(),
+                &cfg,
+                &p,
+                None,
+                "",
+                &r,
+                None,
+                &llm,
+                Some(reserved),
+                None
+            )
+            .status,
             "skipped"
         );
         assert!(cancel.load(Ordering::Acquire));

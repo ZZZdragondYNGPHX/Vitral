@@ -105,6 +105,8 @@ internal class Key(
     private var downX = 0f
     private var downY = 0f
     private var swipeUpActive = false
+    private var spaceScrubbing = false
+    private var spaceAnchorX = 0f
     private var recording = false
     private var repeatingDelete = false
     private var pressedAt = 0L
@@ -245,8 +247,8 @@ internal class Key(
 
     override fun onDraw(c: Canvas) {
         val dark = darkOverride ?: context.darkKeyboard
-        val padX = context.dpF(2.6f)
-        val padY = context.dpF(3.2f)
+        val padX = context.dpF(2.2f)
+        val padY = context.dpF(3.6f)
         val r = context.dpF(T.Radius.mobileKeycapPx.toFloat())
 
         val now = SystemClock.uptimeMillis()
@@ -416,34 +418,47 @@ internal class Key(
                 }
             }
             "空格" -> {
-                val hint = spaceHint.ifEmpty { "Vitral" }
-                drawCenteredText(
-                    c,
-                    hint,
-                    cx,
-                    cy,
-                    12f,
-                    secondaryText,
-                    Paint.Align.CENTER,
-                    medium = true,
-                    alpha = 195,
-                )
-                drawMicDot(c, keyRect.right - context.dpF(14f), cy, secondaryText)
+                if (spaceScrubbing) {
+                    drawCenteredText(
+                        c,
+                        "◂  移动光标  ▸",
+                        cx,
+                        cy,
+                        12.5f,
+                        accentText,
+                        Paint.Align.CENTER,
+                        bold = true,
+                    )
+                } else {
+                    val hint = spaceHint.ifEmpty { "Vitral" }
+                    drawCenteredText(
+                        c,
+                        hint,
+                        cx,
+                        cy,
+                        12f,
+                        secondaryText,
+                        Paint.Align.CENTER,
+                        medium = true,
+                        alpha = 195,
+                    )
+                    drawMicDot(c, keyRect.right - context.dpF(14f), cy, secondaryText)
+                }
             }
             else -> {
                 val showUpper = upper.isNotEmpty() && sublabelMode != SublabelMode.CLEAN
                 val showFinal = flypy && sublabelMode == SublabelMode.DUAL
                 val textSizeDp =
                     when {
-                        displayLabel.length >= 3 -> 12.5f
-                        displayLabel.length == 2 -> 13.5f
-                        role == KeyRole.PRIMARY -> if (showFinal) 18.0f else 19.0f
-                        else -> 15.5f
+                        displayLabel.length >= 3 -> 13.0f
+                        displayLabel.length == 2 -> 14.0f
+                        role == KeyRole.PRIMARY -> if (showFinal) 19.0f else 20.0f
+                        else -> 16.0f
                     }
                 val yOffset =
                     when {
-                        showFinal -> -context.dpF(0.6f)
-                        showUpper -> context.dpF(0.8f)
+                        showFinal -> -context.dpF(0.5f)
+                        showUpper -> context.dpF(1.0f)
                         else -> 0f
                     }
                 drawCenteredText(
@@ -458,17 +473,17 @@ internal class Key(
                     medium = role == KeyRole.FUNCTION,
                 )
                 if (showUpper) {
-                    val subInsetX = context.dpF(4.6f)
-                    val subInsetY = context.dpF(6.6f)
+                    val subInsetX = context.dpF(4.8f)
+                    val subInsetY = context.dpF(7.2f)
                     drawCenteredText(
                         c,
                         upper,
                         if (flypy) keyRect.left + subInsetX else keyRect.right - subInsetX,
                         keyRect.top + subInsetY,
-                        7.8f,
+                        8.2f,
                         secondaryText,
                         if (flypy) Paint.Align.LEFT else Paint.Align.RIGHT,
-                        alpha = 140,
+                        alpha = 148,
                     )
                 }
                 if (showFinal) {
@@ -477,13 +492,13 @@ internal class Key(
                         drawCenteredText(
                             c,
                             finalLabel,
-                            keyRect.right - context.dpF(4.4f),
-                            keyRect.bottom - context.dpF(5.2f),
-                            7.4f,
+                            keyRect.right - context.dpF(4.6f),
+                            keyRect.bottom - context.dpF(5.8f),
+                            7.8f,
                             accentText,
                             Paint.Align.RIGHT,
                             medium = true,
-                            alpha = 185,
+                            alpha = 192,
                         )
                     }
                 }
@@ -496,6 +511,8 @@ internal class Key(
             MotionEvent.ACTION_DOWN -> {
                 downX = e.x
                 downY = e.y
+                spaceAnchorX = e.x
+                spaceScrubbing = false
                 swipeUpActive = false
                 repeatingDelete = false
                 pressedAt = e.eventTime
@@ -509,11 +526,28 @@ internal class Key(
                 }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (abs(e.x - downX) > context.dp(18) || abs(e.y - downY) > context.dp(18)) {
+                if (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14)) {
                     removeCallbacks(startVoice)
                     removeCallbacks(repeatDelete)
                 }
-                swipeUpActive = upper.isNotEmpty() && downY - e.y > context.dp(16)
+                if (label == "空格" && !recording) {
+                    val step = context.dpF(14f)
+                    if (!spaceScrubbing && abs(e.x - downX) > step) {
+                        spaceScrubbing = true
+                        spaceAnchorX = downX
+                    }
+                    if (spaceScrubbing) {
+                        while (e.x - spaceAnchorX >= step) {
+                            spaceAnchorX += step
+                            action("cursor-right")
+                        }
+                        while (spaceAnchorX - e.x >= step) {
+                            spaceAnchorX -= step
+                            action("cursor-left")
+                        }
+                    }
+                }
+                swipeUpActive = !spaceScrubbing && upper.isNotEmpty() && downY - e.y > context.dp(16)
             }
             MotionEvent.ACTION_UP -> {
                 removeCallbacks(startVoice)
@@ -522,16 +556,16 @@ internal class Key(
                 releasedAt = SystemClock.uptimeMillis()
                 val didSwipeUp = swipeUpActive
                 val didRepeat = repeatingDelete
+                val didScrub = spaceScrubbing
                 swipeUpActive = false
                 repeatingDelete = false
+                spaceScrubbing = false
                 when {
                     recording -> {
                         recording = false
                         voice?.invoke(false)
                     }
-                    didRepeat -> Unit
-                    label == "空格" && abs(e.x - downX) > context.dp(20) ->
-                        action(if (e.x > downX) "cursor-right" else "cursor-left")
+                    didRepeat || didScrub -> Unit
                     label == "⌫" && e.x - downX < -context.dp(20) -> action("delete-word")
                     didSwipeUp || (upper.isNotEmpty() && downY - e.y > context.dp(16)) ->
                         action(upper)
@@ -546,6 +580,7 @@ internal class Key(
                 releasedAt = SystemClock.uptimeMillis()
                 swipeUpActive = false
                 repeatingDelete = false
+                spaceScrubbing = false
                 if (recording) {
                     recording = false
                     action("cancel-voice")

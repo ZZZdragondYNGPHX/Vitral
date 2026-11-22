@@ -91,6 +91,14 @@ pub struct VitralCore {
     sync: Mutex<SyncState>,
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct ContextNextHint {
+    pub initial: String,
+    pub syllable: String,
+    pub ch: String,
+    pub source: &'static str,
+}
+
 impl Drop for VitralCore {
     fn drop(&mut self) { self.prediction.cancel(); }
 }
@@ -137,6 +145,9 @@ impl VitralCore {
         let models = models::ModelManager::new(&engine.config, engine.resolved_assets_dir.as_deref())?;
         engine.model_paths = models.paths();
         engine.pure_rust.set_model_paths(&engine.model_paths);
+        // Keep lazy corpus loading outside the realtime hint path.
+        engine.pure_rust.get_corpus();
+        crate::imp::xiaohe::canonical_syllable_set();
         let mut hw = HandwritingSession::with_assets_dir(engine.resolved_assets_dir.as_deref());
         hw.set_model_paths(engine.model_paths.clone());
         let voice = VoiceSession { model_paths: engine.model_paths.clone(), ..Default::default() };
@@ -340,6 +351,23 @@ impl VitralCore {
         }
         let mut st = self.input.lock();
         let mut sync = self.sync.lock();
+        cfg.koofr_endpoint = cfg.koofr_endpoint.map(|s| s.trim().to_string());
+        cfg.koofr_username = cfg
+            .koofr_username
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        cfg.koofr_password = cfg
+            .koofr_password
+            .map(|s| s.trim_matches(['\r', '\n']).to_string())
+            .filter(|s| !s.is_empty());
+        if cfg.koofr_password.is_none()
+            && cfg.koofr_endpoint.as_deref().is_some_and(|s| !s.is_empty())
+            && cfg.koofr_endpoint.as_deref()
+                == st.engine.config.koofr_endpoint.as_deref().map(str::trim)
+        {
+            cfg.koofr_password
+                .clone_from(&st.engine.config.koofr_password);
+        }
         self.set_pure_offline(cfg.pure_offline);
         if st.engine.schema != cfg.schema { st.engine.set_schema(cfg.schema); }
         st.engine.set_opencc_mode(cfg.opencc_mode);
@@ -361,11 +389,15 @@ impl VitralCore {
         }
         *self.ai.write() = Arc::new(AiClient::from(&cfg));
         if st.engine.config.shortcuts != cfg.shortcuts { st.engine.clear_composition_state(); }
+        st.engine.pure_rust.fuzzy_pinyin = cfg.fuzzy_pinyin;
+        let split_changed = st.engine.config.syllable_split != cfg.syllable_split;
+        st.engine.set_syllable_split(cfg.syllable_split)?;
         let active = &mut st.engine.config;
         active.model_catalog_url = cfg.model_catalog_url.clone();
         active.shortcuts = cfg.shortcuts;
         active.linux_english_mode = cfg.linux_english_mode;
         active.adaptive_learning = cfg.adaptive_learning;
+        active.fuzzy_pinyin = cfg.fuzzy_pinyin;
         active.prediction_enabled = cfg.prediction_enabled;
         active.prediction_delay_ms = cfg.prediction_delay_ms;
         active.profile_distill_enabled = cfg.profile_distill_enabled;
@@ -380,6 +412,11 @@ impl VitralCore {
         active.sync_key = cfg.sync_key;
         active.ai_tier3_enabled = cfg.ai_tier3_enabled;
         active.ai_prefer_local = cfg.ai_prefer_local;
+        if split_changed {
+            let imported = self.imported_lexicon.read();
+            let InputState { engine, retention, .. } = &mut *st;
+            engine.refresh_candidates(&sync.clipboard, &imported, retention)?;
+        }
         Ok(())
     }
 
@@ -427,6 +464,7 @@ impl VitralCore {
         crate::hw::ids_exta::IdsIndex::clear_cache();
         ai::clear_model_cache();
         let rep = st.engine.reload_assets()?;
+        st.engine.pure_rust.get_corpus();
         let paths = st.engine.model_paths.clone();
         let assets = st.engine.resolved_assets_dir.clone();
         st.hw.set_assets_dir(assets.as_deref());
@@ -463,6 +501,19 @@ impl VitralCore {
         self.prediction.cancel();
         let mut st = self.input.lock();
         st.engine.on_app_focus(app_id)
+    }
+
+    pub fn set_syllable_split(&self, enabled: bool) -> Result<InputAction, VitralError> {
+        let mut st = self.input.lock();
+        st.engine.set_syllable_split(enabled)?;
+        st.engine.pure_rust.page_index = 0;
+        st.engine.current_page.page_index = 0;
+        let sync = self.sync.lock();
+        let imported = self.imported_lexicon.read();
+        let InputState {
+            engine, retention, ..
+        } = &mut *st;
+        engine.refresh_candidates(&sync.clipboard, &imported, retention)
     }
 
     pub fn candidate_state(&self) -> Result<InputAction, VitralError> {
@@ -576,7 +627,7 @@ impl VitralCore {
             }
             let before_seq = st.retention.crdt_seq;
             let canonical = st.engine.canonical_at(index).map(str::to_string);
-            let code = st.engine.raw_input.clone();
+            let code = st.engine.candidate_code_at(index).to_string();
             let feedback = st.engine.selection_feedback(index);
             let is_clipboard = st.engine.is_clipboard_candidate(index);
             let sync_st = self.sync.lock();
@@ -663,6 +714,14 @@ impl VitralCore {
         pen_up: bool,
     ) -> Result<HandwritingPayload, VitralError> {
         let mut st = self.input.lock();
+        if st.hw.active_mode.is_none() {
+            return Err(VitralError::NotInitialized);
+        }
+        if st.engine.model_paths.handwriting.is_none() {
+            return Err(VitralError::ModelUnavailable(
+                "尚未下载或已禁用离线手写识别模型，请在模型中心下载并启用".into(),
+            ));
+        }
         let gram = st.engine.model_paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
         let imported = self.imported_lexicon.read();
         let InputState {
@@ -683,6 +742,14 @@ impl VitralCore {
     pub fn hw_end(&self) -> Result<HandwritingPayload, VitralError> {
         let (payload, revision, refine) = {
             let mut st = self.input.lock();
+            if st.hw.active_mode.is_none() {
+                return Err(VitralError::NotInitialized);
+            }
+            if st.engine.model_paths.handwriting.is_none() {
+                return Err(VitralError::ModelUnavailable(
+                    "尚未下载或已禁用离线手写识别模型，请在模型中心下载并启用".into(),
+                ));
+            }
             let gram = st.engine.model_paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
             let imported = self.imported_lexicon.read();
             let refine = st.engine.config.ai_tier3_enabled && (!self.is_pure_offline() || ai::local_llm::LocalLlmEngine::available(st.engine.model_paths.local_llm.as_ref()));
@@ -992,6 +1059,137 @@ impl VitralCore {
         }
         Ok(())
     }
+    /// Read bounded continuation buckets without waiting for an ongoing input operation.
+    pub fn context_next_hints(
+        &self,
+        context_before: &str,
+        prediction_text: Option<&str>,
+    ) -> Vec<ContextNextHint> {
+        use pinyin::ToPinyin;
+
+        let Some(st) = self.input.try_lock() else {
+            return Vec::new();
+        };
+        let corpus = st.engine.pure_rust.get_corpus();
+        let gram = st.engine.pure_rust.cached_gram();
+        let canonical = crate::imp::xiaohe::canonical_syllable_set();
+        let hint = |word: &str, reading: Option<&str>, source| {
+            let ch = word.chars().next().filter(|ch| ret::is_cjk(*ch))?;
+            let syllable = reading
+                .or_else(|| {
+                    corpus
+                        .char_readings
+                        .get(&ch)?
+                        .first()
+                        .map(|(s, _)| s.as_str())
+                })
+                .or_else(|| ch.to_pinyin().map(|p| p.plain()))?;
+            if !canonical.contains(syllable) {
+                return None;
+            }
+            Some(ContextNextHint {
+                initial: syllable[..1].to_string(),
+                syllable: syllable.to_string(),
+                ch: ch.to_string(),
+                source,
+            })
+        };
+        let mut ranked: Vec<(u8, f64, ContextNextHint)> = Vec::with_capacity(7);
+        let mut push = |hint: ContextNextHint, score: f64| {
+            let priority = match hint.source {
+                "prediction" => 2,
+                "personal" => 1,
+                _ => 0,
+            };
+            if let Some(i) = ranked
+                .iter()
+                .position(|(_, _, h)| h.initial == hint.initial)
+            {
+                let (old_priority, old_score, old) = &ranked[i];
+                if priority
+                    .cmp(old_priority)
+                    .then_with(|| score.total_cmp(old_score))
+                    .then_with(|| old.ch.cmp(&hint.ch))
+                    .then_with(|| old.syllable.cmp(&hint.syllable))
+                    .is_le()
+                {
+                    return;
+                }
+                ranked.remove(i);
+            }
+            ranked.push((priority, score, hint));
+            ranked.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| b.1.total_cmp(&a.1))
+                    .then_with(|| a.2.ch.cmp(&b.2.ch))
+                    .then_with(|| a.2.syllable.cmp(&b.2.syllable))
+            });
+            ranked.truncate(6);
+        };
+        if let Some(hint) = prediction_text.and_then(|text| hint(text, None, "prediction")) {
+            push(hint, 0.0);
+        }
+        let mut tail: Vec<char> = context_before
+            .chars()
+            .rev()
+            .take(3)
+            .take_while(|ch| ret::is_cjk(*ch))
+            .collect();
+        if tail.is_empty() {
+            tail = st
+                .engine
+                .speech_context_before()
+                .chars()
+                .rev()
+                .take(3)
+                .take_while(|ch| ret::is_cjk(*ch))
+                .collect();
+        }
+        // Corpus buckets are capped at 24/10 entries and personal buckets at eight.
+        for length in 1..=tail.len() {
+            let prefix: String = tail[..length].iter().rev().collect();
+            if let Some(words) = st.retention.context_bigrams.get(&prefix) {
+                for (word, weight) in words {
+                    if !weight.is_finite()
+                        || *weight <= 0.25
+                        || st.retention.erased_words.contains(word)
+                    {
+                        continue;
+                    }
+                    let reading = corpus
+                        .word_readings
+                        .get(word)
+                        .and_then(|(syllables, _)| syllables.first())
+                        .map(String::as_str);
+                    if let Some(hint) = hint(word, reading, "personal") {
+                        push(hint, *weight);
+                    }
+                }
+            }
+            for (word, weight) in corpus.continuations.get(&prefix).into_iter().flatten() {
+                let phrase = format!("{prefix}{word}");
+                if st.retention.erased_words.contains(word)
+                    || st.retention.erased_words.contains(&phrase)
+                {
+                    continue;
+                }
+                let reading = corpus
+                    .word_readings
+                    .get(&phrase)
+                    .and_then(|(s, _)| s.get(length))
+                    .or_else(|| corpus.word_readings.get(word)?.0.first())
+                    .map(String::as_str);
+                if let Some(hint) = hint(word, reading, "dictionary") {
+                    let score = (*weight as f64).ln_1p()
+                        + length as f64 * 8.0
+                        + gram.and_then(|g| g.lookup(&prefix, word)).unwrap_or(0.0);
+                    push(hint, score);
+                }
+            }
+        }
+        ranked.into_iter().map(|(_, _, hint)| hint).collect()
+    }
+
     pub fn predict_request(&self, request: predict::PredictRequest) -> predict::PredictResult {
         let generation = self.prediction.cancel().id;
         let st = self.input.lock();
@@ -999,7 +1197,21 @@ impl VitralCore {
         // Host claims cannot bypass the core composition gate.
         let mut request = request;
         request.is_composing |= !st.engine.raw_input.is_empty() || !st.engine.composing.is_empty();
-        self.prediction.request(request.clone(), &st.engine.config, &st.profile.profile, st.profile.latest(&request.app_id), &clipboard, &st.retention, st.engine.model_paths.local_llm.as_ref(), ai::local_engine(), Some(generation))
+        self.prediction.request(
+            request.clone(),
+            &st.engine.config,
+            &st.profile.profile,
+            st.profile.latest(&request.app_id),
+            &clipboard,
+            &st.retention,
+            st.engine.model_paths.local_llm.as_ref(),
+            ai::local_engine(),
+            Some(generation),
+            Some((
+                st.engine.pure_rust.get_corpus(),
+                st.engine.pure_rust.get_gram(),
+            )),
+        )
     }
     pub fn predict_poll(&self, id: Option<u64>) -> predict::PredictResult { self.prediction.poll(id) }
     pub fn predict_cancel(&self) -> predict::PredictResult { self.prediction.cancel() }
@@ -6267,6 +6479,71 @@ mod prediction_integration_tests {
     use serde_json::json;
 
     #[test]
+    fn context_next_hints_rank_deduplicate_and_serialize() {
+        let core = VitralCore::init(
+            r#"{"assets_dir":"/nonexistent-vitral-hints-assets","pure_offline":true}"#,
+        )
+        .unwrap();
+        let hints = core.context_next_hints("正", None);
+        assert!(hints.iter().any(|h| h.initial == "q"
+            && h.syllable == "que"
+            && h.ch == "确"
+            && h.source == "dictionary"));
+        assert_eq!(
+            core.context_next_hints("正", Some("确定"))[0].source,
+            "prediction"
+        );
+        {
+            let mut st = core.input.lock();
+            let words = st.retention.context_bigrams.entry("正".into()).or_default();
+            words.insert("法".into(), 100.0);
+            words.insert("智能".into(), 40.0);
+            words.insert("七".into(), 20.0);
+            words.insert("世界".into(), 500.0);
+            words.insert("你".into(), 0.1);
+            st.retention.erased_words.insert("世界".into());
+            st.retention.register_typed_phrase(
+                "智能",
+                "zhi neng",
+                "ving",
+                RetentionEngine::now_epoch_ms(),
+            );
+            assert!(core.context_next_hints("正", None).is_empty());
+            let imported = core.imported_lexicon.read();
+            let InputState {
+                engine, retention, ..
+            } = &mut *st;
+            engine.record_candidate_commit(
+                "正",
+                "zheng",
+                None,
+                &imported,
+                retention,
+                RetentionEngine::now_epoch_ms(),
+            );
+        }
+        let hints = core.context_next_hints("正", None);
+        assert_eq!((hints[0].ch.as_str(), hints[0].source), ("法", "personal"));
+        assert_eq!(hints[1].syllable, "zhi");
+        assert_eq!(hints.iter().filter(|h| h.initial == "q").count(), 1);
+        assert!(!hints.iter().any(|h| h.ch == "世" || h.ch == "你"));
+        let response = commands::execute(
+            &core,
+            "context-next-hints",
+            &json!({"context_before":"正", "prediction_text":"确定"}),
+        )
+        .unwrap();
+        assert_eq!(
+            response["hints"][0],
+            json!({"initial":"q", "syllable":"que", "ch":"确", "source":"prediction"})
+        );
+        assert_eq!(response["hints"][1]["source"], "personal");
+        assert!(response["hints"].as_array().unwrap().len() <= 6);
+        let fallback = commands::execute(&core, "context-next-hints", &json!({})).unwrap();
+        assert_eq!(fallback["hints"][0]["ch"], "法");
+    }
+
+    #[test]
     fn feedback_learning_clear_and_configuration_boundaries() {
         let dir = std::env::temp_dir().join(format!("vitral-prediction-integration-{}", std::process::id()));
         struct Cleanup(std::path::PathBuf);
@@ -6308,5 +6585,610 @@ mod prediction_integration_tests {
         assert_eq!(core.profile_state()["profile"]["accepted_count"], 1);
         let raw = commands::execute(&core,"predict-request", &json!({"app_id":"editor","is_password":true,"context_before":"你好"})).unwrap();
         assert_eq!(raw["status"], "skipped");
+    }
+}
+
+#[cfg(test)]
+mod device_regression_tests {
+    use super::*;
+    struct Temp(std::path::PathBuf);
+    impl Temp {
+        fn new(name: &str) -> Self {
+            let dir =
+                std::env::temp_dir().join(format!("vitral-device-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn core(&self) -> VitralCore {
+            VitralCore::init(&serde_json::json!({"platform":"android", "pure_offline":true, "prediction_enabled":true, "assets_dir":self.0.join("assets"), "data_dir":self.0, "cache_dir":self.0.join("cache")}).to_string()).unwrap()
+        }
+    }
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn partial_selection_keeps_tail_and_learns_consumed_code() {
+        let temp = Temp::new("partial");
+        for route in ["select", "space", "digit"] {
+            let core = temp.core();
+            let index = {
+                let mut st = core.input.lock();
+                st.engine.raw_input = "wo'yaoquka".into();
+                let imp = core.imported_lexicon.read();
+                let clip = core.sync.lock();
+                let InputState {
+                    engine, retention, ..
+                } = &mut *st;
+                loop {
+                    engine
+                        .process_key_pure_rust_for_test(0, &clip.clipboard, &imp, retention)
+                        .unwrap();
+                    if let Some(index) = engine
+                        .current_candidates
+                        .iter()
+                        .position(|c| c.text == "我")
+                    {
+                        break index;
+                    }
+                    assert!(engine.current_page.has_next);
+                    engine.pure_rust.page_index += 1;
+                }
+            };
+            let action = if route == "select" {
+                core.select_candidate(index).unwrap()
+            } else {
+                let mut st = core.input.lock();
+                if route == "space" {
+                    st.engine
+                        .pin_candidate_in_state(index, &mut RetentionEngine::default())
+                        .unwrap();
+                }
+                let imp = core.imported_lexicon.read();
+                let clip = core.sync.lock();
+                let InputState {
+                    engine, retention, ..
+                } = &mut *st;
+                engine
+                    .process_key(
+                        if route == "space" {
+                            0x20
+                        } else {
+                            '1' as u32 + index as u32
+                        },
+                        0,
+                        SwipeDir::None,
+                        &clip.clipboard,
+                        &imp,
+                        retention,
+                    )
+                    .unwrap()
+            };
+            assert_eq!(action.commit_text.as_deref(), Some("我"), "{route}");
+            assert_eq!(action.preedit.text, "yaoquka");
+            assert!(!action.candidates.is_empty());
+            let st = core.input.lock();
+            assert_eq!(st.engine.raw_input, "yaoquka");
+            assert_eq!(st.engine.pure_rust.page_index, 0);
+            assert_eq!(st.engine.last_committed_code.as_deref(), Some("wo"));
+        }
+    }
+
+    #[test]
+    fn prediction_without_model_uses_dictionary_and_preserves_gates() {
+        let temp = Temp::new("prediction");
+        let core = temp.core();
+        let request = predict::PredictRequest {
+            context_before: "输入".into(),
+            ..Default::default()
+        };
+        let result = core.predict_request(request.clone());
+        assert_eq!(result.status, "ready");
+        assert_eq!(result.text, "法");
+        assert_eq!(result.source, "dictionary");
+        assert!(core.predict_dismiss(result.id).unwrap());
+        assert_eq!(core.predict_poll(Some(result.id)).status, "skipped");
+        for (password, composing, context) in [
+            (true, false, "输入"),
+            (false, true, "输入"),
+            (false, false, "password=secret"),
+        ] {
+            let result = core.predict_request(predict::PredictRequest {
+                context_before: context.into(),
+                is_password: password,
+                is_composing: composing,
+                ..Default::default()
+            });
+            assert_eq!(result.status, "skipped");
+        }
+        core.input
+            .lock()
+            .retention
+            .context_bigrams
+            .entry("输入".into())
+            .or_default()
+            .insert("完成".into(), 20.0);
+        core.prediction.clear_cache();
+        let result = core.predict_request(request);
+        assert_eq!(result.text, "完成");
+        assert_eq!(result.source, "personal_memory");
+    }
+
+    #[test]
+    fn blank_password_keeps_only_same_endpoint_secret() {
+        let temp = Temp::new("preferences");
+        let core = temp.core();
+        let mut cfg = core.input.lock().engine.config.clone();
+        cfg.koofr_endpoint = Some(" https://example.org/dav/ ".into());
+        cfg.koofr_username = Some(" user ".into());
+        cfg.koofr_password = Some("\r\nsecret\r\n".into());
+        core.apply_preferences(cfg.clone()).unwrap();
+        for password in [None, Some(String::new())] {
+            cfg.koofr_password = password;
+            core.apply_preferences(cfg.clone()).unwrap();
+            assert_eq!(
+                core.input.lock().engine.config.koofr_password.as_deref(),
+                Some("secret")
+            );
+            assert_eq!(
+                core.sync
+                    .lock()
+                    .dav_config
+                    .as_ref()
+                    .unwrap()
+                    .username
+                    .as_deref(),
+                Some("user")
+            );
+        }
+        cfg.koofr_endpoint = Some("https://other.example/dav".into());
+        core.apply_preferences(cfg.clone()).unwrap();
+        assert!(core.input.lock().engine.config.koofr_password.is_none());
+        cfg.koofr_password = Some("other-secret".into());
+        core.apply_preferences(cfg.clone()).unwrap();
+        cfg.koofr_password = None;
+        cfg.koofr_endpoint = None;
+        core.apply_preferences(cfg).unwrap();
+        assert!(core.input.lock().engine.config.koofr_password.is_none());
+    }
+
+    #[test]
+    fn handwriting_paths_hot_reload_and_normalized_strokes() {
+        let temp = Temp::new("handwriting");
+        let core = temp.core();
+        let stroke = [
+            StrokePoint {
+                x: 0.15,
+                y: 0.5,
+                timestamp_ms: 0,
+            },
+            StrokePoint {
+                x: 0.85,
+                y: 0.5,
+                timestamp_ms: 30,
+            },
+        ];
+        for mode in [HwMode::PhoneticLookup, HwMode::ContinuousLattice] {
+            core.hw_begin(mode);
+            assert!(matches!(
+                core.hw_push_stroke(&stroke, true),
+                Err(VitralError::ModelUnavailable(_))
+            ));
+            assert!(matches!(
+                core.hw_end(),
+                Err(VitralError::ModelUnavailable(_))
+            ));
+        }
+        // A downloaded file changes every consumer together, even before an ONNX session is opened.
+        let model_dir = models::store_root(temp.0.to_str().unwrap(), "").join("handwriting");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let model = models::Catalog::builtin()
+            .models
+            .into_iter()
+            .find(|m| m.id == "handwriting-cnn")
+            .unwrap();
+        for file in model.files {
+            let path = models::store_root(temp.0.to_str().unwrap(), "").join(file.rel_path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(path)
+                .unwrap()
+                .set_len(file.size)
+                .unwrap();
+        }
+        core.reload_assets().unwrap();
+        let assert_paths = |enabled| {
+            let st = core.input.lock();
+            let paths = core.models.paths();
+            assert_eq!(st.engine.model_paths, paths);
+            assert_eq!(st.hw.model_paths.as_ref(), Some(&paths));
+            assert_eq!(st.voice.model_paths, paths);
+            assert_eq!(paths.handwriting.is_some(), enabled);
+        };
+        assert_paths(true);
+        for mode in [HwMode::PhoneticLookup, HwMode::ContinuousLattice] {
+            core.hw_begin(mode);
+            core.hw_push_stroke(&stroke[..1], false).unwrap();
+            core.hw_push_stroke(&stroke[1..], true).unwrap();
+            match core.hw_end().unwrap() {
+                HandwritingPayload::Mode1(result) => assert_eq!(result.candidates[0].ch, "一"),
+                HandwritingPayload::Mode2(result) => assert_eq!(result.composing_text, "一"),
+            }
+        }
+        core.hw_begin(HwMode::PhoneticLookup);
+        assert!(matches!(
+            core.hw_push_stroke(
+                &[StrokePoint {
+                    x: f32::NAN,
+                    y: 0.5,
+                    timestamp_ms: 0
+                }],
+                true
+            ),
+            Err(VitralError::InvalidArgument(_))
+        ));
+        core.models_set_enabled("handwriting-cnn", false).unwrap();
+        assert_paths(false);
+        core.models_set_enabled("handwriting-cnn", true).unwrap();
+        assert_paths(true);
+        core.models_delete("handwriting-cnn").unwrap();
+        assert_paths(false);
+        assert!(!model_dir.exists());
+    }
+}
+
+#[cfg(test)]
+mod input_feature_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    struct Fixture {
+        core: VitralCore,
+        root: PathBuf,
+    }
+    impl Fixture {
+        fn new(schema: SchemaKind, adaptive: bool) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "vitral-input-features-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let cfg = EngineConfig {
+                data_dir: root.join("data").to_string_lossy().into_owned(),
+                cache_dir: root.join("cache").to_string_lossy().into_owned(),
+                assets_dir: root.join("missing-assets").to_string_lossy().into_owned(),
+                schema,
+                adaptive_learning: adaptive,
+                pure_offline: true,
+                ..Default::default()
+            };
+            Self {
+                core: VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap(),
+                root,
+            }
+        }
+        fn type_code(&self, code: &str) -> InputAction {
+            code.chars().map(|c| self.key(c as u32)).last().unwrap()
+        }
+        fn key(&self, code: u32) -> InputAction {
+            self.core.process_key(code, 0, SwipeDir::None).unwrap()
+        }
+        fn choose(&self, text: &str) -> InputAction {
+            let index = self
+                .core
+                .input
+                .lock()
+                .engine
+                .current_candidates
+                .iter()
+                .position(|c| c.text == text)
+                .unwrap_or_else(|| panic!("missing {text}"));
+            self.core.select_candidate(index).unwrap()
+        }
+        fn add_words(&self, words: &[(&str, &str)]) {
+            let entries: Vec<_> = words
+                .iter()
+                .map(|(text, pinyin)| crate::imp::ImportedLexiconEntry {
+                    text: (*text).into(),
+                    pinyin: (*pinyin).into(),
+                    toned_pinyin: (*pinyin).into(),
+                    xiaohe: crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin),
+                    weight: 100,
+                })
+                .collect();
+            self.core.imported_lexicon.write().inject_hotwords(&entries);
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            // Core has no pending network jobs in these offline fixtures.
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn local_selections_learn_whole_phrase_in_both_schemas() {
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "woyaodaka"),
+            (SchemaKind::DoublePinyinFlypy, "woycdaka"),
+        ] {
+            let f = Fixture::new(schema, true);
+            f.type_code(code);
+            let mut committed = String::new();
+            for text in ["我", "要", "打", "卡"] {
+                committed.push_str(f.choose(text).commit_text.as_deref().unwrap());
+            }
+            assert_eq!(committed, "我要打卡");
+            let state = f.core.input.lock();
+            assert_eq!(state.retention.user_phrases["我要打卡"].source, "typed");
+            drop(state);
+            assert_eq!(f.type_code(code).candidates[0].text, "我要打卡");
+        }
+    }
+
+    #[test]
+    fn local_phrase_learning_respects_cancel_edit_and_preference() {
+        for cancel in [0x1b, 0xff08] {
+            let f = Fixture::new(SchemaKind::RimeIce, true);
+            f.type_code("woyaodaka");
+            f.choose("我");
+            f.key(cancel);
+            f.key(0x1b);
+            f.type_code("ka");
+            f.choose("卡");
+            assert!(!f
+                .core
+                .input
+                .lock()
+                .retention
+                .user_phrases
+                .contains_key("我卡"));
+        }
+        let f = Fixture::new(SchemaKind::RimeIce, false);
+        f.type_code("woyaodaka");
+        for text in ["我", "要", "打", "卡"] {
+            f.choose(text);
+        }
+        assert!(f.core.input.lock().retention.user_phrases.is_empty());
+    }
+
+    #[test]
+    fn chinese_mode_mixes_canonical_english_without_displacing_exact_chinese() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let f = Fixture::new(schema, true);
+            f.add_words(&[("爱", "ai"), ("只", "zhi"), ("团", "tuan"), ("昂", "ang")]);
+            for (code, word) in [
+                ("github", "GitHub"),
+                ("iphone", "iPhone"),
+                ("python", "Python"),
+                ("vscode", "VSCode"),
+                ("vitral", "Vitral"),
+            ] {
+                assert_eq!(
+                    f.type_code(code).candidates[0].text,
+                    word,
+                    "{schema:?} {code}"
+                );
+                assert_eq!(f.choose(word).commit_text.as_deref(), Some(word));
+            }
+            let action = f.type_code("ai");
+            assert_eq!(action.candidates[0].text, "爱");
+            assert_eq!(action.candidates[1].text, "AI");
+            f.key(0x1b);
+            f.core
+                .input
+                .lock()
+                .retention
+                .record_english_casing("MyTool");
+            assert_eq!(f.type_code("mytool").candidates[0].text, "MyTool");
+        }
+    }
+
+    #[test]
+    fn syllable_split_command_and_configure_refresh_active_composition() {
+        assert!(!EngineConfig::parse_json("{}").unwrap().syllable_split);
+        let mut f = Fixture::new(SchemaKind::RimeIce, false);
+        let mut cfg = f.core.input.lock().engine.config.clone();
+        cfg.assets_dir = crate::eng::resolve_assets_dir("")
+            .expect("workspace assets")
+            .to_string_lossy()
+            .into_owned();
+        f.core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        let normal = f.type_code("dian");
+        assert!(matches!(
+            normal.candidates[0].text.as_str(),
+            "点" | "电" | "店"
+        ));
+        f.add_words(&[("点", "dian"), ("底案", "di an")]);
+        let action: InputAction = serde_json::from_value(
+            crate::commands::execute(
+                &f.core,
+                "set-syllable-split",
+                &serde_json::json!({"enabled":true}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!action.candidates.is_empty());
+        assert!(
+            action.candidates.iter().all(|c| c.comment == "di an"),
+            "{:?}",
+            action.candidates
+        );
+        assert!(action.commit_text.is_none());
+        assert_eq!(f.core.input.lock().engine.raw_input, "dian");
+        let normal: InputAction = serde_json::from_value(
+            crate::commands::execute(
+                &f.core,
+                "set-syllable-split",
+                &serde_json::json!({"enabled":false}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            normal.candidates[0].text.as_str(),
+            "点" | "电" | "店"
+        ));
+        let mut cfg = f.core.input.lock().engine.config.clone();
+        cfg.syllable_split = true;
+        crate::commands::execute(
+            &f.core,
+            "configure",
+            &serde_json::to_value(cfg.clone()).unwrap(),
+        )
+        .unwrap();
+        assert!(f
+            .core
+            .input
+            .lock()
+            .engine
+            .current_candidates
+            .iter()
+            .all(|c| c.comment == "di an"));
+        assert!(f
+            .core
+            .candidate_state()
+            .unwrap()
+            .candidates
+            .iter()
+            .all(|c| c.comment == "di an"));
+        cfg.syllable_split = false;
+        f.core.apply_preferences(cfg).unwrap();
+        assert!(matches!(
+            f.core.input.lock().engine.current_candidates[0]
+                .text
+                .as_str(),
+            "点" | "电" | "店"
+        ));
+        f.key(0x08);
+        assert_eq!(f.core.input.lock().engine.raw_input, "dia");
+        assert!(matches!(
+            f.key('n' as u32).candidates[0].text.as_str(),
+            "点" | "电" | "店"
+        ));
+        f.key(0x1b);
+        assert!(f
+            .core
+            .set_syllable_split(true)
+            .unwrap()
+            .candidates
+            .is_empty());
+        assert!(crate::commands::execute(
+            &f.core,
+            "set-syllable-split",
+            &serde_json::json!({"enabled":"true"})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn fuzzy_pinyin_is_opt_in_and_preserves_exact_readings() {
+        let f = Fixture::new(SchemaKind::RimeIce, true);
+        f.add_words(&[
+            ("四", "si"),
+            ("中国", "zhong guo"),
+            ("蓝", "lan"),
+            ("南", "nan"),
+            ("英", "ying"),
+            ("音", "yin"),
+        ]);
+        assert!(!f.type_code("si").candidates.iter().any(|c| c.text == "是"));
+        f.key(0x1b);
+        let mut cfg = f.core.input.lock().engine.config.clone();
+        cfg.fuzzy_pinyin = true;
+        f.core.apply_preferences(cfg).unwrap();
+        for (code, target) in [
+            ("s", "是"),
+            ("si", "是"),
+            ("zongguo", "中国"),
+            ("nan", "蓝"),
+            ("yin", "英"),
+        ] {
+            let action = f.type_code(code);
+            assert!(
+                action.candidates.iter().any(|c| c.text == target),
+                "{code}: {:?}",
+                action.candidates
+            );
+            if code == "si" {
+                assert_eq!(action.candidates[0].text, "四");
+            }
+            if code == "nan" {
+                assert_eq!(action.candidates[0].text, "南");
+            }
+            if code == "yin" {
+                assert_eq!(action.candidates[0].text, "音");
+            }
+            f.key(0x1b);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_backend_mixes_english_and_learns_local_phrase() {
+        let assets = crate::eng::resolve_assets_dir("").expect("workspace assets");
+        // The process-wide runtime must keep its reusable directories beyond this fixture.
+        crate::eng::rime_ffi::with_runtime(&assets, "", "", |_| Ok(())).unwrap();
+        let f = Fixture::new(SchemaKind::RimeIce, true);
+        {
+            let mut state = f.core.input.lock();
+            state.engine.resolved_assets_dir = Some(assets.clone());
+            state.engine.pure_rust.reload_assets(Some(&assets));
+        }
+        for (code, word) in [("github", "GitHub"), ("iphone", "iPhone")] {
+            assert_eq!(f.type_code(code).candidates[0].text, word);
+            assert_eq!(f.choose(word).commit_text.as_deref(), Some(word));
+        }
+        let english_alternative = f.type_code("ai");
+        assert_eq!(english_alternative.candidates[0].text, "爱");
+        assert_eq!(english_alternative.candidates[1].text, "AI");
+        f.key(0x1b);
+        f.type_code("woyaodaka");
+        for text in ["我", "要", "打", "卡"] {
+            for _ in 0..8 {
+                let state = f.core.input.lock();
+                let engine = &state.engine;
+                if engine.current_candidates.iter().any(|c| c.text == text) {
+                    break;
+                }
+                assert!(engine.current_page.has_next, "missing native {text}");
+                drop(state);
+                f.key(0xff56);
+            }
+            f.choose(text);
+        }
+        assert_eq!(f.type_code("woyaodaka").candidates[0].text, "我要打卡");
+        assert!(f
+            .core
+            .input
+            .lock()
+            .retention
+            .user_phrases
+            .contains_key("我要打卡"));
+        f.key(0x1b);
+        let mut cfg = f.core.input.lock().engine.config.clone();
+        cfg.fuzzy_pinyin = true;
+        f.core.apply_preferences(cfg).unwrap();
+        for (code, word) in [("si", "是"), ("zongguo", "中国")] {
+            assert!(f.type_code(code).candidates.iter().any(|c| c.text == word));
+            f.key(0x1b);
+        }
+    }
+
+    #[test]
+    fn flypy_local_selection_and_punctuation_commit() {
+        let f = Fixture::new(SchemaKind::DoublePinyinFlypy, true);
+        f.type_code("woycdaka");
+        let first = f.choose("我");
+        assert_eq!(first.commit_text.as_deref(), Some("我"));
+        assert!(!first.preedit.text.is_empty());
+        assert_eq!(f.key(',' as u32).commit_text.as_deref(), Some("要打卡，"));
+        let engine = &f.core.input.lock().engine;
+        assert!(engine.raw_input.is_empty());
+        assert!(engine.current_candidates.is_empty());
     }
 }

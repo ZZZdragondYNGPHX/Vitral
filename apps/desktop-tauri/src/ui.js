@@ -1079,6 +1079,27 @@ function syncModelsPolling(state) {
   }
 }
 
+const MODEL_GROUP_DEFS = [
+  { id: "input", title: "输入与语言增强", subtitle: "万象长句语法解码与上下文语义重排", caps: ["grammar", "reranker"] },
+  { id: "multimodal", title: "多模态交互", subtitle: "离线手写认字与本地语音转写", caps: ["handwriting", "voice"] },
+  { id: "ai", title: "本地大模型与智能预测", subtitle: "端侧语境预测、用户画像蒸馏与离线 AI 工具", caps: ["local_llm"] },
+];
+const MODEL_CAP_DEFS = {
+  grammar: { title: "中文语法模型", subtitle: "提升全拼与双拼长句切分及语境排序" },
+  reranker: { title: "语义重排模型", subtitle: "连续手写模糊字位重排与语义增强" },
+  handwriting: { title: "离线手写识别", subtitle: "单字查音与连续手写联句（含生僻字索引）" },
+  voice: { title: "离线语音转写", subtitle: "按硬件档位选择轻快均衡或高精多语方言" },
+  local_llm: { title: "本地 Qwen3 推理", subtitle: "按内存档位选择低 / 中 / 高精端侧预测与 AI" },
+};
+let modelNav = { group: null, cap: null };
+
+function modelTierLabel(m) {
+  const rec = Number(m.recommended_ram_mb) || 0;
+  if (rec <= 2048) return "低配 · 轻量档";
+  if (rec <= 6144) return "中配 · 均衡档";
+  return "高配 · 旗舰档";
+}
+
 function renderModels() {
   const list = $("#models-list");
   const empty = $("#models-empty");
@@ -1111,7 +1132,165 @@ function renderModels() {
     return;
   }
 
-  for (const m of models) {
+  const knownCaps = new Set(MODEL_GROUP_DEFS.flatMap(g => g.caps));
+  const extraCaps = [...new Set(models.map(m => m.capability).filter(c => c && !knownCaps.has(c)))];
+  const groups = extraCaps.length
+    ? [...MODEL_GROUP_DEFS, { id: "other", title: "扩展模型", subtitle: "自定义目录中的扩展能力模型", caps: extraCaps }]
+    : MODEL_GROUP_DEFS;
+
+  if (modelNav.group) {
+    const curGroup = groups.find(g => g.id === modelNav.group);
+    const navBar = document.createElement("div");
+    navBar.className = "model-card";
+    navBar.style.display = "flex";
+    navBar.style.justifyContent = "space-between";
+    navBar.style.alignItems = "center";
+    navBar.style.padding = "10px 14px";
+
+    const crumbs = document.createElement("div");
+    crumbs.style.display = "flex";
+    crumbs.style.gap = "6px";
+    crumbs.style.alignItems = "center";
+    const rootLink = document.createElement("button");
+    rootLink.type = "button";
+    rootLink.className = "btn-ghost";
+    rootLink.textContent = "模型目录";
+    rootLink.onclick = () => { modelNav = { group: null, cap: null }; renderModels(); };
+    crumbs.append(rootLink);
+    if (curGroup) {
+      const sep1 = document.createElement("span");
+      sep1.textContent = "›";
+      const grpLink = document.createElement("button");
+      grpLink.type = "button";
+      grpLink.className = "btn-ghost";
+      grpLink.textContent = curGroup.title;
+      grpLink.onclick = () => { modelNav = { group: curGroup.id, cap: null }; renderModels(); };
+      crumbs.append(sep1, grpLink);
+    }
+    if (modelNav.cap) {
+      const sep2 = document.createElement("span");
+      sep2.textContent = "›";
+      const capSpan = document.createElement("strong");
+      capSpan.textContent = MODEL_CAP_DEFS[modelNav.cap]?.title || CAPABILITY_LABELS[modelNav.cap] || modelNav.cap;
+      crumbs.append(sep2, capSpan);
+    }
+    const backBtn = document.createElement("button");
+    backBtn.type = "button";
+    backBtn.className = "btn-ghost";
+    backBtn.textContent = "← 返回上级";
+    backBtn.onclick = () => {
+      if (modelNav.cap) modelNav = { group: modelNav.group, cap: null };
+      else modelNav = { group: null, cap: null };
+      renderModels();
+    };
+    navBar.append(crumbs, backBtn);
+    list.append(navBar);
+  }
+
+  // Level 1: Primary Category Directories
+  if (!modelNav.group) {
+    for (const grp of groups) {
+      const grpModels = models.filter(m => grp.caps.includes(m.capability));
+      if (!grpModels.length) continue;
+      const activeCnt = grpModels.filter(m => m.active).length;
+      const installedCnt = grpModels.filter(m => m.installed || m.bundled).length;
+      const card = document.createElement("article");
+      card.className = `model-card${activeCnt > 0 ? " is-active" : ""}`;
+      card.style.cursor = "pointer";
+      card.onclick = () => {
+        const availCaps = grp.caps.filter(c => grpModels.some(m => m.capability === c));
+        modelNav = { group: grp.id, cap: availCaps.length === 1 ? availCaps[0] : null };
+        renderModels();
+      };
+      const head = document.createElement("div");
+      head.className = "model-head";
+      const tg = document.createElement("div");
+      tg.className = "model-title-group";
+      const tl = document.createElement("div");
+      tl.className = "model-title-line";
+      const t = document.createElement("span");
+      t.className = "model-title";
+      t.textContent = grp.title;
+      const b = document.createElement("span");
+      b.className = activeCnt > 0 ? "badge is-ok" : "badge";
+      b.textContent = activeCnt > 0 ? `已启用 ${activeCnt} 项` : `共 ${grpModels.length} 个模型`;
+      tl.append(t, b);
+      if (installedCnt > 0) {
+        const ib = document.createElement("span");
+        ib.className = "badge is-accent";
+        ib.textContent = `已安装 ${installedCnt}`;
+        tl.append(ib);
+      }
+      const d = document.createElement("p");
+      d.className = "model-desc";
+      d.textContent = grp.subtitle;
+      tg.append(tl, d);
+      const arrow = document.createElement("span");
+      arrow.className = "badge";
+      arrow.textContent = "进入 ›";
+      head.append(tg, arrow);
+      card.append(head);
+      list.append(card);
+    }
+    return;
+  }
+
+  // Level 2: Sub-feature Directories
+  if (!modelNav.cap) {
+    const curGroup = groups.find(g => g.id === modelNav.group);
+    const subCaps = (curGroup?.caps || []).filter(c => models.some(m => m.capability === c));
+    for (const cap of subCaps) {
+      const capModels = models.filter(m => m.capability === cap).sort((a, b) => (a.recommended_ram_mb || 0) - (b.recommended_ram_mb || 0));
+      const def = MODEL_CAP_DEFS[cap] || { title: CAPABILITY_LABELS[cap] || cap, subtitle: "" };
+      const activeCnt = capModels.filter(m => m.active).length;
+      const tiers = [...new Set(capModels.map(modelTierLabel))].join(" / ");
+      const card = document.createElement("article");
+      card.className = `model-card${activeCnt > 0 ? " is-active" : ""}`;
+      card.style.cursor = "pointer";
+      card.onclick = () => { modelNav = { group: modelNav.group, cap }; renderModels(); };
+      const head = document.createElement("div");
+      head.className = "model-head";
+      const tg = document.createElement("div");
+      tg.className = "model-title-group";
+      const tl = document.createElement("div");
+      tl.className = "model-title-line";
+      const t = document.createElement("span");
+      t.className = "model-title";
+      t.textContent = def.title;
+      const tb = document.createElement("span");
+      tb.className = "badge is-accent";
+      tb.textContent = tiers;
+      const sb = document.createElement("span");
+      sb.className = activeCnt > 0 ? "badge is-ok" : "badge";
+      sb.textContent = activeCnt > 0 ? "已启用" : "未启用";
+      tl.append(t, tb, sb);
+      const d = document.createElement("p");
+      d.className = "model-desc";
+      d.textContent = def.subtitle;
+      tg.append(tl, d);
+      const arrow = document.createElement("span");
+      arrow.className = "badge";
+      arrow.textContent = "查看档位 ›";
+      head.append(tg, arrow);
+      card.append(head);
+      list.append(card);
+    }
+    return;
+  }
+
+  // Level 3: Tiered Models (Low / Mid / High)
+  if (modelNav.cap === "local_llm") {
+    const builtin = document.createElement("article");
+    builtin.className = "model-card is-active";
+    builtin.innerHTML = `<div class="model-head"><div class="model-title-group"><div class="model-title-line"><span class="model-title">低配 · 内置算法预测引擎</span><span class="badge is-accent">低配 · 零体积</span><span class="badge is-ok">全机型推荐</span></div><p class="model-desc">无需下载大模型，基于本地词典前缀续写与个人习惯记忆实现零延迟预测</p><div class="model-meta">体积 0 B · 纯本地即时生效</div></div><span class="badge is-ok">内置已启用</span></div>`;
+    list.append(builtin);
+  }
+
+  const visibleModels = models
+    .filter(m => m.capability === modelNav.cap)
+    .sort((a, b) => (a.recommended_ram_mb || 0) - (b.recommended_ram_mb || 0));
+
+  for (const m of visibleModels) {
     const card = document.createElement("article");
     card.className = `model-card${m.active ? " is-active" : ""}`;
     const dl = m.download;
@@ -1131,10 +1310,10 @@ function renderModels() {
     title.textContent = m.name;
     titleLine.append(title);
 
-    const capTag = document.createElement("span");
-    capTag.className = "badge is-accent";
-    capTag.textContent = CAPABILITY_LABELS[m.capability] || m.capability;
-    titleLine.append(capTag);
+    const tierTag = document.createElement("span");
+    tierTag.className = "badge is-accent";
+    tierTag.textContent = modelTierLabel(m);
+    titleLine.append(tierTag);
 
     const fitTag = document.createElement("span");
     if (m.fit === "recommended") {
@@ -1226,11 +1405,23 @@ function renderModels() {
     toggle.setAttribute("aria-label", `启用${m.name}`);
     toggle.onchange = () => {
       const nextEnabled = toggle.checked;
+      const replacedPeer = nextEnabled
+        ? ((modelsState?.models || []).find(
+            (x) => x.capability === m.capability && x.id !== m.id && x.active
+          )?.name || "")
+        : "";
       run(async () => {
         modelsState = await api("models-set-enabled", { id: m.id, enabled: nextEnabled });
         renderModels();
         syncModelsPolling(modelsState);
-        setNotice(nextEnabled ? `已启用「${m.name}」并完成热加载` : `已停用「${m.name}」并释放缓存`, "ok");
+        setNotice(
+          nextEnabled
+            ? (replacedPeer
+                ? `已切换为「${m.name}」，已自动关闭「${replacedPeer}」并释放缓存`
+                : `已启用「${m.name}」并完成热加载`)
+            : `已停用「${m.name}」并释放缓存`,
+          "ok"
+        );
       });
     };
     const toggleText = document.createElement("span");

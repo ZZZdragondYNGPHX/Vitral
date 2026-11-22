@@ -9,6 +9,7 @@ import org.json.JSONObject
 
 object VitralNative {
     init {
+        runCatching { System.loadLibrary("onnxruntime") }
         System.loadLibrary("vitral_jni")
     }
 

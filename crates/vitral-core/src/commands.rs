@@ -50,6 +50,9 @@ fn keycode(key: &str) -> Result<u32> {
 
 pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
     Ok(match cmd {
+        "context-next-hints" => json!({"hints": core.context_next_hints(
+            v["context_before"].as_str().unwrap_or(""), v["prediction_text"].as_str(),
+        )}),
         "predict-request" => to_value(core.predict_request(serde_json::from_value(v.clone())?))?,
         "predict-poll" => to_value(core.predict_poll(v.get("id").map(|_| arg(v, "id")).transpose()?))?,
         "predict-cancel" => to_value(core.predict_cancel())?,
@@ -116,6 +119,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             to_value(st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == key && st.engine.config.shortcut_enabled(b.action)).map(|b| b.action))?
         }
         "shortcut-key" => to_value(core.shortcut_key(string(v, "key")?)?)?,
+        "set-syllable-split" => to_value(core.set_syllable_split(arg(v, "enabled")?)?)?,
         "candidate-state" => to_value(core.candidate_state()?)?,
         "select-candidate" => to_value(core.select_candidate(arg(v, "idx")?)?)?,
         "pin-candidate" => to_value(core.pin_candidate(arg(v, "idx")?)?)?,

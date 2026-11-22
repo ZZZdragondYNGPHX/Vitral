@@ -92,7 +92,7 @@ pub struct HandwritingSession {
     pub last_slots: Vec<Mode2Slot>,
     pub last_mode1: Vec<Mode1Candidate>,
     pub assets_dir: Option<PathBuf>,
-    model_paths: Option<crate::models::ModelPaths>,
+    pub(crate) model_paths: Option<crate::models::ModelPaths>,
     slot_span_bounds: Vec<(usize, usize)>,
     manual_locked_by_span: HashMap<(usize, usize), String>,
     baseline_char_by_span: HashMap<(usize, usize), String>,
@@ -152,6 +152,11 @@ impl HandwritingSession {
     pub fn push_stroke(&mut self, points: &[StrokePoint], pen_up: bool) -> Result<(), VitralError> {
         if self.active_mode.is_none() {
             return Err(VitralError::NotInitialized);
+        }
+        if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return Err(VitralError::InvalidArgument(
+                "handwriting coordinates must be finite".into(),
+            ));
         }
         if !points.is_empty() {
         self.revision = self.revision.wrapping_add(1);

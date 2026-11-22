@@ -43,6 +43,8 @@ pub struct RimeDictCorpus {
     pub word_readings: HashMap<String, (Vec<String>, u64)>,
     pub spaced_pinyin_to_words: HashMap<String, Vec<(String, u64)>>,
     pub max_word_chars: usize,
+    pub abbreviations: HashMap<String, Vec<(String, u64)>>,
+    pub continuations: HashMap<String, Vec<(String, u64)>>,
     word_bloom: Vec<u64>,
 }
 
@@ -143,6 +145,42 @@ impl RimeDictCorpus {
             }
         }
 
+        // Bound every initials bucket while building it; never collect the entire corpus twice.
+        let mut abbreviations: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        for (word, (syllables, weight)) in &word_readings {
+            if !(2..=6).contains(&syllables.len()) || word.chars().count() != syllables.len() {
+                continue;
+            }
+            let key: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
+            let bucket = abbreviations.entry(key).or_default();
+            bucket.push((word.clone(), *weight));
+            bucket.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            bucket.truncate(16);
+        }
+        abbreviations.shrink_to_fit();
+        // Single-character contexts need more coverage than longer, more specific prefixes.
+        let mut continuations: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+        for (word, (_, weight)) in &word_readings {
+            if !(2..=6).contains(&word.chars().count()) {
+                continue;
+            }
+            for (prefix_len, (offset, _)) in word.char_indices().skip(1).take(3).enumerate() {
+                let limit = if prefix_len == 0 { 24 } else { 10 };
+                let bucket = continuations.entry(word[..offset].to_string()).or_default();
+                let suffix = &word[offset..];
+                let rank = bucket.partition_point(|(text, w)| {
+                    *w > *weight || (*w == *weight && text.as_str() < suffix)
+                });
+                if rank < limit {
+                    bucket.insert(rank, (suffix.to_string(), *weight));
+                    bucket.truncate(limit);
+                }
+            }
+        }
+        for bucket in continuations.values_mut() {
+            bucket.shrink_to_fit();
+        }
+        continuations.shrink_to_fit();
         char_readings.shrink_to_fit();
         word_readings.shrink_to_fit();
         spaced_pinyin_to_words.shrink_to_fit();
@@ -176,6 +214,8 @@ impl RimeDictCorpus {
             word_readings,
             spaced_pinyin_to_words,
             max_word_chars: max_word_chars.min(12),
+            abbreviations,
+            continuations,
             word_bloom,
         }
     }
@@ -347,6 +387,19 @@ impl RimeDictCorpus {
             ("世", "shi", 5_000_000),
             ("界", "jie", 5_000_000),
             ("我", "wo", 20_000_000),
+            ("女", "nv", 5_000_000),
+            ("绿", "lv", 3_000_000),
+            ("旅", "lv", 2_000_000),
+            ("虐", "nve", 500_000),
+            ("略", "lve", 1_000_000),
+            ("局", "ju", 3_000_000),
+            ("需", "xu", 3_000_000),
+            ("握", "wo", 500_000),
+            ("为", "wei", 10_000_000),
+            ("无", "wu", 8_000_000),
+            ("要", "yao", 10_000_000),
+            ("打", "da", 8_000_000),
+            ("卡", "ka", 5_000_000),
             ("去", "qu", 8_000_000),
             ("的", "de", 76_000_000),
             ("是", "shi", 30_000_000),
@@ -387,6 +440,16 @@ impl RimeDictCorpus {
         }
         const FALLBACK_WORDS: &[(&str, &str, u64)] = &[
             ("你好", "ni hao", 1_000_000),
+            ("我的", "wo de", 1_000_000),
+            ("我要", "wo yao", 900_000),
+            ("打卡", "da ka", 500_000),
+            ("输入法", "shu ru fa", 500_000),
+            ("正确", "zheng que", 500_000),
+            ("人工智能", "ren gong zhi neng", 500_000),
+            ("没关系", "mei guan xi", 500_000),
+            ("为什么", "wei shen me", 500_000),
+            ("不知道", "bu zhi dao", 500_000),
+            ("怎么样", "zen me yang", 500_000),
             ("世界", "shi jie", 1_000_000),
             ("你好世界", "ni hao shi jie", 1_000_000),
             ("西安", "xi an", 55_003),
@@ -1249,6 +1312,39 @@ impl PolyphoneAnnotator {
         }
 
         resolved
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+
+    #[test]
+    fn continuation_buckets_keep_wider_single_character_coverage() {
+        let root = std::env::temp_dir()
+            .join(format!("vitral-continuation-bounds-{}", std::process::id()));
+        let dict_dir = root.join("rime/cn_dicts");
+        fs::create_dir_all(&dict_dir).unwrap();
+        let mut dict = String::from("---\nname: test\n...\n");
+        for i in 0..30 {
+            let ch = char::from_u32(0x4e00 + i).unwrap();
+            for (prefix, reading) in [
+                ("正", "zheng"),
+                ("人工", "ren gong"),
+                ("输入法", "shu ru fa"),
+            ] {
+                dict.push_str(&format!("{prefix}{ch}\t{reading} que\t{}\n", 100 - i));
+            }
+        }
+        fs::write(dict_dir.join("base.dict.yaml"), dict).unwrap();
+        let corpus = RimeDictCorpus::build(Some(&root));
+        fs::remove_dir_all(root).unwrap();
+        for (prefix, limit) in [("正", 24), ("人工", 10), ("输入法", 10)] {
+            let bucket = &corpus.continuations[prefix];
+            assert_eq!(bucket.len(), limit);
+            assert_eq!(bucket[0].1, 100);
+            assert_eq!(bucket[limit - 1].1, 101 - limit as u64);
+        }
     }
 }
 

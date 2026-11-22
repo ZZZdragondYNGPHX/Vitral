@@ -13,7 +13,7 @@ use std::{
         Arc,
     },
     thread::JoinHandle,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub const DEFAULT_CATALOG_URL: &str =
@@ -325,7 +325,8 @@ pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let result = (|| {
         let mut options = fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
@@ -483,11 +484,9 @@ impl ModelManager {
         Ok(())
     }
     fn disable_peers(&self, model: &Model, state: &mut State) {
-        if matches!(model.capability.as_str(), "voice" | "local_llm") {
-            for peer in &self.inner.catalog.read().models {
-                if peer.capability == model.capability && peer.id != model.id {
-                    state.enabled.insert(peer.id.clone(), false);
-                }
+        for peer in &self.inner.catalog.read().models {
+            if peer.capability == model.capability && peer.id != model.id {
+                state.enabled.insert(peer.id.clone(), false);
             }
         }
     }
@@ -627,9 +626,9 @@ impl ModelManager {
         };
         fs::create_dir_all(tmp).map_err(io)?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(15)))
-            .timeout_recv_response(Some(Duration::from_secs(15)))
-            .timeout_per_read(Some(Duration::from_secs(2)))
+            .timeout_connect(Some(Duration::from_secs(20)))
+            .timeout_recv_response(Some(Duration::from_secs(30)))
+            .timeout_per_read(Some(Duration::from_secs(5)))
             .build()
             .into();
         let mut completed = 0;
@@ -637,57 +636,152 @@ impl ModelManager {
             let part = tmp.join(format!("{idx}.part"));
             let mut last_error = invalid("无下载地址");
             let mut verified = false;
-            for url in &f.urls {
-                check()?;
-                {
-                    let mut p = self.inner.progress.lock();
-                    let p = p.get_mut(&m.id).unwrap();
-                    p.current_file = Some(f.rel_path.clone());
-                    p.downloaded_bytes = completed;
+            let verify = || -> Result<()> {
+                let mut input = fs::File::open(&part).map_err(io)?;
+                let mut hash = Sha256::new();
+                let mut size = 0;
+                let mut buf = [0u8; 65536];
+                loop {
+                    check()?;
+                    let len = input.read(&mut buf).map_err(io)?;
+                    if len == 0 {
+                        break;
+                    }
+                    size += len as u64;
+                    hash.update(&buf[..len]);
                 }
-                let attempt = (|| {
-                    let mut response = agent.get(url).call().map_err(io)?;
-                    let mut reader = response.body_mut().as_reader();
-                    let mut out = fs::File::create(&part).map_err(io)?;
-                    let mut hash = Sha256::new();
-                    let mut n = 0;
-                    let mut buf = [0u8; 65536];
-                    loop {
-                        check()?;
-                        let len = reader.read(&mut buf).map_err(io)?;
-                        if len == 0 {
-                            break;
+                if size != f.size
+                    || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&f.sha256)
+                {
+                    return Err(VitralError::Integrity(format!(
+                        "{} 大小或 SHA-256 不匹配",
+                        f.rel_path
+                    )));
+                }
+                Ok(())
+            };
+            'mirrors: for url in &f.urls {
+                for retry in 0..=3 {
+                    check()?;
+                    if retry > 0 {
+                        // Keep cancellation/offline responsive throughout the backoff.
+                        let until = Instant::now() + Duration::from_secs(1 << (retry - 1));
+                        while Instant::now() < until {
+                            check()?;
+                            std::thread::sleep(
+                                until
+                                    .saturating_duration_since(Instant::now())
+                                    .min(Duration::from_millis(50)),
+                            );
                         }
-                        n += len as u64;
-                        if n > f.size {
-                            return Err(VitralError::Integrity(format!("{} 文件过大", f.rel_path)));
+                    }
+                    let mut existing = fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                    if existing > f.size {
+                        fs::remove_file(&part).map_err(io)?;
+                        existing = 0;
+                    }
+                    {
+                        let mut progress = self.inner.progress.lock();
+                        let p = progress.get_mut(&m.id).unwrap();
+                        p.current_file = Some(f.rel_path.clone());
+                        p.downloaded_bytes = completed + existing;
+                    }
+                    let attempt = (|| {
+                        if existing == f.size && part.is_file() {
+                            return verify();
                         }
-                        out.write_all(&buf[..len]).map_err(io)?;
-                        hash.update(&buf[..len]);
+                        let mut request = agent.get(url).header("Accept-Encoding", "identity");
+                        if existing > 0 {
+                            request = request.header("Range", format!("bytes={existing}-"));
+                        }
+                        let mut response = request.call().map_err(io)?;
+                        let append = response.status() == 206 && existing > 0;
+                        if response.status() != 200 && !append {
+                            return Err(io(format!(
+                                "unexpected HTTP status {}",
+                                response.status()
+                            )));
+                        }
+                        let mut out = fs::OpenOptions::new()
+                            .create(true)
+                            .write(true)
+                            .append(append)
+                            .truncate(!append)
+                            .open(&part)
+                            .map_err(io)?;
+                        let mut n = if append { existing } else { 0 };
                         self.inner
                             .progress
                             .lock()
                             .get_mut(&m.id)
                             .unwrap()
                             .downloaded_bytes = completed + n;
+                        let mut reader = response.body_mut().as_reader();
+                        let mut last_progress = Instant::now();
+                        let mut buf = [0u8; 65536];
+                        loop {
+                            check()?;
+                            let len = match reader.read(&mut buf) {
+                                Ok(len) => len,
+                                Err(e)
+                                    if matches!(
+                                        e.kind(),
+                                        std::io::ErrorKind::TimedOut
+                                            | std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::Interrupted
+                                    ) || e
+                                        .get_ref()
+                                        .and_then(|e| e.downcast_ref::<ureq::Error>())
+                                        .is_some_and(|e| matches!(e, ureq::Error::Timeout(_))) =>
+                                {
+                                    check()?;
+                                    if last_progress.elapsed() >= Duration::from_secs(45) {
+                                        return Err(io(e));
+                                    }
+                                    continue;
+                                }
+                                Err(e) => return Err(io(e)),
+                            };
+                            if len == 0 {
+                                break;
+                            }
+                            n += len as u64;
+                            if n > f.size {
+                                return Err(VitralError::Integrity(format!(
+                                    "{} 文件过大",
+                                    f.rel_path
+                                )));
+                            }
+                            out.write_all(&buf[..len]).map_err(io)?;
+                            last_progress = Instant::now();
+                            self.inner
+                                .progress
+                                .lock()
+                                .get_mut(&m.id)
+                                .unwrap()
+                                .downloaded_bytes = completed + n;
+                        }
+                        out.sync_all().map_err(io)?;
+                        if n < f.size {
+                            return Err(io(format!("{} 下载中断，等待断点续传", f.rel_path)));
+                        }
+                        verify()
+                    })();
+                    match attempt {
+                        Ok(()) => {
+                            verified = true;
+                            break 'mirrors;
+                        }
+                        Err(e) => {
+                            check()?;
+                            let corrupt = matches!(e, VitralError::Integrity(_));
+                            last_error = e;
+                            if corrupt {
+                                fs::remove_file(&part).map_err(io)?;
+                                break; // A corrupt mirror should not be retried with its bad bytes.
+                            }
+                        }
                     }
-                    if n != f.size
-                        || !format!("{:x}", hash.finalize()).eq_ignore_ascii_case(&f.sha256)
-                    {
-                        return Err(VitralError::Integrity(format!(
-                            "{} 大小或 SHA-256 不匹配",
-                            f.rel_path
-                        )));
-                    }
-                    out.sync_all().map_err(io)?;
-                    Ok(())
-                })();
-                match attempt {
-                    Ok(()) => {
-                        verified = true;
-                        break;
-                    }
-                    Err(e) => last_error = e,
                 }
             }
             if !verified {
@@ -868,7 +962,7 @@ mod tests {
     }
     #[test]
     fn capability_enable_and_download_are_exclusive() {
-        for capability in ["voice", "local_llm"] {
+        for capability in ["voice", "local_llm", "grammar", "handwriting"] {
             let t = Temp::new();
             let bytes = b"model".to_vec();
             let (url, server) = serve(bytes.clone(), 1);
@@ -1010,6 +1104,165 @@ mod tests {
         assert!(!m.inner.root.join("test/model.bin").exists());
         assert!(!m.inner.root.join(".tmp/test-model").exists());
     }
+    #[test]
+    fn complete_part_is_verified_and_reused_without_http() {
+        let t = Temp::new();
+        let bytes = b"complete verified part";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let m = manager(
+            &t,
+            &fixture(
+                vec!["http://127.0.0.1:1/unused".into()],
+                &hash,
+                bytes.len() as u64,
+            ),
+        );
+        let tmp = m.inner.root.join(".tmp/test-model");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("0.part"), bytes).unwrap();
+        m.start_download("test-model", &OfflineGuard::new(false), || Ok(()))
+            .unwrap();
+        assert_eq!(wait(&m, "test-model").status, "completed");
+        assert_eq!(
+            fs::read(m.inner.root.join("test/model.bin")).unwrap(),
+            bytes
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn ignored_range_restarts_instead_of_appending() {
+        let t = Temp::new();
+        let bytes = b"server ignores range";
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let req = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                req.headers()
+                    .iter()
+                    .find(|h| h.field.equiv("Range"))
+                    .unwrap()
+                    .value
+                    .as_str(),
+                "bytes=3-"
+            );
+            req.respond(Response::from_data(bytes.to_vec())).unwrap();
+        });
+        let m = manager(&t, &fixture(vec![url], &hash, bytes.len() as u64));
+        let tmp = m.inner.root.join(".tmp/test-model");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::write(tmp.join("0.part"), &bytes[..3]).unwrap();
+        m.start_download("test-model", &OfflineGuard::new(false), || Ok(()))
+            .unwrap();
+        assert_eq!(wait(&m, "test-model").status, "completed");
+        handle.join().unwrap();
+        assert_eq!(
+            fs::read(m.inner.root.join("test/model.bin")).unwrap(),
+            bytes
+        );
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn range_resume_after_interrupted_body_and_slow_reads() {
+        struct InterruptedBody {
+            sent: bool,
+        }
+        impl Read for InterruptedBody {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.sent {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "interrupted fixture",
+                    ));
+                }
+                self.sent = true;
+                let len = buf.len().min(8192);
+                buf[..len].fill(42);
+                Ok(len)
+            }
+        }
+        struct DelayedBody {
+            remaining: usize,
+            reads: usize,
+        }
+        impl Read for DelayedBody {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.remaining == 0 {
+                    return Ok(0);
+                }
+                if self.reads == 1 {
+                    std::thread::sleep(Duration::from_millis(5500));
+                }
+                self.reads += 1;
+                let len = buf.len().min(self.remaining).min(8192);
+                buf[..len].fill(42);
+                self.remaining -= len;
+                Ok(len)
+            }
+        }
+        let t = Temp::new();
+        let bytes = vec![42; 32768];
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", server.server_addr());
+        let handle = std::thread::spawn(move || {
+            let first = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            assert!(!first.headers().iter().any(|h| h.field.equiv("Range")));
+            let _ = first.respond(Response::new(
+                200.into(),
+                vec![],
+                InterruptedBody { sent: false },
+                Some(32768),
+                None,
+            ));
+            let second = server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            let range = second
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Range"))
+                .unwrap();
+            assert_eq!(range.value.as_str(), "bytes=8192-");
+            second
+                .respond(Response::new(
+                    206.into(),
+                    vec![
+                        tiny_http::Header::from_bytes("Content-Range", "bytes 8192-32767/32768")
+                            .unwrap(),
+                    ],
+                    DelayedBody {
+                        remaining: 24576,
+                        reads: 0,
+                    },
+                    Some(24576),
+                    None,
+                ))
+                .unwrap();
+        });
+        let m = manager(&t, &fixture(vec![url], &hash, bytes.len() as u64));
+        m.start_download("test-model", &OfflineGuard::new(false), || Ok(()))
+            .unwrap();
+        let result = wait(&m, "test-model");
+        handle.join().unwrap();
+        assert_eq!(result.status, "completed", "{:?}", result.error);
+        assert_eq!(
+            fs::read(m.inner.root.join("test/model.bin")).unwrap(),
+            bytes
+        );
+        assert!(!m.inner.root.join(".tmp").exists());
+    }
+
     struct SlowReader {
         remaining: usize,
     }

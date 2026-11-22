@@ -807,13 +807,19 @@ impl RetentionEngine {
         {
             return;
         }
-        let count = self
+        let frecency_count = self
             .frecency
             .get(word)
             .copied()
             .unwrap_or(1.0)
-            .floor()
+            .round()
             .max(1.0) as u32;
+        let count = self
+            .user_phrases
+            .get(word)
+            .map_or(frecency_count, |p| {
+                p.count.saturating_add(1).max(frecency_count)
+            });
         self.user_phrases.insert(
             word.into(),
             UserPhrase {
@@ -1250,7 +1256,7 @@ pub(crate) fn is_cjk(ch: char) -> bool {
 }
 
 fn valid_phrase(word: &str) -> bool {
-    (2..=6).contains(&word.chars().count()) && word.chars().all(is_cjk)
+    (2..=8).contains(&word.chars().count()) && word.chars().all(is_cjk)
 }
 
 fn valid_english(raw: &str) -> bool {
@@ -1371,6 +1377,47 @@ pub fn is_voice_hold_triggered(hold_ms: u32) -> bool {
 #[cfg(test)]
 mod personalization_tests {
     use super::*;
+
+    #[test]
+    fn typed_phrase_updates_preserve_counts_after_frecency_decay() {
+        let mut r = RetentionEngine::default();
+        let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe("ce shi ci zu");
+        r.register_typed_phrase("测试词组", "ce shi ci zu", &xiaohe, 1000);
+        r.user_phrases.get_mut("测试词组").unwrap().count = 100;
+        r.frecency.insert("测试词组".into(), 0.1);
+        r.register_typed_phrase("测试词组", "ce shi ci zu", &xiaohe, 61_000);
+        let phrase = &r.user_phrases["测试词组"];
+        assert_eq!(phrase.count, 101);
+        assert_eq!(phrase.updated_ms, 61_000);
+        assert_eq!(phrase.acronym, "cscz");
+        assert_eq!(r.query_acronym_phrases("cscz")[0].word, "测试词组");
+        r.user_phrases.get_mut("测试词组").unwrap().count = u32::MAX;
+        r.register_typed_phrase("测试词组", "ce shi ci zu", &xiaohe, 62_000);
+        assert_eq!(r.user_phrases["测试词组"].count, u32::MAX);
+    }
+
+    #[test]
+    fn eight_character_typed_phrase_survives_query_and_sync() {
+        let mut r = RetentionEngine::default();
+        let word = "我要打卡你好世界";
+        let pinyin = "wo yao da ka ni hao shi jie";
+        let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin);
+        r.register_typed_phrase(word, pinyin, &xiaohe, RetentionEngine::now_epoch_ms());
+        assert_eq!(
+            r.query_user_phrases("woyaodakanihaoshijie", false)[0].word,
+            word
+        );
+        let mut other = RetentionEngine::default();
+        other.merge_crdt_delta(&r.export_crdt_delta("test-device"));
+        assert_eq!(other.query_user_phrases(&xiaohe, true)[0].word, word);
+        r.register_typed_phrase(
+            "我要打卡你好世界啊",
+            pinyin,
+            &xiaohe,
+            RetentionEngine::now_epoch_ms(),
+        );
+        assert!(!r.user_phrases.contains_key("我要打卡你好世界啊"));
+    }
 
     #[test]
     fn acronym_phrases_use_spaced_initials_and_legacy_xiaohe_fallback() {

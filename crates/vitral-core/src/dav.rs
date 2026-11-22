@@ -99,8 +99,18 @@ impl DavConfig {
         }
         Some(Self {
             endpoint: ep.to_string(),
-            username: cfg.koofr_username.clone(),
-            password: cfg.koofr_password.clone(),
+            username: cfg
+                .koofr_username
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            password: cfg
+                .koofr_password
+                .as_deref()
+                .map(|s| s.trim_matches(['\r', '\n']))
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             root: cfg.koofr_root.clone(),
             sync_key: cfg.sync_key.clone(),
         })
@@ -143,13 +153,17 @@ impl DavConfig {
             ));
         }
         Ok(Self {
-            endpoint,
+            endpoint: endpoint.trim().to_string(),
             username: parsed
                 .koofr_username
-                .or_else(|| fallback.and_then(|f| f.username.clone())),
+                .or_else(|| fallback.and_then(|f| f.username.clone()))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty()),
             password: parsed
                 .koofr_password
-                .or_else(|| fallback.and_then(|f| f.password.clone())),
+                .or_else(|| fallback.and_then(|f| f.password.clone()))
+                .map(|s| s.trim_matches(['\r', '\n']).to_string())
+                .filter(|s| !s.is_empty()),
             root: parsed
                 .koofr_root
                 .or_else(|| fallback.and_then(|f| f.root.clone())),
@@ -236,14 +250,56 @@ pub fn normalize_clean_root(root: Option<&str>) -> String {
     .to_string()
 }
 
-fn dav_http_client() -> Result<reqwest::Client, VitralError> {
+fn dav_error_summary(message: &str) -> String {
+    // OpenDAL includes status and headers before its response body. Do not expose either.
+    let head = message.split('<').next().unwrap_or_default();
+    let status = head.split_once("status").and_then(|(_, status)| {
+        status
+            .trim_start_matches([':', ' ', '='])
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+    });
+    match status {
+        Some("401") => "WebDAV 认证失败 (401)：请检查账户、密码或端点路径".into(),
+        Some("403") => "WebDAV 权限被拒 (403)".into(),
+        Some("404") => "WebDAV 路径不存在 (404)".into(),
+        _ => {
+            let end = [
+                "headers",
+                "Headers",
+                "response",
+                "Response",
+                "report-to",
+                "body",
+            ]
+            .iter()
+            .filter_map(|marker| head.find(marker))
+            .min()
+            .unwrap_or(head.len());
+            let summary = &head[..end];
+            let summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!(
+                "WebDAV 操作失败：{}",
+                summary.chars().take(160).collect::<String>()
+            )
+        }
+    }
+}
+
+fn dav_http_client(follow_redirects: bool) -> Result<reqwest::Client, VitralError> {
     reqwest::Client::builder()
-            .tls_backend_preconfigured(rustls_client_config().clone())
-            .connect_timeout(Duration::from_secs(5))
-            .read_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(20))
-            .build()
-            .map_err(|e| VitralError::Io(format!("reqwest client build failed: {e}")))
+        .user_agent(concat!("Vitral/", env!("CARGO_PKG_VERSION")))
+        .tls_backend_preconfigured(rustls_client_config().clone())
+        .redirect(if follow_redirects {
+            reqwest::redirect::Policy::default()
+        } else {
+            reqwest::redirect::Policy::none()
+        })
+        .connect_timeout(Duration::from_secs(5))
+        .read_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| VitralError::Io(format!("reqwest client build failed: {e}")))
 }
 
 pub struct KoofrDavClient {
@@ -271,21 +327,27 @@ impl KoofrDavClient {
         let clean_root = validate_clean_root(cfg.root.as_deref())?;
         let opendal_root = format!("/{clean_root}/");
 
-        let client = dav_http_client()?;
+        let client = dav_http_client(true)?;
 
         let mut builder = opendal::services::Webdav::default()
             .endpoint(trimmed_ep)
             .root(&opendal_root)
             .disable_create_dir(disable_create_dir);
-        if let Some(ref u) = cfg.username {
-            if !u.trim().is_empty() {
-                builder = builder.username(u);
-            }
+        if let Some(user) = cfg
+            .username
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            builder = builder.username(user);
         }
-        if let Some(ref p) = cfg.password {
-            if !p.is_empty() {
-                builder = builder.password(p);
-            }
+        if let Some(password) = cfg
+            .password
+            .as_deref()
+            .map(|s| s.trim_matches(['\r', '\n']))
+            .filter(|s| !s.is_empty())
+        {
+            builder = builder.password(password);
         }
 
         let transport = HttpTransporter::new(ReqwestTransport::new(client));
@@ -321,9 +383,9 @@ impl KoofrDavClient {
 
     fn ensure_collections(&self, rel_parent: &str) -> Result<(), VitralError> {
         self.guard.require_online("dav_mkcol")?;
-        let mut url = reqwest::Url::parse(&self.cfg.endpoint)
+        let mut url = reqwest::Url::parse(self.cfg.endpoint.trim())
             .map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
-        let client = dav_http_client()?;
+        let client = dav_http_client(false)?;
         let method = reqwest::Method::from_bytes(b"MKCOL")
             .map_err(|e| VitralError::Internal(e.to_string()))?;
         run_on_blocking_dav_thread(|| {
@@ -343,20 +405,34 @@ impl KoofrDavClient {
                         .push("");
                     self.guard.require_online("dav_mkcol")?;
                     let mut request = client.request(method.clone(), url.clone());
-                    if let Some(user) = self.cfg.username.as_ref() {
-                        request = request.basic_auth(user, self.cfg.password.as_ref());
+                    if let Some(user) = self
+                        .cfg
+                        .username
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        request = request.basic_auth(
+                            user,
+                            self.cfg
+                                .password
+                                .as_deref()
+                                .map(|s| s.trim_matches(['\r', '\n']))
+                                .filter(|s| !s.is_empty()),
+                        );
                     }
                     let response = request
                         .send()
                         .await
                         .map_err(|e| VitralError::Io(e.without_url().to_string()))?;
                     if !response.status().is_success()
-                        && response.status() != reqwest::StatusCode::METHOD_NOT_ALLOWED
+                        && !matches!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED
+                            | reqwest::StatusCode::MOVED_PERMANENTLY | reqwest::StatusCode::FOUND)
                     {
-                        return Err(VitralError::Io(format!(
-                            "WebDAV MKCOL failed: HTTP status {}",
+                        return Err(VitralError::Io(dav_error_summary(&format!(
+                            "HTTP status {}",
                             response.status()
-                        )));
+                        ))));
                     }
                 }
                 Ok(())
@@ -382,14 +458,14 @@ impl KoofrDavClient {
                     return direct_op
                         .write(&rel, data.to_vec())
                         .map(|_| ())
-                        .map_err(|e| VitralError::Io(format!("WebDAV PUT {rel} failed: {e}")));
+                        .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())));
                 }
                 let parent_dir = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
                 self.ensure_collections(parent_dir)?;
                 self.op
                     .write(&rel, data.to_vec())
                     .map(|_| ())
-                    .map_err(|e| VitralError::Io(format!("WebDAV PUT {rel} failed: {e}")))
+                    .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
             }
         })
     }
@@ -400,7 +476,7 @@ impl KoofrDavClient {
         run_on_blocking_dav_thread(|| match self.op.read(&rel) {
             Ok(buf) => Ok(Some(buf.to_vec())),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(VitralError::Io(format!("WebDAV GET {rel} failed: {e}"))),
+            Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
         })
     }
 
@@ -411,7 +487,7 @@ impl KoofrDavClient {
             self.op
                 .read(&rel)
                 .map(|b| b.to_vec())
-                .map_err(|e| VitralError::Io(format!("WebDAV GET {rel} failed: {e}")))
+                .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
         })
     }
 
@@ -426,7 +502,7 @@ impl KoofrDavClient {
         run_on_blocking_dav_thread(|| match self.op.list(&dir) {
             Ok(entries) => Ok(entries),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(VitralError::Io(format!("WebDAV LIST {dir} failed: {e}"))),
+            Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
         })
     }
 
@@ -443,7 +519,12 @@ impl KoofrDavClient {
                     folders.push(path.to_owned());
                 } else {
                     self.guard.require_online("storage")?;
-                    let len = run_on_blocking_dav_thread(|| self.op.stat(path).map(|m| m.content_length()).map_err(|e| VitralError::Io(e.to_string())))?;
+                    let len = run_on_blocking_dav_thread(|| {
+                        self.op
+                            .stat(path)
+                            .map(|m| m.content_length())
+                            .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
+                    })?;
                     total = total.saturating_add(len);
                 }
             }
@@ -471,7 +552,7 @@ impl KoofrDavClient {
         run_on_blocking_dav_thread(|| match self.op.delete(&rel) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(VitralError::Io(format!("WebDAV DELETE {rel} failed: {e}"))),
+            Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
         })
     }
 }
@@ -590,7 +671,7 @@ pub(crate) fn merge_clipboard_ring(
         let mut path = url.path_segments_mut().map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?;
         path.pop_if_empty().extend(dav.clean_root.split('/')).push("clipboard").push("history_ring.jsonl.enc");
     }
-    let client = dav_http_client()?;
+    let client = dav_http_client(true)?;
     let request = |method| {
         let req = client.request(method, url.clone());
         if let Some(user) = cfg.username.as_ref() { req.basic_auth(user, cfg.password.as_ref()) } else { req }
@@ -642,7 +723,7 @@ pub(crate) fn sync_current_copy(
     let mut url = reqwest::Url::parse(&cfg.endpoint).map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
     url.path_segments_mut().map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?
         .pop_if_empty().extend(dav.clean_root.split('/')).push("clipboard").push("current.json.enc");
-    let client = dav_http_client()?;
+    let client = dav_http_client(true)?;
     let request = |method| {
         let req = client.request(method, url.clone());
         if let Some(user) = cfg.username.as_ref() { req.basic_auth(user, cfg.password.as_ref()) } else { req }
@@ -1118,4 +1199,135 @@ pub fn put_lexicon_import_artifact(
     let rel_file = format!("lexicon/imports/{filename}");
     client.write_bytes(&rel_file, bytes)?;
     Ok(format!("/Koofr/{}/{rel_file}", client.clean_root()))
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    fn credentials_and_error_summaries() {
+        let config = EngineConfig {
+            koofr_endpoint: Some(" https://example.org/dav/ ".into()),
+            koofr_username: Some(" user@example.org \t".into()),
+            koofr_password: Some("\r\n password \n".into()),
+            ..Default::default()
+        };
+        let cfg = DavConfig::from_engine_config(&config).unwrap();
+        assert_eq!(cfg.endpoint, "https://example.org/dav/");
+        assert_eq!(cfg.username.as_deref(), Some("user@example.org"));
+        assert_eq!(cfg.password.as_deref(), Some(" password "));
+        let parsed = DavConfig::from_json_with_fallback(r#"{"koofr_endpoint":" https://example.org/dav/ ","koofr_username":" user@example.org ","koofr_password":"\r\nsecret\r\n"}"#, None).unwrap();
+        assert_eq!(parsed.endpoint, cfg.endpoint);
+        assert_eq!(parsed.username, cfg.username);
+        assert_eq!(parsed.password.as_deref(), Some("secret"));
+        let empty = DavConfig::from_json_with_fallback(
+            r#"{"koofr_username":" \t ","koofr_password":"\r\n"}"#,
+            Some(&cfg),
+        )
+        .unwrap();
+        assert!(empty.username.is_none());
+        assert!(empty.password.is_none());
+        let error = dav_error_summary("PermissionDenied status: 401, headers: {report-to: cloudflare}, body: <html>401 Unauthorized</html>");
+        assert_eq!(error, "WebDAV 认证失败 (401)：请检查账户、密码或端点路径");
+        assert_eq!(
+            dav_error_summary("HTTP status 403 Forbidden"),
+            "WebDAV 权限被拒 (403)"
+        );
+        assert_eq!(
+            dav_error_summary("HTTP status 404 Not Found"),
+            "WebDAV 路径不存在 (404)"
+        );
+        let error = dav_error_summary(
+            "Unexpected path /401 response: Parts { status: 502, headers: report-to: {} } <html>bad gateway</html>",
+        );
+        assert!(!error.contains("report-to") && !error.contains('<'));
+        assert!(!error.contains("认证失败"));
+    }
+}
+
+#[cfg(test)]
+mod http_device_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn mkcol_accepts_existing_collection_redirects_but_rejects_errors() {
+        for status in [201, 301, 302, 405, 401, 403, 500] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let cfg = DavConfig {
+                endpoint: format!("http://{}/dav/", server.server_addr()),
+                root: Some("Vitral".into()),
+                ..Default::default()
+            };
+            let handle = std::thread::spawn(move || {
+                let request = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.method().as_str(), "MKCOL");
+                let response = tiny_http::Response::empty(status)
+                    .with_header(tiny_http::Header::from_bytes("Location", request.url()).unwrap());
+                request.respond(response).unwrap();
+            });
+            let client = KoofrDavClient::connect(&OfflineGuard::new(false), &cfg).unwrap();
+            assert_eq!(
+                client.ensure_collections("").is_ok(),
+                matches!(status, 201 | 301 | 302 | 405),
+                "{status}"
+            );
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn opendal_and_mkcol_trim_auth_and_hide_html() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let count = socket.read(&mut buf).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&buf[..count]);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                let body = "<html><title>401 Unauthorized</title></html>";
+                write!(socket, "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nContent-Type: text/html\r\nreport-to: {{\"group\":\"cloudflare\"}}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+            requests
+        });
+        let cfg = DavConfig {
+            endpoint: format!(" http://{address}/dav/ "),
+            username: Some(" user ".into()),
+            password: Some("\r\npass\r\n".into()),
+            root: None,
+            sync_key: None,
+        };
+        let client = KoofrDavClient::connect(&OfflineGuard::new(false), &cfg).unwrap();
+        for error in [
+            client.read_bytes("file").unwrap_err(),
+            client.ensure_collections("").unwrap_err(),
+        ] {
+            let VitralError::Io(message) = error else {
+                panic!("expected I/O error")
+            };
+            assert_eq!(message, "WebDAV 认证失败 (401)：请检查账户、密码或端点路径");
+        }
+        for request in server.join().unwrap() {
+            let request = request.to_ascii_lowercase();
+            assert!(
+                request.contains("authorization: basic dxnlcjpwyxnz"),
+                "{request}"
+            );
+            assert!(request.contains("user-agent: vitral/"), "{request}");
+        }
+    }
 }
