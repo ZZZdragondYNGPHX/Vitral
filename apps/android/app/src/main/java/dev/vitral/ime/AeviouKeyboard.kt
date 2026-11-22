@@ -44,6 +44,7 @@ internal class AeviouKeyboard(
     ctx: Context,
     private val env: AeviouEnv = AeviouEnv.MIXED,
     private val shiftState: Int = 0,
+    private val leftHanded: Boolean = false,
     private val darkOverride: Boolean? = null,
     private val onSyllable: (String) -> Unit,
     private val onActionKey: (String) -> Unit,
@@ -85,45 +86,71 @@ internal class AeviouKeyboard(
 
     private val baseRows: List<List<Triple<String, String, Int>>> =
         if (isPureEnglish) {
-            // 31-hex pure English probability honeycomb (all 26 letters + 123 + 4 actions, 8/7/8/8)
+            // 5-row airy Pure English honeycomb (7/6/7/6/5 = 31 hexes, full vertical utilization)
+            val bottomRow =
+                if (leftHanded) {
+                    listOf(
+                        Triple("↵", "↵", 2), Triple("⌫", "⌫", 1), Triple("空格", "空格", 1),
+                        Triple("⇧", "⇧", 1), Triple("123", "123", 1),
+                    )
+                } else {
+                    listOf(
+                        Triple("123", "123", 1), Triple("⇧", "⇧", 1), Triple("空格", "空格", 1),
+                        Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                    )
+                }
             listOf(
                 listOf(
                     Triple("q", "q", 0), Triple("w", "w", 0), Triple("e", "e", 0), Triple("r", "r", 0),
-                    Triple("t", "t", 0), Triple("y", "y", 0), Triple("u", "u", 0), Triple("i", "i", 0),
+                    Triple("t", "t", 0), Triple("y", "y", 0), Triple("u", "u", 0),
                 ),
                 listOf(
-                    Triple("a", "a", 0), Triple("s", "s", 0), Triple("d", "d", 0), Triple("f", "f", 0),
-                    Triple("g", "g", 0), Triple("h", "h", 0), Triple("o", "o", 0),
+                    Triple("a", "a", 0), Triple("s", "s", 0), Triple("d", "d", 0),
+                    Triple("f", "f", 0), Triple("g", "g", 0), Triple("h", "h", 0),
                 ),
                 listOf(
-                    Triple("⇧", "⇧", 1), Triple("z", "z", 0), Triple("x", "x", 0), Triple("c", "c", 0),
-                    Triple("v", "v", 0), Triple("b", "b", 0), Triple("n", "n", 0), Triple("p", "p", 0),
+                    Triple("z", "z", 0), Triple("x", "x", 0), Triple("c", "c", 0), Triple("v", "v", 0),
+                    Triple("b", "b", 0), Triple("n", "n", 0), Triple("m", "m", 0),
                 ),
                 listOf(
-                    Triple("123", "123", 1), Triple("j", "j", 0), Triple("k", "k", 0), Triple("l", "l", 0),
-                    Triple("m", "m", 0), Triple("空格", "空格", 1), Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                    Triple("i", "i", 0), Triple("o", "o", 0), Triple("p", "p", 0),
+                    Triple("j", "j", 0), Triple("k", "k", 0), Triple("l", "l", 0),
                 ),
+                bottomRow,
             )
         } else {
-            // 25-hex Chinese Quanpin / Mixed-English honeycomb (6/6/6/7 with dedicated 123 symbols key)
+            // 5-row airy Chinese Quanpin / Mixed-English honeycomb (5/5/5/5/5 = 25 hexes, generous gaps!)
+            val vowelHub = Triple("aeiou", if (allowMixedEnglish) "a·e·i·o·u" else "a·e·o", 0)
+            val bottomRow =
+                if (leftHanded) {
+                    listOf(
+                        Triple("↵", "↵", 2), Triple("⌫", "⌫", 1), Triple("空格", "空格", 1),
+                        vowelHub, Triple("123", "123", 1),
+                    )
+                } else {
+                    listOf(
+                        Triple("123", "123", 1), vowelHub, Triple("空格", "空格", 1),
+                        Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                    )
+                }
             listOf(
                 listOf(
                     Triple("b", "B", 0), Triple("p", "P", 0), Triple("m", "M", 0),
-                    Triple("f", "F", 0), Triple("d", "D", 0), Triple("t", "T", 0),
+                    Triple("f", "F", 0), Triple("d", "D", 0),
                 ),
                 listOf(
-                    Triple("n", "N", 0), Triple("l", "L", 0), Triple("g", "G", 0),
-                    Triple("k", "K", 0), Triple("h", "H", 0), Triple("j", "J", 0),
+                    Triple("t", "T", 0), Triple("n", "N", 0), Triple("l", "L", 0),
+                    Triple("g", "G", 0), Triple("k", "K", 0),
                 ),
                 listOf(
-                    Triple("q", "Q", 0), Triple("x", "X", 0), Triple("z", "Z", 0),
+                    Triple("h", "H", 0), Triple("j", "J", 0), Triple("q", "Q", 0),
+                    Triple("x", "X", 0), Triple("z", "Z", 0),
+                ),
+                listOf(
                     Triple("c", "C", 0), Triple("s", "S", 0), Triple("r", "R", 0),
+                    Triple("y", "Y", 0), Triple("w", "W", 0),
                 ),
-                listOf(
-                    Triple("123", "123", 1), Triple("y", "Y", 0), Triple("w", "W", 0),
-                    Triple("aeiou", if (allowMixedEnglish) "a·e·i·o·u" else "a·e·o", 0),
-                    Triple("空格", "空格", 1), Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
-                ),
+                bottomRow,
             )
         }
 
@@ -190,30 +217,38 @@ internal class AeviouKeyboard(
 
     private fun layoutHexGrid(w: Float, h: Float) {
         if (w <= 0f || h <= 0f) return
-        val padX = context.dpF(14f)
-        val padY = context.dpF(10f)
-        val availW = (w - padX * 2).coerceAtLeast(1f)
-        val availH = (h - padY * 2).coerceAtLeast(1f)
-        val colSpan = if (isPureEnglish) 8.5f else 7.0f
-        val rByW = availW / (colSpan * 1.73205f)
-        val rByH = availH / 6.75f
+        val padLeft = context.dpF(if (leftHanded) 20f else 12f)
+        val padRight = context.dpF(if (leftHanded) 12f else 20f)
+        val padTop = context.dpF(8f)
+        val padBottom = context.dpF(18f)
+        val availW = (w - padLeft - padRight).coerceAtLeast(1f)
+        val availH = (h - padTop - padBottom).coerceAtLeast(1f)
+        val rowCountTotal = baseRows.size // 5 airy rows
+        val maxCols = if (isPureEnglish) 7.2f else 5.55f
+        val pitchFactor = if (isPureEnglish) 1.09f else 1.20f
+        val rByW = availW / (maxCols * 1.73205f * pitchFactor)
+        val rByH = availH / ((rowCountTotal - 1) * 1.76f + 2.0f)
         hexRadius = min(rByW, rByH)
         val hexW = hexRadius * 1.73205f
-        val rowStepY = hexRadius * 1.52f
-        val totalGridH = 3f * rowStepY + 2f * hexRadius
-        val startY = (h - totalGridH) * 0.5f + hexRadius
-        val gridLeft = (w - colSpan * hexW) * 0.5f
+        val colPitchX = hexW * pitchFactor
+        // Stretch rowStepY to utilize the full vertical height cleanly (no dead top/bottom void!)
+        val rowStepY =
+            ((availH - 2f * hexRadius) / (rowCountTotal - 1).coerceAtLeast(1))
+                .coerceIn(hexRadius * 1.62f, hexRadius * 2.18f)
+        val totalGridH = (rowCountTotal - 1) * rowStepY + 2f * hexRadius
+        val startY = padTop + (availH - totalGridH) * 0.5f + hexRadius
+        val centerX = padLeft + availW * 0.5f
         for (cell in cells) {
-            if (isPureEnglish) {
-                val xOffset = if (cell.row % 2 == 1) hexW else hexW * 0.5f
-                cell.cx = gridLeft + xOffset + cell.col * hexW
-            } else {
-                val rowCount = baseRows[cell.row].size
-                val rowW = rowCount * hexW
-                val stagger = if (cell.row == 1) hexW * 0.36f else if (cell.row == 0 || cell.row == 2) -hexW * 0.14f else 0f
-                val rowStartX = (w - rowW) * 0.5f + hexW * 0.5f + stagger
-                cell.cx = rowStartX + cell.col * hexW
-            }
+            val colsInRow = baseRows[cell.row].size
+            val rowW = (colsInRow - 1) * colPitchX
+            val stagger =
+                when {
+                    isPureEnglish -> 0f // 7 / 6 / 7 / 6 / 5 naturally interlocks symmetrically!
+                    cell.row == 4 -> 0f // Bottom action row centered cleanly
+                    cell.row % 2 == 1 -> colPitchX * (if (leftHanded) -0.24f else 0.24f)
+                    else -> colPitchX * (if (leftHanded) 0.24f else -0.24f)
+                }
+            cell.cx = centerX - rowW * 0.5f + cell.col * colPitchX + stagger
             cell.cy = startY + cell.row * rowStepY
         }
     }
@@ -344,14 +379,14 @@ internal class AeviouKeyboard(
             }
         }
 
-        // Right-hand friendly & edge-safe petal fanning:
-        // - Right side of screen (e.g. J/H/T/R): fan ALL petals into the open upper-left & left arc
-        //   so neither the screen edge nor the right thumb blocks them.
-        // - Left edge (e.g. B/N/Q): fan into the open upper-right & right arc.
-        // - Center: prioritize upper-left / top / left slots first (unobstructed by right thumb).
-        val nearRight = width > 0 && activeCenter.x > width * 0.56f
-        val nearLeft = width > 0 && activeCenter.x < width * 0.24f
-        val nearTop = height > 0 && activeCenter.y < height * 0.30f
+        // Handedness-aware & edge-safe petal fanning:
+        // - Right-handed mode: default & right-half keys fan into the open upper-left & left arc
+        //   to stay clear of the right thumb.
+        // - Left-handed mode: default & left-half keys fan into the open upper-right & right arc
+        //   to stay clear of the left thumb.
+        val nearRight = width > 0 && activeCenter.x > width * (if (leftHanded) 0.74f else 0.52f)
+        val nearLeft = width > 0 && activeCenter.x < width * (if (leftHanded) 0.48f else 0.26f)
+        val nearTop = height > 0 && activeCenter.y < height * 0.28f
         val nearBottom = height > 0 && activeCenter.y > height * 0.72f
         val anglesDeg =
             when {
@@ -361,9 +396,14 @@ internal class AeviouKeyboard(
                 nearLeft && nearTop -> floatArrayOf(0f, 35f, 70f, 18f, 52f, 95f)
                 nearLeft && nearBottom -> floatArrayOf(-65f, -30f, 0f, -100f, -48f, 25f)
                 nearLeft -> floatArrayOf(-60f, -25f, 0f, 35f, -95f, 70f)
-                nearTop -> floatArrayOf(180f, 135f, 90f, 45f, 0f, 158f)
-                nearBottom -> floatArrayOf(-120f, -60f, 180f, -90f, 0f, -150f)
-                else -> floatArrayOf(-120f, -60f, 180f, 120f, 0f, 60f)
+                nearTop ->
+                    if (leftHanded) floatArrayOf(0f, 45f, 90f, 135f, 180f, 22f)
+                    else floatArrayOf(180f, 135f, 90f, 45f, 0f, 158f)
+                nearBottom ->
+                    if (leftHanded) floatArrayOf(-60f, -120f, 0f, -90f, 180f, -30f)
+                    else floatArrayOf(-120f, -60f, 180f, -90f, 0f, -150f)
+                leftHanded -> floatArrayOf(-60f, -25f, 0f, -100f, 40f, 70f)
+                else -> floatArrayOf(-120f, -155f, 180f, -80f, 140f, 110f)
             }
         val pad = hexRadius * 1.05f
         fun petalPos(deg: Float): PointF {
@@ -431,7 +471,8 @@ internal class AeviouKeyboard(
 
     override fun onDraw(c: Canvas) {
         val dark = darkOverride ?: context.darkKeyboard
-        val r = (hexRadius * 0.92f).coerceAtLeast(1f)
+        // Crisp separated hexagonal islands (0.82x visual radius) with comfortable breathing gaps
+        val r = (hexRadius * 0.82f).coerceAtLeast(1f)
         val primaryText = (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb).toInt()
         val secondaryText = (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
         val accentText = (if (dark) T.Dark.accentTextArgb else T.Light.accentTextArgb).toInt()
@@ -671,15 +712,16 @@ internal class AeviouKeyboard(
             subPaint.color = secondaryText
             subPaint.alpha = 135
             subPaint.textSize = context.dpF(9.6f)
+            val handTag = if (leftHanded) "左手" else "右手"
             val footer =
                 when (env) {
-                    AeviouEnv.PURE_EN -> "AEVIOU+ 纯英文蜂窝 · 全字母轻点，滑行直达高频词"
+                    AeviouEnv.PURE_EN -> "AEVIOU+ 纯英文蜂窝（$handTag）· 全字母轻点，滑行直达高频词"
                     AeviouEnv.PURE_ZH ->
-                        if (contextTargets.isNotEmpty()) "AEVIOU+ 纯中文蜂窝 · 放大声母含语境预测，零英文干扰"
-                        else "AEVIOU+ 纯中文蜂窝 · 按住声母滑向亮瓣，轻点即简拼"
+                        if (contextTargets.isNotEmpty()) "AEVIOU+ 纯中文蜂窝（$handTag）· 放大声母含语境预测"
+                        else "AEVIOU+ 纯中文蜂窝（$handTag）· 按住声母滑向亮瓣，轻点即简拼"
                     AeviouEnv.MIXED ->
-                        if (contextTargets.isNotEmpty()) "AEVIOU+ 中英混输蜂窝 · 放大声母含语境预测，双树自动分叉"
-                        else "AEVIOU+ 中英混输蜂窝 · 按住声母滑向亮瓣，支持拼音与英文混滑"
+                        if (contextTargets.isNotEmpty()) "AEVIOU+ 中英混输蜂窝（$handTag）· 放大声母含语境预测"
+                        else "AEVIOU+ 中英混输蜂窝（$handTag）· 按住声母滑向亮瓣，支持拼音与英文混滑"
                 }
             c.drawText(footer, width * 0.5f, height - context.dpF(3f), subPaint)
         }
@@ -687,19 +729,19 @@ internal class AeviouKeyboard(
 
     private fun hitCell(x: Float, y: Float): HexCell? {
         var best: HexCell? = null
-        var bestScore = hexRadius * 1.12f
+        var bestScore = hexRadius * 0.96f
         for (cell in cells) {
             val d = hypot(x - cell.cx, y - cell.cy)
             val rank = if (!cell.isAction) contextTargets[cell.id]?.third else null
             val gravity =
                 when {
-                    rank == 0 -> 1.24f
-                    rank != null && rank <= 2 -> 1.14f
-                    rank != null -> 1.07f
+                    rank == 0 -> 1.18f
+                    rank != null && rank <= 2 -> 1.10f
+                    rank != null -> 1.05f
                     else -> 1.0f
                 }
             val effective = d / gravity
-            if (d <= hexRadius * (1.06f * gravity) && effective < bestScore) {
+            if (d <= hexRadius * (0.94f * gravity) && effective < bestScore) {
                 bestScore = effective
                 best = cell
             }

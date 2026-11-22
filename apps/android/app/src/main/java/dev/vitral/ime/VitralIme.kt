@@ -40,6 +40,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var flypy = true
     private var syllableSplit = false
     private var aeviouExperimental = false
+    private var aeviouLeftHanded = false
     private var detectedAeviouEnv = AeviouEnv.MIXED
     private var manualLangOverride = false
     private var numbers = false
@@ -196,6 +197,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         flypy = cfg.optString("schema", "double_pinyin_flypy") == "double_pinyin_flypy"
         syllableSplit = false
         aeviouExperimental = cfg.optBoolean("mobile_experimental_aeviou", false)
+        aeviouLeftHanded = cfg.optString("mobile_aeviou_hand", "right") == "left"
         font = cfg.optInt("candidate_font_px", 16).coerceIn(13, 22).toFloat()
         themePref = cfg.optString("theme", "system")
         sublabelMode =
@@ -728,7 +730,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val nav = if (rootNav > 0) rootNav.coerceAtLeast(dp(48)) else 0
         val usableHeight = (dm.heightPixels - nav).coerceAtLeast(1)
         val isFiveRow =
-            mode == "keys" && !numbers && !flypy && !aeviouExperimental && T.Ergonomics.quanpinRows == 5
+            mode == "keys" && !numbers && !flypy && T.Ergonomics.quanpinRows == 5
         val scale =
             when (heightPreset) {
                 "compact" -> 1.06f
@@ -2442,6 +2444,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     this,
                     env = effectiveAeviouEnv(),
                     shiftState = shiftState,
+                    leftHanded = aeviouLeftHanded,
                     darkOverride = dark,
                     onSyllable = { syl ->
                         for (ch in syl) key(if (ch == ' ') "空格" else ch.toString())

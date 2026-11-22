@@ -362,6 +362,7 @@ class SettingsActivity : ComponentActivity() {
             var openccMode by remember { mutableStateOf(config.optString("opencc_mode", "simplified")) }
             var sublabelMode by remember { mutableStateOf(config.optString("mobile_sublabel_mode", "dual")) }
             var keyboardHeight by remember { mutableStateOf(config.optString("mobile_keyboard_height", "standard")) }
+            var aeviouHand by remember { mutableStateOf(config.optString("mobile_aeviou_hand", "right")) }
             var size by remember {
                 mutableFloatStateOf(
                     config.optInt("candidate_font_px", T.Typography.candidateFontSizeDefaultPx).toFloat()
@@ -401,6 +402,13 @@ class SettingsActivity : ComponentActivity() {
                         config.optString("koofr_password").trim('\r', '\n'),
                     )
                 }
+                val diskCfg = Core.settings(this@SettingsActivity)
+                if (diskCfg.has("mobile_experimental_aeviou")) {
+                    config.put(
+                        "mobile_experimental_aeviou",
+                        diskCfg.optBoolean("mobile_experimental_aeviou", false),
+                    )
+                }
                 config
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
                     .put("fuzzy_pinyin", fuzzyPinyin)
@@ -408,6 +416,7 @@ class SettingsActivity : ComponentActivity() {
                     .put("theme", themeMode)
                     .put("mobile_sublabel_mode", sublabelMode)
                     .put("mobile_keyboard_height", keyboardHeight)
+                    .put("mobile_aeviou_hand", aeviouHand)
                     .put("pure_offline", offline)
                     .put("adaptive_learning", adaptive)
                     .put("learn_from_clipboard", clipLearn)
@@ -799,6 +808,23 @@ class SettingsActivity : ComponentActivity() {
                                             onSelect = {
                                                 keyboardHeight = it
                                                 persistConfig("键盘高度已更新")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(14.dp))
+                                        Text("蜂窝键位持握习惯", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
+                                        Text(
+                                            "自动避开对应拇指视线，优化实验性蜂窝键盘的边距与花瓣展开方向",
+                                            fontSize = 11.5.sp,
+                                            color = palette.textSecondary,
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassSegmentedControl(
+                                            options = listOf("right" to "右手模式", "left" to "左手模式"),
+                                            selected = aeviouHand,
+                                            onSelect = {
+                                                aeviouHand = it
+                                                persistConfig(if (it == "left") "蜂窝键盘已切换为左手模式" else "蜂窝键盘已切换为右手模式")
                                             },
                                         )
 
