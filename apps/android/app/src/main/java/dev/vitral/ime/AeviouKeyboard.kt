@@ -85,73 +85,69 @@ internal class AeviouKeyboard(
     }
 
     private val baseRows: List<List<Triple<String, String, Int>>> =
-        if (isPureEnglish) {
-            // 5-row airy Pure English honeycomb (7/6/7/6/5 = 31 hexes, full vertical utilization)
-            val bottomRow =
-                if (leftHanded) {
+        run {
+            // Right-hand canonical layouts follow the "grid-traversal degree-of-freedom" topology:
+            //   - Highest branching + highest frequency keys occupy the 360° inner core, biased right-of-center
+            //     for comfortable right-thumb reach without wall collisions.
+            //   - Lowest branching / lowest frequency keys sit on corners and outer left edges.
+            // Left-hand mode mirrors every row horizontally for symmetric left-thumb ergonomics.
+            val rightHandRows =
+                if (isPureEnglish) {
+                    // 5-row Pure English honeycomb (7/6/7/6/5 = 31 hexes):
+                    // All 9 Tier-1 English superstars (R,N,E,T / H,A,O,I,S) occupy 100% of the 9 inner-core cells,
+                    // with vowels A/E/I/O clustered in the heart and low-branching Q/X/Z/J/V/K on outer left edges.
                     listOf(
-                        Triple("↵", "↵", 2), Triple("⌫", "⌫", 1), Triple("空格", "空格", 1),
-                        Triple("⇧", "⇧", 1), Triple("123", "123", 1),
+                        listOf(
+                            Triple("q", "q", 0), Triple("v", "v", 0), Triple("p", "p", 0), Triple("f", "f", 0),
+                            Triple("m", "m", 0), Triple("c", "c", 0), Triple("w", "w", 0),
+                        ),
+                        listOf(
+                            Triple("g", "g", 0), Triple("r", "r", 0), Triple("n", "n", 0),
+                            Triple("e", "e", 0), Triple("t", "t", 0), Triple("l", "l", 0),
+                        ),
+                        listOf(
+                            Triple("x", "x", 0), Triple("h", "h", 0), Triple("a", "a", 0), Triple("o", "o", 0),
+                            Triple("i", "i", 0), Triple("s", "s", 0), Triple("d", "d", 0),
+                        ),
+                        listOf(
+                            Triple("z", "z", 0), Triple("j", "j", 0), Triple("k", "k", 0),
+                            Triple("y", "y", 0), Triple("u", "u", 0), Triple("b", "b", 0),
+                        ),
+                        listOf(
+                            Triple("123", "123", 1), Triple("⇧", "⇧", 1), Triple("空格", "空格", 1),
+                            Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                        ),
                     )
                 } else {
+                    // 5-row Chinese Quanpin / Mixed-English honeycomb (5/5/5/5/5 = 25 hexes):
+                    // Phonological families stay intact while matching branching degree to board liberties:
+                    //   - Inner 6-way core: N,L,D & C,Z,S (all five 6-branch initials + #1 high-freq D), biased right.
+                    //   - Outer corners/left: 2-branch Q,X,J clustered bottom-left; low-count F(10), W(9) on top corners.
+                    val vowelHub = Triple("aeiou", if (allowMixedEnglish) "aeiou" else "aeo", 0)
                     listOf(
-                        Triple("123", "123", 1), Triple("⇧", "⇧", 1), Triple("空格", "空格", 1),
-                        Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                        listOf(
+                            Triple("f", "F", 0), Triple("p", "P", 0), Triple("b", "B", 0),
+                            Triple("m", "M", 0), Triple("w", "W", 0),
+                        ),
+                        listOf(
+                            Triple("t", "T", 0), Triple("n", "N", 0), Triple("l", "L", 0),
+                            Triple("d", "D", 0), Triple("y", "Y", 0),
+                        ),
+                        listOf(
+                            Triple("r", "R", 0), Triple("c", "C", 0), Triple("z", "Z", 0),
+                            Triple("s", "S", 0), Triple("h", "H", 0),
+                        ),
+                        listOf(
+                            Triple("q", "Q", 0), Triple("x", "X", 0), Triple("j", "J", 0),
+                            Triple("k", "K", 0), Triple("g", "G", 0),
+                        ),
+                        listOf(
+                            Triple("123", "123", 1), vowelHub, Triple("空格", "空格", 1),
+                            Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
+                        ),
                     )
                 }
-            listOf(
-                listOf(
-                    Triple("q", "q", 0), Triple("w", "w", 0), Triple("e", "e", 0), Triple("r", "r", 0),
-                    Triple("t", "t", 0), Triple("y", "y", 0), Triple("u", "u", 0),
-                ),
-                listOf(
-                    Triple("a", "a", 0), Triple("s", "s", 0), Triple("d", "d", 0),
-                    Triple("f", "f", 0), Triple("g", "g", 0), Triple("h", "h", 0),
-                ),
-                listOf(
-                    Triple("z", "z", 0), Triple("x", "x", 0), Triple("c", "c", 0), Triple("v", "v", 0),
-                    Triple("b", "b", 0), Triple("n", "n", 0), Triple("m", "m", 0),
-                ),
-                listOf(
-                    Triple("i", "i", 0), Triple("o", "o", 0), Triple("p", "p", 0),
-                    Triple("j", "j", 0), Triple("k", "k", 0), Triple("l", "l", 0),
-                ),
-                bottomRow,
-            )
-        } else {
-            // 5-row airy Chinese Quanpin / Mixed-English honeycomb (5/5/5/5/5 = 25 hexes, generous gaps!)
-            val vowelHub = Triple("aeiou", if (allowMixedEnglish) "aeiou" else "aeo", 0)
-            val bottomRow =
-                if (leftHanded) {
-                    listOf(
-                        Triple("↵", "↵", 2), Triple("⌫", "⌫", 1), Triple("空格", "空格", 1),
-                        vowelHub, Triple("123", "123", 1),
-                    )
-                } else {
-                    listOf(
-                        Triple("123", "123", 1), vowelHub, Triple("空格", "空格", 1),
-                        Triple("⌫", "⌫", 1), Triple("↵", "↵", 2),
-                    )
-                }
-            listOf(
-                listOf(
-                    Triple("b", "B", 0), Triple("p", "P", 0), Triple("m", "M", 0),
-                    Triple("f", "F", 0), Triple("d", "D", 0),
-                ),
-                listOf(
-                    Triple("t", "T", 0), Triple("n", "N", 0), Triple("l", "L", 0),
-                    Triple("g", "G", 0), Triple("k", "K", 0),
-                ),
-                listOf(
-                    Triple("h", "H", 0), Triple("j", "J", 0), Triple("q", "Q", 0),
-                    Triple("x", "X", 0), Triple("z", "Z", 0),
-                ),
-                listOf(
-                    Triple("c", "C", 0), Triple("s", "S", 0), Triple("r", "R", 0),
-                    Triple("y", "Y", 0), Triple("w", "W", 0),
-                ),
-                bottomRow,
-            )
+            if (leftHanded) rightHandRows.map { it.reversed() } else rightHandRows
         }
 
     private val cells: List<HexCell> =
@@ -220,7 +216,7 @@ internal class AeviouKeyboard(
         val padLeft = context.dpF(if (leftHanded) 20f else 12f)
         val padRight = context.dpF(if (leftHanded) 12f else 20f)
         val padTop = context.dpF(28f)
-        val padBottom = context.dpF(18f)
+        val padBottom = context.dpF(6f)
         val availW = (w - padLeft - padRight).coerceAtLeast(1f)
         val availH = (h - padTop - padBottom).coerceAtLeast(1f)
         val rowCountTotal = baseRows.size // 5 airy rows
@@ -401,18 +397,15 @@ internal class AeviouKeyboard(
                 val py = activeCenter.y + dy
                 if (width > padX * 2 && (px < padX || px > width - padX)) continue
                 if (height > padTop + padBot && (py < padTop || py > height - padBot)) continue
-                // Handedness thumb-avoidance cost:
-                // Right-hand mode prefers LEFT & UPPER-LEFT (dx < 0, dy <= 0); penalizes right/lower-right under thumb.
-                // Left-hand mode mirrors: prefers RIGHT & UPPER-RIGHT (dx > 0, dy <= 0).
-                val thumbSidePenalty =
-                    if (leftHanded) {
-                        (if (dx < -1f) 38f else 0f) + (if (dx < -1f && dy > 1f) 24f else 0f)
-                    } else {
-                        (if (dx > 1f) 38f else 0f) + (if (dx > 1f && dy > 1f) 24f else 0f)
-                    }
+                // Ergonomic dominant-hand swipe arc cost:
+                // Right-hand thumb rests bottom-right, so the most comfortable & unobstructed swipe directions
+                // are Upper-Left (#1) -> Left (#2) -> Upper-Right (#3) -> Lower-Left (#4), while Right (#5)
+                // and Lower-Right (#6, under thumb base) are reserved for the rarest combinations.
+                // Left-hand mode mirrors symmetrically: Upper-Right (#1) -> Right (#2) -> Upper-Left (#3)...
+                val towardThumbRootX = if (leftHanded) -(dx / pitch) else (dx / pitch)
                 val distCost = hypot(dx, dy) / pitch * 60f
-                val upperBonus = if (dy < -1f) -10f else if (dy > 1f) 6f else 0f
-                val cost = ring * 100f + distCost + thumbSidePenalty + upperBonus
+                val palmPenalty = if (towardThumbRootX > 0.1f && dy > 1f) 24f else 0f
+                val cost = ring * 100f + distCost + towardThumbRootX * 26f + (dy / pitch) * 32f + palmPenalty
                 validSlots.add(SlotCand(PointF(px, py), ring, cost))
             }
         }
@@ -704,22 +697,6 @@ internal class AeviouKeyboard(
             subPaint.alpha = 255
             val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
             c.drawText(hudSummary, width * 0.5f, hudTextY, subPaint)
-        } else {
-            subPaint.color = secondaryText
-            subPaint.alpha = 135
-            subPaint.textSize = context.dpF(9.6f)
-            val handTag = if (leftHanded) "左手" else "右手"
-            val footer =
-                when (env) {
-                    AeviouEnv.PURE_EN -> "AEVIOU+ 纯英文蜂窝（$handTag）· 全字母轻点，滑行直达高频词"
-                    AeviouEnv.PURE_ZH ->
-                        if (contextTargets.isNotEmpty()) "AEVIOU+ 纯中文蜂窝（$handTag）· 放大声母含语境预测"
-                        else "AEVIOU+ 纯中文蜂窝（$handTag）· 按住声母滑向亮瓣，轻点即简拼"
-                    AeviouEnv.MIXED ->
-                        if (contextTargets.isNotEmpty()) "AEVIOU+ 中英混输蜂窝（$handTag）· 放大声母含语境预测"
-                        else "AEVIOU+ 中英混输蜂窝（$handTag）· 按住声母滑向亮瓣，支持拼音与英文混滑"
-                }
-            c.drawText(footer, width * 0.5f, height - context.dpF(3f), subPaint)
         }
     }
 
