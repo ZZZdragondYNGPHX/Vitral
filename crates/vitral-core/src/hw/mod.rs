@@ -9,11 +9,11 @@ use crate::error::VitralError;
 use crate::imp::ImportedLexiconIndex;
 use crate::ret::RetentionEngine;
 use ids_exta::{compose_rare_candidates, find_bipartite_splits, IdsIndex};
-use lattice::{build_confusion_lattice, segment_strokes_with_locks};
-use onnx_models::HwOnnxBundle;
+use lattice::{build_cached_lattice, segment_strokes_with_locks, VisualCache};
+use onnx_models::{HwOnnxBundle, RerankerLock};
 use pure_fallback::{classify_1d_primitive, classify_single_stroke_primitive};
 use raster::{render_directmap, GlyphGeometry, StrokeStats, DIRECTMAP_LEN};
-use rerank::decode_lattice_3tier;
+use rerank::decode_lattice;
 pub use rerank::{HwDecodeContext, Tier3ElasticSlot, Tier3SlotDisambiguator, Tier3SlotRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -97,6 +97,8 @@ pub struct HandwritingSession {
     manual_locked_by_span: HashMap<(usize, usize), String>,
     baseline_char_by_span: HashMap<(usize, usize), String>,
     strokes_dirty: bool,
+    rerank_pending: bool,
+    visual_cache: VisualCache,
     prev_span_count: usize,
     pub(crate) confirmed_since_edit: bool,
     pub(crate) revision: u64,
@@ -113,6 +115,7 @@ impl HandwritingSession {
     pub fn set_assets_dir(&mut self, assets_dir: Option<&Path>) {
         self.assets_dir = assets_dir.map(PathBuf::from);
         self.model_paths = None;
+        self.visual_cache = VisualCache::default();
     }
 
     pub fn set_model_paths(&mut self, paths: crate::models::ModelPaths) {
@@ -121,18 +124,8 @@ impl HandwritingSession {
     }
 
     pub fn begin(&mut self, mode: HwMode) {
-        self.revision = self.revision.wrapping_add(1);
+        self.clear();
         self.active_mode = Some(mode);
-        self.strokes.clear();
-        self.current_stroke.clear();
-        self.last_slots.clear();
-        self.last_mode1.clear();
-        self.slot_span_bounds.clear();
-        self.manual_locked_by_span.clear();
-        self.baseline_char_by_span.clear();
-        self.strokes_dirty = false;
-        self.prev_span_count = 0;
-        self.confirmed_since_edit = false;
     }
 
     pub fn clear(&mut self) {
@@ -145,6 +138,8 @@ impl HandwritingSession {
         self.manual_locked_by_span.clear();
         self.baseline_char_by_span.clear();
         self.strokes_dirty = false;
+        self.rerank_pending = false;
+        self.visual_cache = VisualCache::default();
         self.prev_span_count = 0;
         self.confirmed_since_edit = false;
     }
@@ -159,7 +154,7 @@ impl HandwritingSession {
             ));
         }
         if !points.is_empty() {
-        self.revision = self.revision.wrapping_add(1);
+            self.revision = self.revision.wrapping_add(1);
             self.current_stroke.extend_from_slice(points);
             self.strokes_dirty = true;
             self.confirmed_since_edit = false;
@@ -180,7 +175,7 @@ impl HandwritingSession {
     ) -> Result<HandwritingPayload, VitralError> {
         self.push_stroke(points, pen_up)?;
         if pen_up && self.strokes_dirty {
-            self.decode_current(ctx)
+            self.decode_current(ctx, RerankerLock::Try)
         } else {
             self.snapshot()
         }
@@ -198,10 +193,13 @@ impl HandwritingSession {
             self.strokes_dirty = true;
             self.confirmed_since_edit = false;
         }
-        if !self.strokes_dirty && (!self.last_slots.is_empty() || !self.last_mode1.is_empty()) {
+        if !self.strokes_dirty
+            && !self.rerank_pending
+            && (!self.last_slots.is_empty() || !self.last_mode1.is_empty())
+        {
             return self.snapshot();
         }
-        self.decode_current(ctx)
+        self.decode_current(ctx, RerankerLock::Wait)
     }
 
     pub fn snapshot(&self) -> Result<HandwritingPayload, VitralError> {
@@ -286,11 +284,16 @@ impl HandwritingSession {
                 }
             }
             self.confirmed_since_edit = true;
+            self.rerank_pending = false;
         }
         Some(committed)
     }
 
-    fn decode_current(&mut self, ctx: &HwDecodeContext<'_>) -> Result<HandwritingPayload, VitralError> {
+    fn decode_current(
+        &mut self,
+        ctx: &HwDecodeContext<'_>,
+        reranker_lock: RerankerLock,
+    ) -> Result<HandwritingPayload, VitralError> {
         let mode = self.active_mode.ok_or(VitralError::NotInitialized)?;
         self.manual_locked_by_span
             .retain(|&(start, end), _| start <= end && end < self.strokes.len());
@@ -298,7 +301,10 @@ impl HandwritingSession {
             .assets_dir
             .clone()
             .or_else(crate::imp::polyphone::default_assets_dir_candidates);
-        let paths = self.model_paths.clone().unwrap_or_else(|| crate::models::ModelPaths::bundled(assets.as_deref()));
+        let paths = self
+            .model_paths
+            .clone()
+            .unwrap_or_else(|| crate::models::ModelPaths::bundled(assets.as_deref()));
         let bundle = HwOnnxBundle::load_paths(&paths);
         let ids = IdsIndex::load_dir(paths.handwriting.as_deref());
 
@@ -309,13 +315,14 @@ impl HandwritingSession {
                 self.strokes_dirty = false;
                 Ok(HandwritingPayload::Mode1(Mode1Result {
                     mode: TOKENS.handwriting.modes[0].to_string(),
-                    stroke_count: self.strokes.len()
-                        + usize::from(!self.current_stroke.is_empty()),
+                    stroke_count: self.strokes.len() + usize::from(!self.current_stroke.is_empty()),
                     candidates: cands,
                 }))
             }
             HwMode::ContinuousLattice => {
+                self.visual_cache.update(&self.strokes, &bundle);
                 if self.strokes.is_empty() {
+                    self.rerank_pending = false;
                     self.prev_span_count = 0;
                     self.slot_span_bounds.clear();
                     self.last_slots.clear();
@@ -332,8 +339,9 @@ impl HandwritingSession {
                     &bundle,
                     &ids,
                     self.manual_locked_by_span.keys().copied(),
+                    &mut self.visual_cache,
                 );
-                let lattice = build_confusion_lattice(&spans, &bundle, &ids)?;
+                let lattice = build_cached_lattice(&spans, &bundle, &ids, &mut self.visual_cache)?;
 
                 let span_bounds: Vec<(usize, usize)> = lattice
                     .iter()
@@ -358,19 +366,22 @@ impl HandwritingSession {
                     })
                     .collect();
 
-                let mut slots = decode_lattice_3tier(
+                let (mut slots, rerank_pending) = decode_lattice(
                     &lattice,
                     &self.manual_locked_by_span,
                     &baseline_vec,
                     &bundle,
                     ctx,
+                    reranker_lock,
                 );
+                self.rerank_pending = rerank_pending;
 
                 // When slot 0 first enters multi-char context (`prev_span_count < 2 && span_bounds.len() == 2`),
                 // record its contextual baseline so later trailing flips properly flag `changed_retroactively`.
                 if self.prev_span_count < 2 && span_bounds.len() == 2 {
                     for (i, span) in span_bounds.iter().enumerate() {
-                        self.baseline_char_by_span.insert(*span, slots[i].ch.clone());
+                        self.baseline_char_by_span
+                            .insert(*span, slots[i].ch.clone());
                         slots[i].changed_retroactively = false;
                     }
                 } else {
@@ -533,7 +544,10 @@ fn decode_mode1(
             // Batch both halves when neither is 1D; classify_part_variants handles 1D & triple-order.
             let geom_a = GlyphGeometry::from_strokes(&sp.left_or_top);
             let geom_b = GlyphGeometry::from_strokes(&sp.right_or_bottom);
-            let (pa, pb) = match (classify_1d_primitive(&geom_a), classify_1d_primitive(&geom_b)) {
+            let (pa, pb) = match (
+                classify_1d_primitive(&geom_a),
+                classify_1d_primitive(&geom_b),
+            ) {
                 (Some(prim_a), Some(prim_b)) => (
                     prim_a.into_iter().map(|p| (p.ch, p.prob)).collect(),
                     prim_b.into_iter().map(|p| (p.ch, p.prob)).collect(),
@@ -587,15 +601,8 @@ fn decode_mode1(
                 ),
             };
 
-            let composed = compose_rare_candidates(
-                ids,
-                imported,
-                class_set,
-                sp,
-                &pa,
-                &pb,
-                geom.stroke_count,
-            );
+            let composed =
+                compose_rare_candidates(ids, imported, class_set, sp, &pa, &pb, geom.stroke_count);
             let mut best_comp = 0.0f32;
             for (ch, comp_score) in composed.into_iter().take(5) {
                 best_comp = best_comp.max(comp_score);
@@ -638,10 +645,73 @@ fn decode_mode1(
         .collect())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "linux", feature = "native-onnx"))]
+    #[test]
+    fn incremental_handwriting_reuses_prefix_cnn_and_matches_uncached_decode() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let mut paths = crate::models::ModelPaths::bundled(Some(&assets));
+        paths.reranker = None;
+        assert!(HwOnnxBundle::load_paths(&paths).has_hw_onnx());
+        let imported = ImportedLexiconIndex::new(None);
+        let retention = RetentionEngine::default();
+        let ctx = HwDecodeContext {
+            imported: &imported,
+            retention: &retention,
+            gram: None,
+            tier3: None,
+            offline_guard: None,
+        };
+        let mut cached = HandwritingSession::default();
+        let mut uncached = HandwritingSession::default();
+        for session in [&mut cached, &mut uncached] {
+            session.set_model_paths(paths.clone());
+            session.begin(HwMode::ContinuousLattice);
+        }
+        let stroke = |points: &[(f32, f32)], start: u64| -> Vec<_> {
+            points
+                .iter()
+                .enumerate()
+                .map(|(i, &(x, y))| StrokePoint {
+                    x,
+                    y,
+                    timestamp_ms: start + i as u64 * 10,
+                })
+                .collect()
+        };
+        let strokes = [
+            stroke(&[(0.1, 0.2), (0.85, 0.2), (0.85, 0.8)], 0),
+            stroke(&[(0.2, 0.1), (0.2, 0.7)], 1000),
+            stroke(&[(0.1, 0.4), (0.6, 0.4)], 1040),
+        ];
+        for (i, stroke) in strokes.iter().enumerate() {
+            uncached.visual_cache.reset_visuals();
+            let actual = cached.push_stroke_with_context(stroke, true, &ctx).unwrap();
+            let expected = uncached
+                .push_stroke_with_context(stroke, true, &ctx)
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            assert_eq!(cached.visual_cache.lattice_cache_hits, i);
+        }
+        assert_eq!(cached.slot_span_bounds, [(0, 0), (1, 2)]);
+
+        // Force a final decode on both paths while keeping the same completed ink.
+        uncached.visual_cache.reset_visuals();
+        cached.strokes_dirty = true;
+        uncached.strokes_dirty = true;
+        assert_eq!(
+            serde_json::to_value(cached.end_with_context(&ctx).unwrap()).unwrap(),
+            serde_json::to_value(uncached.end_with_context(&ctx).unwrap()).unwrap(),
+        );
+        assert_eq!(cached.visual_cache.lattice_cache_hits, 4);
+        assert_eq!(uncached.visual_cache.lattice_cache_hits, 0);
+    }
 
     #[test]
     fn shrinking_public_strokes_removes_stale_manual_locks() {
@@ -663,7 +733,7 @@ mod tests {
             offline_guard: None,
         };
         assert!(matches!(
-            session.decode_current(&ctx).unwrap(),
+            session.decode_current(&ctx, RerankerLock::Wait).unwrap(),
             HandwritingPayload::Mode2(Mode2Result { slots, .. }) if slots.is_empty()
         ));
         assert!(session.manual_locked_by_span.is_empty());

@@ -167,7 +167,7 @@ impl VitralStringResult {
         match serde_json::to_string(value) {
             Ok(s) => Self {
                 status: VitralStatus::Ok,
-                json_utf8: to_c_char_lossy(&s),
+                json_utf8: CString::new(s).expect("JSON escapes NUL").into_raw(),
                 error_message: std::ptr::null_mut(),
             },
             Err(e) => Self::err(VitralStatus::ErrInternal, &e.to_string()),

@@ -1,9 +1,12 @@
 use super::ids_exta::{canonical_radical, find_bipartite_splits, IdcOp, IdsIndex};
 use super::onnx_models::{HwOnnxBundle, VisualPrediction};
 use super::pure_fallback::{classify_1d_primitive, classify_single_stroke_primitive};
-use super::raster::{global_bbox, render_directmap, GlyphGeometry, StrokeStats, DIRECTMAP_LEN};
+use super::raster::{global_bbox, render_directmap, GlyphGeometry, StrokeStats};
 use super::{StrokePoint, Top8Candidate};
 use crate::error::VitralError;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Weak};
 use vitral_tokens::TOKENS;
 
 #[derive(Debug, Clone)]
@@ -24,31 +27,86 @@ pub struct LatticeSlot {
     pub top8: Vec<Top8Candidate>,
 }
 
+type StrokeSpan = (usize, usize);
+
+#[derive(Debug)]
+struct SegmentationVisual {
+    bounds: (f32, f32, f32, f32),
+    geometry: GlyphGeometry,
+    predictions: Option<Vec<VisualPrediction>>,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct VisualCache {
+    bundle: Weak<HwOnnxBundle>,
+    strokes: Vec<(Vec<StrokePoint>, Option<StrokeStats>)>,
+    segmentation: HashMap<StrokeSpan, SegmentationVisual>,
+    lattice: HashMap<StrokeSpan, (usize, LatticeSlot)>,
+    #[cfg(all(test, feature = "native-onnx", target_os = "linux"))]
+    pub(super) lattice_cache_hits: usize,
+}
+
+impl VisualCache {
+    pub(super) fn update(&mut self, strokes: &[Vec<StrokePoint>], bundle: &Arc<HwOnnxBundle>) {
+        let bundle = Arc::downgrade(bundle);
+        if !self.bundle.ptr_eq(&bundle) {
+            self.segmentation.clear();
+            self.lattice.clear();
+            self.bundle = bundle;
+        }
+        self.update_strokes(strokes);
+    }
+
+    fn update_strokes(&mut self, strokes: &[Vec<StrokePoint>]) {
+        // HandwritingSession exposes the strokes to Rust callers, including edits to earlier ink.
+        let unchanged = self
+            .strokes
+            .iter()
+            .zip(strokes)
+            .take_while(|((old, _), new)| {
+                old.len() == new.len()
+                    && old.iter().zip(*new).all(|(a, b)| {
+                        a.x.to_bits() == b.x.to_bits()
+                            && a.y.to_bits() == b.y.to_bits()
+                            && a.timestamp_ms == b.timestamp_ms
+                    })
+            })
+            .count();
+        if unchanged < self.strokes.len() {
+            self.strokes.truncate(unchanged);
+            self.segmentation.retain(|&(_, end), _| end < unchanged);
+            self.lattice.retain(|&(_, end), _| end < unchanged);
+        }
+        self.strokes.extend(
+            strokes[unchanged..]
+                .iter()
+                .map(|s| (s.clone(), StrokeStats::from_stroke(s))),
+        );
+    }
+
+    #[cfg(all(test, feature = "native-onnx", target_os = "linux"))]
+    pub(super) fn reset_visuals(&mut self) {
+        self.segmentation.clear();
+        self.lattice.clear();
+    }
+}
+
 pub(super) fn segment_strokes_with_locks(
     strokes: &[Vec<StrokePoint>],
     bundle: &HwOnnxBundle,
     ids: &IdsIndex,
     locked: impl Iterator<Item = (usize, usize)>,
+    cache: &mut VisualCache,
 ) -> Vec<SegmentedSpan> {
     let mut locked: Vec<_> = locked.collect();
     locked.sort_unstable();
-    let segment_range = |range: std::ops::Range<usize>| {
-        let offset = range.start;
-        segment_strokes(&strokes[range], bundle, ids)
-            .into_iter()
-            .map(move |mut span| {
-                span.stroke_start += offset;
-                span.stroke_end += offset;
-                span
-            })
-    };
     let mut spans = Vec::new();
     let mut offset = 0;
     for (start, end) in locked {
         if start < offset || end >= strokes.len() || start > end {
             continue;
         }
-        spans.extend(segment_range(offset..start));
+        spans.extend(segment_range(strokes, offset..start, bundle, ids, cache));
         spans.push(SegmentedSpan {
             stroke_start: start,
             stroke_end: end,
@@ -56,13 +114,19 @@ pub(super) fn segment_strokes_with_locks(
         });
         offset = end + 1;
     }
-    spans.extend(segment_range(offset..strokes.len()));
+    spans.extend(segment_range(
+        strokes,
+        offset..strokes.len(),
+        bundle,
+        ids,
+        cache,
+    ));
     spans
 }
 
 /// Dual-regime CASIA-OLHWDB spatiotemporal stroke segmentation:
 /// - Superimposed writing: a long pause before restarting in the previous glyph area splits the ink.
-/// - Horizontal connected writing: routes pause/wide-gap candidates through a batched
+/// - Horizontal connected writing: routes pause/wide-gap candidates through a
 ///   visual DAG + `IdsIndex` structural-compound gate (keeping LR single characters like
 ///   `明`/`好`/`你` unified even across intra-char pauses while splitting horizontal sequences).
 pub fn segment_strokes(
@@ -70,10 +134,23 @@ pub fn segment_strokes(
     bundle: &HwOnnxBundle,
     ids: &IdsIndex,
 ) -> Vec<SegmentedSpan> {
-    let valid: Vec<(usize, StrokeStats)> = strokes
+    let mut cache = VisualCache::default();
+    cache.update_strokes(strokes);
+    segment_range(strokes, 0..strokes.len(), bundle, ids, &mut cache)
+}
+
+fn segment_range(
+    strokes: &[Vec<StrokePoint>],
+    range: Range<usize>,
+    bundle: &HwOnnxBundle,
+    ids: &IdsIndex,
+    cache: &mut VisualCache,
+) -> Vec<SegmentedSpan> {
+    let offset = range.start;
+    let valid: Vec<(usize, StrokeStats)> = cache.strokes[range]
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| StrokeStats::from_stroke(s).map(|st| (i, st)))
+        .filter_map(|(i, (_, stats))| stats.clone().map(|st| (offset + i, st)))
         .collect();
     if valid.is_empty() {
         return Vec::new();
@@ -116,8 +193,8 @@ pub fn segment_strokes(
 
         // A paused stroke that returns deep into the left half starts overlaid ink.
         // Shallow overlap near the right edge still needs a visual comparison.
-        let overlaid_restart = next.cx <= cur_min_x + 0.5 * cur_w
-            && cur_max_x - next.cx >= 0.25 * char_scale;
+        let overlaid_restart =
+            next.cx <= cur_min_x + 0.5 * cur_w && cur_max_x - next.cx >= 0.25 * char_scale;
         if paused && overlaid_restart {
             hard_splits[i] = true;
             cur_min_x = valid[i + 1].1.min_x;
@@ -177,7 +254,7 @@ pub fn segment_strokes(
         }
     }
 
-    // Step 2: Resolve horizontal candidates via batched visual DAG + IDS compound gating
+    // Resolve horizontal candidates via the visual DAG and IDS compound gate.
     if horiz_candidates.iter().any(|&b| b) {
         let gap_at: Vec<f32> = (0..(valid.len() - 1))
             .map(|k| valid[k + 1].1.min_x - valid[k].1.max_x)
@@ -196,25 +273,19 @@ pub fn segment_strokes(
                         hard_splits[k] || (horiz_candidates[k] && gap_at[k] >= 0.75 * cur_gap)
                     })
                     .unwrap_or(valid.len() - 1);
-                let left_s: Vec<Vec<StrokePoint>> = valid[seg_start..=i]
-                    .iter()
-                    .map(|&(idx, _)| strokes[idx].clone())
-                    .collect();
-                let right_s: Vec<Vec<StrokePoint>> = valid[(i + 1)..=seg_end]
-                    .iter()
-                    .map(|&(idx, _)| strokes[idx].clone())
-                    .collect();
-                let merged_s: Vec<Vec<StrokePoint>> = valid[seg_start..=seg_end]
-                    .iter()
-                    .map(|&(idx, _)| strokes[idx].clone())
-                    .collect();
+                let [left, right, merged] = [
+                    &valid[seg_start..=i],
+                    &valid[(i + 1)..=seg_end],
+                    &valid[seg_start..=seg_end],
+                ];
+                let bounds = |s: &[(usize, StrokeStats)]| (s[0].0, s[s.len() - 1].0);
+                let keys = [bounds(left), bounds(right), bounds(merged)];
+                let [preds_l, preds_r, preds_m] =
+                    segmentation_predictions(strokes, [left, right, merged], keys, bundle, cache);
 
-                let (l_min_x, l_max_x, l_min_y, l_max_y) =
-                    global_bbox(&left_s).unwrap_or((0.0, 0.0, 0.0, 0.0));
-                let (r_min_x, _r_max_x, _r_min_y, _r_max_y) =
-                    global_bbox(&right_s).unwrap_or((0.0, 0.0, 0.0, 0.0));
-                let (m_min_x, m_max_x, m_min_y, m_max_y) =
-                    global_bbox(&merged_s).unwrap_or((0.0, 0.0, 0.0, 0.0));
+                let (l_min_x, l_max_x, l_min_y, l_max_y) = cache.segmentation[&keys[0]].bounds;
+                let (r_min_x, _, _, _) = cache.segmentation[&keys[1]].bounds;
+                let (m_min_x, m_max_x, m_min_y, m_max_y) = cache.segmentation[&keys[2]].bounds;
                 let l_w = (l_max_x - l_min_x).max(1e-4);
                 let l_h = (l_max_y - l_min_y).max(1e-4);
                 let char_scale = l_h.max(l_w);
@@ -223,8 +294,6 @@ pub fn segment_strokes(
                 let merged_h = (m_max_y - m_min_y).max(1e-4);
                 let merged_aspect = merged_w / merged_h;
 
-                let (preds_l, preds_r, preds_m) =
-                    quick_top3_triple(&left_s, &right_s, &merged_s, bundle);
                 let p_l = preds_l.first().map(|p| p.prob).unwrap_or(0.0);
                 let p_r = preds_r.first().map(|p| p.prob).unwrap_or(0.0);
                 let p_m = preds_m.first().map(|p| p.prob).unwrap_or(0.0);
@@ -234,9 +303,9 @@ pub fn segment_strokes(
                     compact_single_box && matches_ids_compound(ids, &preds_l, &preds_r, &preds_m);
                 let geo_mean = (p_l * p_r).sqrt();
                 let merged_margin = if compact_single_box { 1.0 } else { 0.80 };
-                let separated_without_model = !bundle.has_hw_onnx() && p_m == 0.0 && gap_x >= 0.0;
-                let should_split =
-                    !ids_compound_match && (geo_mean > p_m * merged_margin || separated_without_model);
+                let separated_without_model = p_m == 0.0 && gap_x >= 0.0 && !bundle.has_hw_onnx();
+                let should_split = !ids_compound_match
+                    && (geo_mean > p_m * merged_margin || separated_without_model);
                 if should_split {
                     hard_splits[i] = true;
                 }
@@ -282,45 +351,64 @@ fn matches_ids_compound(
     })
 }
 
-fn quick_top3_triple(
-    left_s: &[Vec<StrokePoint>],
-    right_s: &[Vec<StrokePoint>],
-    merged_s: &[Vec<StrokePoint>],
+fn segmentation_predictions(
+    strokes: &[Vec<StrokePoint>],
+    spans: [&[(usize, StrokeStats)]; 3],
+    keys: [StrokeSpan; 3],
     bundle: &HwOnnxBundle,
-) -> (
-    Vec<VisualPrediction>,
-    Vec<VisualPrediction>,
-    Vec<VisualPrediction>,
-) {
-    if bundle.has_hw_onnx() {
-        let mut flat = Vec::with_capacity(3 * DIRECTMAP_LEN);
-        flat.extend_from_slice(&render_directmap(left_s));
-        flat.extend_from_slice(&render_directmap(right_s));
-        flat.extend_from_slice(&render_directmap(merged_s));
-        if let Some(mut batch) = bundle.classify_directmap_batch(&flat, 3, 3) {
-            if batch.len() == 3 {
-                let mut preds_m = batch.pop().unwrap();
-                let mut preds_r = batch.pop().unwrap();
-                let mut preds_l = batch.pop().unwrap();
-                if let Some(p) = classify_1d_primitive(&GlyphGeometry::from_strokes(left_s)) {
-                    preds_l = p;
-                }
-                if let Some(p) = classify_1d_primitive(&GlyphGeometry::from_strokes(right_s)) {
-                    preds_r = p;
-                }
-                if let Some(p) = classify_1d_primitive(&GlyphGeometry::from_strokes(merged_s)) {
-                    preds_m = p;
-                }
-                return (preds_l, preds_r, preds_m);
-            }
+    cache: &mut VisualCache,
+) -> [Vec<VisualPrediction>; 3] {
+    let mut inference_failed = false;
+    for (span, key) in spans.into_iter().zip(keys) {
+        if cache
+            .segmentation
+            .get(&key)
+            .is_some_and(|vis| vis.predictions.is_some())
+        {
+            continue;
+        }
+        let ink: Vec<_> = span
+            .iter()
+            .map(|(index, _)| strokes[*index].clone())
+            .collect();
+        let vis = cache
+            .segmentation
+            .entry(key)
+            .or_insert_with(|| SegmentationVisual {
+                bounds: global_bbox(&ink).unwrap_or_default(),
+                geometry: GlyphGeometry::from_strokes(&ink),
+                predictions: None,
+            });
+        if !bundle.has_hw_onnx() {
+            vis.predictions =
+                Some(classify_single_stroke_primitive(&vis.geometry).unwrap_or_default());
+        } else if let Some(preds) = classify_span(&ink, bundle, 3) {
+            vis.predictions = Some(classify_1d_primitive(&vis.geometry).unwrap_or(preds));
+        } else {
+            inference_failed = true;
         }
     }
-    (
-        classify_single_stroke_primitive(&GlyphGeometry::from_strokes(left_s)).unwrap_or_default(),
-        classify_single_stroke_primitive(&GlyphGeometry::from_strokes(right_s)).unwrap_or_default(),
-        classify_single_stroke_primitive(&GlyphGeometry::from_strokes(merged_s))
-            .unwrap_or_default(),
-    )
+    keys.map(|key| {
+        let vis = &cache.segmentation[&key];
+        if inference_failed {
+            // Keep the geometry fallback for this comparison and retry failed inference later.
+            classify_single_stroke_primitive(&vis.geometry).unwrap_or_default()
+        } else {
+            vis.predictions.clone().unwrap_or_default()
+        }
+    })
+}
+
+fn classify_span(
+    ink: &[Vec<StrokePoint>],
+    bundle: &HwOnnxBundle,
+    top_k: usize,
+) -> Option<Vec<VisualPrediction>> {
+    // The int8 classifier derives an activation scale from its whole batch.
+    // A single-span batch keeps predictions independent of other ink.
+    bundle
+        .classify_directmap_batch(&render_directmap(ink), 1, top_k)?
+        .pop()
 }
 
 /// Build a single `LatticeSlot` from Top-K predictions & radical ambiguity flag.
@@ -400,104 +488,109 @@ pub fn build_confusion_lattice(
     bundle: &HwOnnxBundle,
     ids: &IdsIndex,
 ) -> Result<Vec<LatticeSlot>, VitralError> {
-    if spans.is_empty() {
-        return Ok(Vec::new());
-    }
-    let top_k = TOKENS.handwriting.confusion_top_k as usize;
-
-    let mut minor_top_prob: Vec<Option<f32>> = vec![None; spans.len()];
-    let raw_preds: Vec<Vec<VisualPrediction>> = if bundle.has_hw_onnx() {
-        let mut flat = Vec::with_capacity(spans.len() * DIRECTMAP_LEN);
-        for sp in spans {
-            flat.extend_from_slice(&render_directmap(&sp.strokes));
-        }
-        let mut batch_res = bundle
-            .classify_directmap_batch(&flat, spans.len(), top_k.max(8))
-            .ok_or_else(|| {
-                VitralError::ModelUnavailable("hw_model ONNX inference failed".into())
-            })?;
-        // Apply 1D single-stroke primitive override (`一`, `丨`, `丶`)
-        for (idx, sp) in spans.iter().enumerate() {
-            let geom = GlyphGeometry::from_strokes(&sp.strokes);
-            if let Some(prim) = classify_1d_primitive(&geom) {
-                batch_res[idx] = prim;
-            }
-        }
-
-        // Detect structural sibling ambiguity for multi-stroke compound spans (e.g. 曝/爆)
-        // where the major right/bottom component dominates the 48x48 CNN while the minor left/top
-        // radical was written ambiguously/cursively.
-        let mut minor_checks: Vec<(usize, Vec<Vec<StrokePoint>>)> = Vec::new();
-        for (idx, sp) in spans.iter().enumerate() {
-            let preds = &batch_res[idx];
-            if sp.strokes.len() >= 6 && preds.len() >= 2 {
-                let top1 = &preds[0];
-                let has_sibling = preds
-                    .iter()
-                    .skip(1)
-                    .take(4)
-                    .any(|p| ids.are_structural_siblings(top1.ch, p.ch));
-                if has_sibling && top1.raw_logit < 2.5 {
-                    let splits = find_bipartite_splits(&sp.strokes);
-                    if let Some(best_split) = splits.first() {
-                        minor_checks.push((idx, best_split.left_or_top.clone()));
-                    } else {
-                        let prefix_n = 4.min(sp.strokes.len() / 2);
-                        minor_checks.push((idx, sp.strokes[..prefix_n].to_vec()));
-                    }
-                }
-            }
-        }
-
-        if !minor_checks.is_empty() {
-            let mut mflat = Vec::with_capacity(minor_checks.len() * DIRECTMAP_LEN);
-            for (_, st) in &minor_checks {
-                mflat.extend_from_slice(&render_directmap(st));
-            }
-            if let Some(res) = bundle.classify_directmap_batch(&mflat, minor_checks.len(), 3) {
-                for ((slot_i, _), preds) in minor_checks.into_iter().zip(res) {
-                    let p_sum: f32 = if preds.len() >= 2
-                        && canonical_radical(preds[0].ch) == canonical_radical(preds[1].ch)
-                    {
-                        preds[0].prob + preds[1].prob
-                    } else {
-                        preds.first().map(|p| p.prob).unwrap_or(0.0)
-                    };
-                    minor_top_prob[slot_i] = Some(p_sum);
-                }
-            }
-        }
-
-        batch_res
-    } else {
-        let mut out = Vec::with_capacity(spans.len());
-        for sp in spans {
-            let geom = GlyphGeometry::from_strokes(&sp.strokes);
-            let prim = classify_single_stroke_primitive(&geom).ok_or_else(|| {
-                VitralError::ModelUnavailable(
-                    "handwriting ONNX model (hw_model.onnx / hw_model.int8.onnx) is unavailable for multi-stroke recognition".into(),
-                )
-            })?;
-            out.push(prim);
-        }
-        out
-    };
-
-    let slots = spans
+    spans
         .iter()
         .enumerate()
-        .map(|(idx, sp)| {
-            let is_radical_ambig = minor_top_prob[idx].is_some_and(|p| p < 0.65);
-            build_lattice_slot_from_predictions(
-                idx,
-                sp.stroke_start,
-                sp.stroke_end,
-                &raw_preds[idx],
-                is_radical_ambig,
-            )
+        .map(|(i, span)| {
+            let (mut slot, _) = build_span_slot(span, bundle, ids)?;
+            slot.slot_idx = i;
+            Ok(slot)
         })
-        .collect();
-    Ok(slots)
+        .collect()
+}
+
+pub(super) fn build_cached_lattice(
+    spans: &[SegmentedSpan],
+    bundle: &HwOnnxBundle,
+    ids: &IdsIndex,
+    cache: &mut VisualCache,
+) -> Result<Vec<LatticeSlot>, VitralError> {
+    spans
+        .iter()
+        .enumerate()
+        .map(|(i, span)| {
+            let key = (span.stroke_start, span.stroke_end);
+            // Locked ranges include empty/invalid strokes that normal segmentation filters out.
+            let count = span.strokes.len();
+            let mut slot =
+                if let Some((_, slot)) = cache.lattice.get(&key).filter(|(n, _)| *n == count) {
+                    #[cfg(all(test, feature = "native-onnx", target_os = "linux"))]
+                    {
+                        cache.lattice_cache_hits += 1;
+                    }
+                    slot.clone()
+                } else {
+                    let (slot, reusable) = build_span_slot(span, bundle, ids)?;
+                    if reusable {
+                        cache.lattice.insert(key, (count, slot.clone()));
+                    }
+                    slot
+                };
+            slot.slot_idx = i;
+            Ok(slot)
+        })
+        .collect()
+}
+
+fn build_span_slot(
+    span: &SegmentedSpan,
+    bundle: &HwOnnxBundle,
+    ids: &IdsIndex,
+) -> Result<(LatticeSlot, bool), VitralError> {
+    let geom = GlyphGeometry::from_strokes(&span.strokes);
+    let (preds, minor_top_prob, reusable) = if bundle.has_hw_onnx() {
+        let top_k = TOKENS.handwriting.confusion_top_k as usize;
+        let raw_preds = classify_span(&span.strokes, bundle, top_k.max(8)).ok_or_else(|| {
+            VitralError::ModelUnavailable("hw_model ONNX inference failed".into())
+        })?;
+        let preds = classify_1d_primitive(&geom).unwrap_or(raw_preds);
+
+        // Soften structural siblings (e.g. 曝/爆) when the minor radical is unclear.
+        let mut minor_top_prob = None;
+        let mut reusable = true;
+        if span.strokes.len() >= 6
+            && preds.len() >= 2
+            && preds[0].raw_logit < 2.5
+            && preds
+                .iter()
+                .skip(1)
+                .take(4)
+                .any(|p| ids.are_structural_siblings(preds[0].ch, p.ch))
+        {
+            let splits = find_bipartite_splits(&span.strokes);
+            let minor = splits.first().map_or_else(
+                || &span.strokes[..4.min(span.strokes.len() / 2)],
+                |split| split.left_or_top.as_slice(),
+            );
+            if let Some(minor_preds) = classify_span(minor, bundle, 3) {
+                minor_top_prob = Some(match minor_preds.as_slice() {
+                    [a, b, ..] if canonical_radical(a.ch) == canonical_radical(b.ch) => {
+                        a.prob + b.prob
+                    }
+                    [a, ..] => a.prob,
+                    [] => 0.0,
+                });
+            } else {
+                reusable = false;
+            }
+        }
+        (preds, minor_top_prob, reusable)
+    } else {
+        let preds = classify_single_stroke_primitive(&geom).ok_or_else(|| {
+            VitralError::ModelUnavailable(
+                "handwriting ONNX model (hw_model.onnx / hw_model.int8.onnx) is unavailable for multi-stroke recognition".into(),
+            )
+        })?;
+        (preds, None, true)
+    };
+    let slot = build_lattice_slot_from_predictions(
+        0,
+        span.stroke_start,
+        span.stroke_end,
+        &preds,
+        minor_top_prob.is_some_and(|p| p < 0.65),
+    );
+    Ok((slot, reusable))
 }
 
 #[cfg(test)]
@@ -542,11 +635,14 @@ mod tests {
         ];
         let natural = segment_strokes(&strokes, &bundle, &ids);
         assert_eq!((natural[0].stroke_start, natural[0].stroke_end), (0, 1));
+        let mut cache = VisualCache::default();
+        cache.update(&strokes, &bundle);
         let locked = segment_strokes_with_locks(
             &strokes,
             &bundle,
             &ids,
             [(3, 4), (2, 3), (1, 2), (0, usize::MAX), (3, 2)].into_iter(),
+            &mut cache,
         );
         let bounds: Vec<_> = locked
             .iter()
@@ -565,8 +661,16 @@ mod tests {
             prob,
             raw_logit: prob.ln(),
         };
-        let left = [prediction('小', 0.6), prediction('水', 0.2), prediction('川', 0.1)];
-        let right = [prediction('司', 0.5), prediction('丁', 0.3), prediction('可', 0.15)];
+        let left = [
+            prediction('小', 0.6),
+            prediction('水', 0.2),
+            prediction('川', 0.1),
+        ];
+        let right = [
+            prediction('司', 0.5),
+            prediction('丁', 0.3),
+            prediction('可', 0.15),
+        ];
         let merged = [prediction('何', 0.5), prediction('河', 0.3)];
         assert!(matches_ids_compound(&ids, &left, &right, &merged));
         assert!(!matches_ids_compound(&ids, &left[..1], &right, &merged));

@@ -1,0 +1,93 @@
+{
+  "schema_version": "1.0.0",
+  "audio_format": {
+    "container": "wav",
+    "encoding": "pcm_s16le",
+    "sample_rate_hz": 16000,
+    "channels": 1,
+    "sample_width_bytes": 2,
+    "bits_per_sample": 16
+  },
+  "generator": {
+    "tts_engine": "espeak-ng 1.52.0",
+    "voice": "cmn",
+    "resampler": "ffmpeg n9.0.2 (-ar 16000 -ac 1 -c:a pcm_s16le -bitexact)"
+  },
+  "clips": [
+    {
+      "id": "mandarin_short",
+      "file": "mandarin_short_16k.wav",
+      "category": "speech_mandarin_short",
+      "language": "zh-CN",
+      "transcript": "你好，今天天气真不错。",
+      "expected_keywords": [
+        "你好",
+        "天气"
+      ],
+      "expect_non_empty_transcript": true,
+      "duration_sec": 3.198,
+      "min_duration_sec": 2.0,
+      "max_duration_sec": 4.5,
+      "rms_int16": 2972.25,
+      "min_rms_int16": 500.0,
+      "peak_int16": 25000,
+      "sha256": "b986fd61478433b8674feecea66ee24bd3679983a7b5a4b3751b5226788d6121"
+    },
+    {
+      "id": "mandarin_mixed_en",
+      "file": "mandarin_mixed_en_16k.wav",
+      "category": "speech_mandarin_mixed_en",
+      "language": "zh-CN+en",
+      "transcript": "我正在使用 Vitral 进行测试。",
+      "expected_keywords": [
+        "Vitral",
+        "测试"
+      ],
+      "expect_non_empty_transcript": true,
+      "duration_sec": 3.56,
+      "min_duration_sec": 2.0,
+      "max_duration_sec": 5.0,
+      "rms_int16": 3205.66,
+      "min_rms_int16": 500.0,
+      "peak_int16": 28184,
+      "sha256": "936a5ad35ecd26155e765e5173028d91cb53235c359bdf0b20c609a6f0c62f4c"
+    },
+    {
+      "id": "long_20s",
+      "file": "long_20s_16k.wav",
+      "category": "speech_mandarin_long",
+      "language": "zh-CN",
+      "transcript": "欢迎使用离线语音识别测试集。这是一段用于验证连续长语音识别与分段转写能力的普通话测试录音。今天上午我们检查了拼音解码准确率，下午将测试本地剪贴板同步与离线语音转写性能。为了保证系统在超过二十秒的连续语音输入下依然保持稳定延迟，这段音频包含多个完整自然句。",
+      "expected_keywords": [
+        "语音",
+        "测试",
+        "普通话"
+      ],
+      "expect_non_empty_transcript": true,
+      "duration_sec": 35.743,
+      "min_duration_sec": 20.0,
+      "max_duration_sec": 45.0,
+      "rms_int16": 3261.36,
+      "min_rms_int16": 500.0,
+      "peak_int16": 32566,
+      "sha256": "230accab1b879ac78793491106ed8d02d8cfbe5d041645fe2b2cc49cfc0e837c"
+    },
+    {
+      "id": "silence_noise",
+      "file": "silence_noise_16k.wav",
+      "category": "noise_low_amplitude",
+      "language": "none",
+      "transcript": "",
+      "expected_keywords": [],
+      "expect_non_empty_transcript": false,
+      "duration_sec": 2.5,
+      "min_duration_sec": 2.0,
+      "max_duration_sec": 3.5,
+      "rms_int16": 11.97,
+      "min_rms_int16": 1.0,
+      "max_rms_int16": 100.0,
+      "peak_int16": 44,
+      "sha256": "2da678fcbf704cf7618058568cece2de29eaffb8e29014d670ba1b409076fcec"
+    }
+  ]
+}

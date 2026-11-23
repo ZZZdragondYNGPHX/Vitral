@@ -420,8 +420,8 @@ impl RimeGramDb {
     /// Resume a Darts lookup from a pre-advanced `prefix_state` using `suffix`.
     pub fn lookup_from_state(
         &self,
-        mut node_pos: usize,
-        mut unit: u32,
+        node_pos: usize,
+        unit: u32,
         suffix: &str,
         buf: &mut Vec<u8>,
     ) -> Option<f64> {
@@ -430,7 +430,20 @@ impl RimeGramDb {
         }
         buf.clear();
         Self::encode_into(suffix, buf);
-        for &b in buf.iter() {
+        self.lookup_from_state_encoded(node_pos, unit, buf)
+    }
+
+    #[inline]
+    pub(super) fn lookup_from_state_encoded(
+        &self,
+        mut node_pos: usize,
+        mut unit: u32,
+        suffix: &[u8],
+    ) -> Option<f64> {
+        if suffix.is_empty() {
+            return None;
+        }
+        for &b in suffix {
             let shift = ((unit >> 6) & 8) as usize;
             let offset = ((unit >> 10) as usize) << shift;
             node_pos = node_pos ^ offset ^ (b as usize);

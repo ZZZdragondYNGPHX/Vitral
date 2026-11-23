@@ -17,9 +17,7 @@ use crate::sync::RelayDevice;
 use pure_rust::{pure_rust_opencc, DecodedCandidate, PureRustEngine};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-#[cfg(all(target_os = "linux", feature = "native-rime"))]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use vitral_tokens::TOKENS;
 
 pub const MOD_LANG_TOGGLE: u32 = 1 << 30;
@@ -423,6 +421,10 @@ pub struct EngineState {
     last_commit_context: Option<String>,
     last_commit_window: Vec<char>,
     context_window: Vec<char>,
+    #[cfg(feature = "native-onnx")]
+    semantic_epoch: u64,
+    #[cfg(feature = "native-onnx")]
+    semantic_requested: u64,
     cached_context_vec: Option<[i8; 32]>,
     cached_mlm_priors: HashMap<char, f32>,
     pub(crate) candidate_features: Vec<[f64; 9]>,
@@ -494,7 +496,10 @@ impl EngineState {
             }
         }
         let resolved_assets_dir = resolve_assets_dir(&config.assets_dir);
-        let mut pure_rust = PureRustEngine::new(resolved_assets_dir.as_deref());
+        let mut pure_rust = PureRustEngine::with_corpus_cache(
+            resolved_assets_dir.as_deref(),
+            (!config.data_dir.is_empty()).then(|| Path::new(&config.data_dir)),
+        );
         pure_rust.fuzzy_pinyin = config.fuzzy_pinyin;
         pure_rust.syllable_split = config.syllable_split;
         let mut engine = Self {
@@ -513,6 +518,10 @@ impl EngineState {
             last_commit_context: None,
             last_commit_window: Vec::new(),
             context_window: Vec::new(),
+            #[cfg(feature = "native-onnx")]
+            semantic_epoch: 0,
+            #[cfg(feature = "native-onnx")]
+            semantic_requested: 0,
             cached_context_vec: None,
             cached_mlm_priors: HashMap::new(),
             candidate_features: Vec::new(),
@@ -579,8 +588,7 @@ impl EngineState {
 
     pub(crate) fn reset_commit_context(&mut self) {
         self.context_window.clear();
-        self.cached_context_vec = None;
-        self.cached_mlm_priors.clear();
+        self.refresh_semantic_context();
         self.last_commit_features = None;
         self.last_committed_word = None;
         self.last_committed_code = None;
@@ -792,25 +800,62 @@ impl EngineState {
         })
     }
 
-    fn refresh_semantic_context(&mut self) {
+    pub(crate) fn refresh_semantic_context(&mut self) {
+        #[cfg(feature = "native-onnx")]
+        {
+            self.semantic_epoch = self.semantic_epoch.wrapping_add(1);
+        }
         self.cached_context_vec = None;
         self.cached_mlm_priors.clear();
         if !self.config.adaptive_learning || self.context_window.is_empty() {
             return;
         }
-        if self.model_paths.reranker.is_some() && self.context_window.len() >= 2 {
-            let bundle = crate::hw::onnx_models::HwOnnxBundle::load_paths(&self.model_paths);
-            if bundle.has_reranker_onnx() {
-                if let Some((vector, priors)) = bundle.encode_rbt3_context(&self.context_window) {
-                    self.cached_context_vec = Some(vector);
-                    self.cached_mlm_priors = priors;
-                    return;
-                }
-            }
-        }
         self.cached_context_vec = Some(RetentionEngine::project_context_fallback(
             &self.context_window.iter().collect::<String>(),
         ));
+    }
+
+    #[cfg(feature = "native-onnx")]
+    pub(crate) fn take_semantic_context(
+        &mut self,
+    ) -> Option<(u64, Vec<char>, crate::models::ModelPaths)> {
+        if self.semantic_requested == self.semantic_epoch
+            || !self.config.adaptive_learning
+            || self.context_window.len() < 2
+            || self.model_paths.reranker.is_none()
+        {
+            return None;
+        }
+        self.semantic_requested = self.semantic_epoch;
+        Some((
+            self.semantic_epoch,
+            self.context_window.clone(),
+            self.model_paths.clone(),
+        ))
+    }
+
+    #[cfg(feature = "native-onnx")]
+    pub(crate) fn is_semantic_epoch(&self, epoch: u64) -> bool {
+        self.semantic_epoch == epoch
+    }
+
+    #[cfg(feature = "native-onnx")]
+    pub(crate) fn cancel_pending_semantic_context(&mut self) {
+        self.semantic_epoch = self.semantic_epoch.wrapping_add(1);
+        self.semantic_requested = self.semantic_epoch;
+    }
+
+    #[cfg(feature = "native-onnx")]
+    pub(crate) fn apply_semantic_context(
+        &mut self,
+        epoch: u64,
+        vector: [i8; 32],
+        priors: HashMap<char, f32>,
+    ) {
+        if self.semantic_epoch == epoch {
+            self.cached_context_vec = Some(vector);
+            self.cached_mlm_priors = priors;
+        }
     }
 
     fn features_for(
@@ -1146,8 +1191,7 @@ impl EngineState {
         self.pure_rust.reload_assets(self.resolved_assets_dir.as_deref());
         self.model_paths = crate::models::ModelPaths::from_config(&self.config, self.resolved_assets_dir.as_deref())?;
         self.pure_rust.set_model_paths(&self.model_paths);
-        self.cached_context_vec = None;
-        self.cached_mlm_priors.clear();
+        self.refresh_semantic_context();
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         { self.rime_session_id = None; rime_ffi::clear_runtime(); }
 
@@ -1602,6 +1646,24 @@ impl EngineState {
             self.score_pair(item, origin, retention, now_ms, *rank / 2);
         }
         if snap.page_index == 0 {
+            let context = self.prefix_prediction_context(now_ms);
+            let decoded = std::cell::OnceCell::new();
+            let simplified = std::cell::OnceCell::new();
+            let converted = std::cell::OnceCell::new();
+            let candidates = |mode| {
+                // Deduplication uses display text, so each OpenCC mode keeps its own ranking.
+                let ranked = if mode == OpenCcMode::Simplified { &simplified } else { &converted };
+                ranked.get_or_init(|| {
+                    let decoded = decoded.get_or_init(|| self.pure_rust.decode_candidates(
+                        &self.raw_input, self.schema, Some(imported), Some(retention),
+                    ));
+                    self.pure_rust.rank_candidates(
+                        decoded, &self.raw_input, self.schema, mode, Some(imported),
+                        Some(retention), context.as_deref(), self.active_app_id.as_deref(),
+                        self.config.adaptive_learning,
+                    )
+                })
+            };
             let (mut priority_overlay, mut seen) =
                 self.build_overlay_candidates(clipboard, imported, retention, true);
             // Learned full readings share Frecency ranking with native alternatives.
@@ -1656,16 +1718,7 @@ impl EngineState {
             {
                 let mut seen_base: HashSet<String> =
                     base_pairs.iter().map(|(it, _, _)| it.text.clone()).collect();
-                let pr = self.pure_rust.query_all_candidates_contextual(
-                    &self.raw_input,
-                    self.schema,
-                    OpenCcMode::Simplified,
-                    Some(imported),
-                    Some(retention),
-                    self.prefix_prediction_context(RetentionEngine::now_epoch_ms()).as_deref(),
-                    self.active_app_id.as_deref(),
-                    self.config.adaptive_learning,
-                );
+                let (pr, _) = candidates(OpenCcMode::Simplified);
                 let mut added_full_alt = 0usize;
                 for (
                     offset,
@@ -1674,15 +1727,15 @@ impl EngineState {
                         canonical,
                         consumed_len,
                     },
-                ) in pr.into_iter().enumerate()
+                ) in pr.iter().enumerate()
                 {
-                    if consumed_len != self.raw_input.len()
-                        || retention.erased_words.contains(&canonical)
+                    if *consumed_len != self.raw_input.len()
+                        || retention.erased_words.contains(canonical)
                     {
                         continue;
                     }
-                    let frec = self.contextual_score(retention, &canonical, now_ms);
-                    let pinned = retention.pinned_words.contains(&canonical);
+                    let frec = self.contextual_score(retention, canonical, now_ms);
+                    let pinned = retention.pinned_words.contains(canonical);
                     let is_full_alt =
                         need_full_span_alt && added_full_alt == 0 && canonical.chars().count() >= max_rime_len
                             && (self.schema == SchemaKind::DoublePinyinFlypy
@@ -1690,14 +1743,18 @@ impl EngineState {
                     if frec <= 0.0 && !pinned && !is_full_alt {
                         continue;
                     }
-                    let converted = self.convert_opencc(&canonical);
+                    let converted = if self.opencc_mode == OpenCcMode::Simplified {
+                        pr_item.text.clone()
+                    } else {
+                        self.convert_opencc(canonical)
+                    };
                     if seen.contains(&converted) || !seen_base.insert(converted.clone()) {
                         continue;
                     }
                     let item = CandidateItem {
                         index: 0,
                         text: converted.clone(),
-                        comment: pr_item.comment,
+                        comment: pr_item.comment.clone(),
                         pinned,
                         is_clipboard_shortcut: false,
                         quick_paste_id: None,
@@ -1706,9 +1763,9 @@ impl EngineState {
                         frecency_score: frec,
                     };
                     let origin = CandidateOrigin::PureRust {
-                        consumed_len,
+                        consumed_len: *consumed_len,
                         features: [0.0; 9],
-                        canonical,
+                        canonical: canonical.clone(),
                         commit_text: converted,
                     };
                     if is_full_alt && frec <= 0.0 && !pinned {
@@ -1840,16 +1897,7 @@ impl EngineState {
             if (self.config.fuzzy_pinyin && self.schema == SchemaKind::RimeIce)
                 || pure_rust::mixed_english(&self.raw_input, Some(retention)).is_some()
             {
-                let decoded = self.pure_rust.query_all_candidates_contextual(
-                    &self.raw_input,
-                    self.schema,
-                    self.opencc_mode,
-                    Some(imported),
-                    Some(retention),
-                    self.prefix_prediction_context(now_ms).as_deref(),
-                    self.active_app_id.as_deref(),
-                    self.config.adaptive_learning,
-                );
+                let (decoded, _) = candidates(self.opencc_mode);
                 let english_at = decoded.iter().position(|c| c.item.comment == "英文");
                 let priority_count = priority_overlay
                     .iter()
@@ -1860,7 +1908,7 @@ impl EngineState {
                     })
                     .count();
                 let mut fuzzy_added = 0;
-                for (rank, candidate) in decoded.into_iter().enumerate() {
+                for (rank, candidate) in decoded.iter().enumerate() {
                     let english = candidate.item.comment == "英文";
                     let fuzzy = self.config.fuzzy_pinyin
                         && self.schema == SchemaKind::RimeIce
@@ -1887,10 +1935,10 @@ impl EngineState {
                     let origin = CandidateOrigin::PureRust {
                         consumed_len: candidate.consumed_len,
                         features: [0.0; 9],
-                        canonical: candidate.canonical,
+                        canonical: candidate.canonical.clone(),
                         commit_text: candidate.item.text.clone(),
                     };
-                    let mut item = candidate.item;
+                    let mut item = candidate.item.clone();
                     let mut origin = origin;
                     self.score_pair(&mut item, &mut origin, retention, now_ms, rank);
                     priority_overlay.insert(
@@ -1902,33 +1950,25 @@ impl EngineState {
                     }
                 }
             }
-            if let Some(context) = self.prefix_prediction_context(now_ms) {
-                if let Some((word, _)) = self.pure_rust.contextual_prefix_candidate(
+            if let Some(context) = context.as_deref() {
+                let active = if self.opencc_mode == OpenCcMode::Simplified { &simplified } else { &converted };
+                // If no other branch decoded, first check for a prefix worth ranking.
+                let prediction = active.get().or_else(|| self.pure_rust.contextual_prefix_candidate(
                     &self.raw_input,
                     self.schema,
                     Some(imported),
                     Some(retention),
-                    &context,
+                    context,
                     self.config.adaptive_learning,
-                ) {
-                    // Reuse the portable ranking guard for explicitly typed longer sentences.
-                    let decoded = self.pure_rust.query_all_candidates_contextual(
-                        &self.raw_input,
-                        self.schema,
-                        self.opencc_mode,
-                        Some(imported),
-                        Some(retention),
-                        Some(&context),
-                        self.active_app_id.as_deref(),
-                        self.config.adaptive_learning,
-                    );
-                    if let Some(candidate) = decoded.into_iter().next().filter(|c| c.canonical == word) {
-                        let prediction_score = candidate.item.frecency_score;
-                        let mut item = candidate.item;
+                ).map(|_| candidates(self.opencc_mode)));
+                if let Some((decoded, Some((word, prediction_score)))) = prediction {
+                    // The portable ranking already guarded against explicitly typed longer sentences.
+                    if let Some(candidate) = decoded.first() {
+                        let mut item = candidate.item.clone();
                         let mut origin = CandidateOrigin::PureRust {
                             consumed_len: candidate.consumed_len,
                             features: [0.0; 9],
-                            canonical: candidate.canonical,
+                            canonical: candidate.canonical.clone(),
                             commit_text: item.text.clone(),
                         };
                         self.score_pair(&mut item, &mut origin, retention, now_ms, 0);
@@ -1936,8 +1976,8 @@ impl EngineState {
                         priority_overlay.push((item, origin));
                         self.promote_prefix_prediction(
                             &mut priority_overlay,
-                            &word,
-                            prediction_score,
+                            word,
+                            *prediction_score,
                             retention,
                             now_ms,
                         );
@@ -2198,7 +2238,7 @@ impl EngineState {
 
         let now_ms = RetentionEngine::now_epoch_ms();
         let prefix_context = self.prefix_prediction_context(now_ms);
-        let base_pairs = self.pure_rust.query_all_candidates_contextual(
+        let (base_pairs, contextual_prediction) = self.pure_rust.query_candidates_with_prediction(
             &self.raw_input,
             self.schema,
             self.opencc_mode,
@@ -2208,25 +2248,6 @@ impl EngineState {
             self.active_app_id.as_deref(),
             self.config.adaptive_learning,
         );
-
-        let contextual_prediction = prefix_context
-            .as_deref()
-            .and_then(|context| {
-                self.pure_rust.contextual_prefix_candidate(
-                    &self.raw_input,
-                    self.schema,
-                    Some(imported),
-                    Some(retention),
-                    context,
-                    self.config.adaptive_learning,
-                )
-            })
-            .and_then(|(word, _)| {
-                base_pairs
-                    .first()
-                    .filter(|c| c.canonical == word)
-                    .map(|c| (word, c.item.frecency_score))
-            });
 
         let english_at = base_pairs.iter().position(|c| c.item.comment == "英文");
         let (mut merged, mut seen) =
@@ -2240,15 +2261,13 @@ impl EngineState {
             },
         ) in base_pairs.into_iter().enumerate()
         {
-            let converted = self.convert_opencc(&canonical);
-            if seen.insert(converted.clone()) {
+            if seen.insert(item.text.clone()) {
                 let mut item = item;
-                item.text = converted.clone();
                 let origin = CandidateOrigin::PureRust {
                     consumed_len,
                     features: [0.0; 9],
                     canonical,
-                    commit_text: converted,
+                    commit_text: item.text.clone(),
                 };
                 let mut origin = origin;
                 self.score_pair(&mut item, &mut origin, retention, now_ms, base_rank);
@@ -2446,8 +2465,8 @@ impl EngineState {
                 )
             }
         };
-        if let Some((syllables, _)) = imported.corpus().word_readings.get(word) {
-            return matches(&syllables.join(" "));
+        if let Some((syllables, _)) = imported.corpus().word_reading(word) {
+            return matches(&syllables.collect::<Vec<_>>().join(" "));
         }
         let ann =
             crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(imported.corpus()))
@@ -2515,12 +2534,10 @@ impl EngineState {
         let mut overlay: Vec<(CandidateItem, CandidateOrigin)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        let paste = clipboard.quick_paste_state();
-        if let Some(clip) = paste.quick_paste.filter(|_| {
-            self.config.platform == "android"
-                && paste.candidate_visible
-                && self.raw_input.is_empty()
-        }) {
+        let quick_paste = (self.config.platform == "android" && self.raw_input.is_empty())
+            .then(|| clipboard.visible_quick_paste())
+            .flatten();
+        if let Some(clip) = quick_paste {
             overlay.push((
                 CandidateItem {
                     index: 0,
@@ -2528,7 +2545,7 @@ impl EngineState {
                     comment: "快捷粘贴".into(),
                     pinned: false,
                     is_clipboard_shortcut: false,
-                    quick_paste_id: Some(clip.id),
+                    quick_paste_id: Some(clip.id.clone()),
                     function_action: None,
                     shortcut_code: None,
                     frecency_score: 0.0,
@@ -2536,7 +2553,7 @@ impl EngineState {
                 CandidateOrigin::Overlay {
                     features: [0.0; 9],
                     canonical: clip.content.clone(),
-                    commit_text: clip.content,
+                    commit_text: clip.content.clone(),
                     is_clipboard: true,
                 },
             ));
@@ -3447,9 +3464,8 @@ mod personalization_tests {
                 e.cached_mlm_priors = e
                     .pure_rust
                     .get_corpus()
-                    .char_readings
-                    .keys()
-                    .map(|&ch| (ch, 0.5))
+                    .character_keys()
+                    .map(|ch| (ch, 0.5))
                     .collect();
             }
             e.raw_input = "woyaoquka".into();
@@ -3488,9 +3504,11 @@ mod personalization_tests {
             (SchemaKind::RimeIce, "yi", "yi"),
             (SchemaKind::DoublePinyinFlypy, "ui", "shi"),
         ] {
-            let bucket = &e.pure_rust.get_corpus().spaced_pinyin_to_words[syllable];
-            assert!(bucket.len() > 48);
-            let late_word = bucket[48].0.clone();
+            let late_word = {
+                let mut bucket = e.pure_rust.get_corpus().spaced_pinyin_words(syllable);
+                assert!(bucket.len() > 48);
+                bucket.nth(48).unwrap().0.to_owned()
+            };
             e.clear_composition_state();
             e.schema = schema;
             e.raw_input = code.into();
@@ -3796,6 +3814,67 @@ mod personalization_tests {
                 .unwrap();
             assert_eq!(selected.commit_text, Some(expected));
             assert!(e.raw_input.is_empty());
+        }
+    }
+
+    #[cfg(feature = "native-onnx")]
+    #[test]
+    fn semantic_context_rejects_old_results_and_deduplicates_requests() {
+        let (mut engine, _, imported, mut retention) = fixture();
+        engine.model_paths.reranker = Some(PathBuf::from("test-reranker"));
+        let now = RetentionEngine::now_epoch_ms();
+        engine.record_candidate_commit("你好", "nihao", None, &imported, &mut retention, now);
+        let (old, _, _) = engine.take_semantic_context().unwrap();
+        assert!(engine.take_semantic_context().is_none());
+
+        engine.record_candidate_commit("世界", "shijie", None, &imported, &mut retention, now);
+        let fallback = engine.cached_context_vec.unwrap();
+        let (current, context, _) = engine.take_semantic_context().unwrap();
+        assert_eq!(context.iter().collect::<String>(), "你好世界");
+        engine.apply_semantic_context(old, [1; 32], HashMap::from([('测', 0.5)]));
+        assert_eq!(engine.cached_context_vec, Some(fallback));
+        assert!(engine.cached_mlm_priors.is_empty());
+        engine.apply_semantic_context(current, [2; 32], HashMap::from([('试', 0.5)]));
+        assert_eq!(engine.cached_context_vec, Some([2; 32]));
+        assert_eq!(engine.cached_mlm_priors.get(&'试'), Some(&0.5));
+
+        engine.reset_commit_context();
+        engine.apply_semantic_context(current, [2; 32], HashMap::new());
+        assert!(engine.cached_context_vec.is_none());
+        assert!(engine.take_semantic_context().is_none());
+    }
+
+    #[cfg(feature = "native-onnx")]
+    #[test]
+    fn real_semantic_context_is_filled_after_commit() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let config = EngineConfig {
+            assets_dir: assets.display().to_string(),
+            pure_offline: true,
+            ..Default::default()
+        };
+        let core = crate::VitralCore::init(&serde_json::to_string(&config).unwrap()).unwrap();
+        {
+            let mut st = core.input.lock();
+            assert!(st.engine.model_paths.reranker.is_some());
+            offer(&mut st.engine, "你好", "nihao");
+        }
+        assert_eq!(
+            core.select_candidate(0).unwrap().commit_text.as_deref(),
+            Some("你好")
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            {
+                let st = core.input.lock();
+                assert!(st.engine.cached_context_vec.is_some());
+                if !st.engine.cached_mlm_priors.is_empty() {
+                    assert!(!st.semantic_worker_running);
+                    break;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "semantic inference did not complete");
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
@@ -4210,9 +4289,16 @@ mod personalization_tests {
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
     #[test]
     fn native_page_zero_promotes_contextual_prefix_with_portable_origin() {
-        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+        for (schema, mode, display) in [
+            (SchemaKind::RimeIce, OpenCcMode::Simplified, "确"),
+            (SchemaKind::RimeIce, OpenCcMode::Traditional, "確"),
+            (SchemaKind::DoublePinyinFlypy, OpenCcMode::Simplified, "确"),
+        ] {
             let (mut e, clip, imp, mut r) = fixture();
             e.schema = schema;
+            e.set_opencc_mode(mode);
+            e.config.fuzzy_pinyin = true;
+            e.pure_rust.fuzzy_pinyin = true;
             type_code(&mut e, "q", &clip, &imp, &mut r);
             e.clear_composition_state();
             e.record_candidate_commit(
@@ -4237,15 +4323,17 @@ mod personalization_tests {
                     comment: String::new(),
                 }],
             };
+            e.pure_rust.decode_calls.set(0);
             let action = e.apply_rime_snapshot(snapshot, false, false, &clip, &imp, &r);
-            assert_eq!(action.candidates[0].text, "确");
+            assert_eq!(e.pure_rust.decode_calls.get(), 1);
+            assert_eq!(action.candidates[0].text, display);
             assert!(
                 matches!(&e.candidate_origins[0], CandidateOrigin::PureRust { consumed_len: 1, canonical, .. } if canonical == "确")
             );
             let commit = e
                 .process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
                 .unwrap();
-            assert_eq!(commit.commit_text.as_deref(), Some("确"));
+            assert_eq!(commit.commit_text.as_deref(), Some(display));
             assert_eq!(e.speech_context_before(), "正确");
         }
     }

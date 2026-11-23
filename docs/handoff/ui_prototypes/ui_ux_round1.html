@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-anim { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .tap-scale:active { transform: scale(0.93); }
+    .tabular { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Workbench Bar -->
+    <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="switchView('desktop')" id="vbtn-desktop" class="px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]">桌面端 (右下角极简栏)</button>
+        <button onclick="switchView('mobile')" id="vbtn-mobile" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">手机端 (顶层图标栏+候选)</button>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-1.5">
+        <div class="flex items-center gap-0.5 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+          <button onclick="setStyle('tonal')" id="sbtn-tonal" class="px-2 py-0.5 rounded font-medium ime-anim bg-[var(--secondary)] text-[var(--secondary-foreground)]">A 温润微色阶</button>
+          <button onclick="setStyle('glass')" id="sbtn-glass" class="px-2 py-0.5 rounded font-medium ime-anim text-[var(--muted-foreground)]">B 晶透毛玻璃</button>
+          <button onclick="setStyle('ink')" id="sbtn-ink" class="px-2 py-0.5 rounded font-medium ime-anim text-[var(--muted-foreground)]">C 纯粹纸墨</button>
+        </div>
+        <button onclick="toggleDark()" id="btn-dark" class="px-2 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-anim">底色: 深色</button>
+      </div>
+    </div>
+
+    <!-- Stage (Fixed Compact Height ~348px) -->
+    <div id="stage" class="rounded-xl relative overflow-hidden ime-anim" style="height:348px; background:#0f1116; border:1px solid rgba(255,255,255,0.08);">
+
+      <!-- Subtle ambient background glow for Glass mode -->
+      <div id="ambient-orb" class="pointer-events-none absolute -top-16 left-1/3 w-64 h-64 rounded-full opacity-0 ime-anim" style="background:radial-gradient(circle, rgba(56,189,248,0.26) 0%, rgba(99,102,241,0.12) 55%, transparent 75%); filter:blur(24px);"></div>
+
+      <!-- ================= DESKTOP VIEW ================= -->
+      <div id="pane-desktop" class="h-full flex flex-col justify-between p-4 relative z-10">
+        <!-- Context sub-controls -->
+        <div class="flex items-center justify-between text-xs" id="desk-hint" style="color:#8b92a0;">
+          <div class="flex items-center gap-2">
+            <button onclick="toggleCandDir()" id="btn-dir" class="px-2 py-0.5 rounded ime-anim" style="background:rgba(255,255,255,0.07);">候选: 横排</button>
+            <button onclick="toggleDeskCustomize()" id="btn-cust-desk" class="px-2 py-0.5 rounded ime-anim" style="background:rgba(99,102,241,0.18); color:#a5b4fc;">+ 自定义右下角图标栏</button>
+            <button onclick="resetDeskBar()" class="px-2 py-0.5 rounded ime-anim opacity-75 hover:opacity-100" style="background:rgba(255,255,255,0.06);">重置初始(仅2图标)</button>
+          </div>
+          <span id="hover-tip" class="tabular opacity-85">悬停右下角图标可预览功能说明</span>
+        </div>
+
+        <!-- Upper-Left: Simulated Editor + PURE Candidate Box (NO toolbar attached!) -->
+        <div class="space-y-2 max-w-lg mt-1">
+          <div id="desk-editor" class="rounded-lg px-3 py-2 text-sm flex items-center gap-1 ime-anim" style="background:#181a21; border:1px solid rgba(255,255,255,0.07); color:#e5e7eb;">
+            <span>纯粹为输入而生：</span>
+            <span class="inline-block w-0.5 h-4 bg-current opacity-70 animate-pulse"></span>
+          </div>
+
+          <div class="pl-20">
+            <div id="desk-cand-box" class="inline-flex flex-col px-3 py-2 ime-anim">
+              <div class="flex items-center justify-between gap-6 pb-1 mb-1 text-xs" id="desk-preedit-bar">
+                <span class="font-mono tracking-wider" id="desk-preedit">xh'sp</span>
+                <span class="opacity-45 text-[11px] tabular">鹤</span>
+              </div>
+              <div id="desk-cands" class="flex items-center gap-1.5 tabular text-sm"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Floating Icon Customizer Popover (Opens above bottom-right bar) -->
+        <div id="desk-picker" class="hidden absolute right-4 bottom-16 rounded-xl p-2.5 text-xs space-y-2 z-20 ime-anim" style="width:252px; background:rgba(24,26,33,0.96); border:1px solid rgba(255,255,255,0.12); box-shadow:0 12px 32px rgba(0,0,0,0.45); color:#e5e7eb;">
+          <div class="flex items-center justify-between opacity-80 pb-1" style="border-bottom:1px solid rgba(255,255,255,0.08);">
+            <span>点选纯图标增删至右下角栏</span>
+            <button onclick="toggleDeskCustomize()" class="opacity-70 hover:opacity-100">✕</button>
+          </div>
+          <div id="picker-grid" class="grid grid-cols-4 gap-1.5"></div>
+        </div>
+
+        <!-- Bottom Desktop Area: Footnote + Bottom-Right Initial Floating Status Pill -->
+        <div class="flex items-end justify-between pt-2">
+          <div class="text-xs opacity-55" id="desk-foot-note" style="color:#9ca3af;">
+            当前为默认初始态：仅「输入法图标 + 中/En」2 个元素
+          </div>
+
+          <!-- THE BOTTOM-RIGHT FLOATING STATUS BAR -->
+          <div id="desk-status-bar" class="inline-flex items-center gap-1 px-2 py-1.5 ime-anim"></div>
+        </div>
+      </div>
+
+      <!-- ================= MOBILE VIEW ================= -->
+      <div id="pane-mobile" class="hidden h-full flex flex-col justify-between px-4 py-2.5 relative z-10">
+        <!-- Mobile Sub-controls -->
+        <div class="flex items-center justify-between text-xs" style="color:#8b92a0;">
+          <div class="flex items-center gap-1.5">
+            <button onclick="toggleMobTopMode()" id="btn-mob-mode" class="px-2 py-0.5 rounded ime-anim" style="background:rgba(99,102,241,0.18); color:#a5b4fc;">顶栏: 双层常驻 (纯图标栏在候选上方)</button>
+            <button onclick="toggleMobTyping()" id="btn-mob-typing" class="px-2 py-0.5 rounded ime-anim" style="background:rgba(255,255,255,0.07);">状态: 正在输入</button>
+          </div>
+          <button onclick="toggleMobSub()" id="btn-mob-sub" class="px-2 py-0.5 rounded ime-anim" style="background:rgba(255,255,255,0.07);">双拼角标: 开</button>
+        </div>
+
+        <!-- Phone Keyboard Frame -->
+        <div id="mob-frame" class="w-full max-w-md mx-auto rounded-2xl p-2 space-y-1 ime-anim">
+          <!-- LAYER 1 (TOPMOST): PURE SVG ICON TOOLBAR (Strictly Above Candidate Bar!) -->
+          <div id="mob-icon-toolbar" class="flex items-center justify-between px-1.5 py-1 ime-anim"></div>
+
+          <!-- LAYER 2 (BELOW TOOLBAR): CANDIDATE BAR -->
+          <div id="mob-cand-bar" class="flex items-center justify-between px-2 py-1 text-sm ime-anim"></div>
+
+          <!-- LAYER 3: 26-Key Grid -->
+          <div id="mob-grid" class="space-y-1 pt-0.5"></div>
+
+          <!-- LAYER 4: Ergonomic Bottom Row with Pure SVG Icons -->
+          <div id="mob-bottom-row" class="grid grid-cols-12 gap-1 pt-0.5 items-center"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const ICONS = {
+      logo: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 9l8 12 8-12-8-6Z"/><path d="M4 9h16"/></svg>`,
+      clipboard: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>`,
+      phrases: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h5"/></svg>`,
+      transfer: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4 20-7z"/></svg>`,
+      mic: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/></svg>`,
+      translate: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>`,
+      recorder: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>`,
+      lexicon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+      settings: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9c.26.6.77 1.02 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`,
+      collapse: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+      expandRight: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg>`,
+      shift: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 4 13h5v7h6v-7h5L12 4z"/></svg>`,
+      backspace: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/><path d="m18 9-6 6"/><path d="m12 9 6 6"/></svg>`,
+      enter: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 10l-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`
+    };
+
+    const TOOLS = [
+      { id: 'clipboard', name: '剪贴板 (N条环形队列 + 置顶)' },
+      { id: 'transfer',  name: '隔空闪传 (传完即焚)' },
+      { id: 'mic',       name: '离线语音 (SenseVoice)' },
+      { id: 'translate', name: '边写边译' },
+      { id: 'phrases',   name: '常用语' },
+      { id: 'lexicon',   name: '词库管理 (.scel 直导)' },
+      { id: 'recorder',  name: 'AI 录音笔 (P2 低优先级工具)' },
+      { id: 'settings',  name: '偏好设置' }
+    ];
+
+    const FLYPY = [
+      [['Q','iu'],['W','ei'],['E','e'],['R','uan'],['T','ue'],['Y','un'],['U','sh'],['I','ch'],['O','uo'],['P','ie']],
+      [['A','a'],['S','ong'],['D','ai'],['F','en'],['G','eng'],['H','ang'],['J','an'],['K','ing'],['L','uang']],
+      [['SHIFT',''],['Z','ou'],['X','ia'],['C','ao'],['V','zh'],['B','in'],['N','iao'],['M','ian'],['BS','']]
+    ];
+
+    let st = {
+      view: 'desktop',
+      style: 'tonal',
+      dark: true,
+      zhMode: true,
+      verticalCand: false,
+      deskTools: [],
+      pickerOpen: false,
+      mobDualBar: true,
+      mobTyping: true,
+      mobSub: true
+    };
+
+    function palette() {
+      const d = st.dark;
+      if (st.style === 'tonal') {
+        return {
+          stageBg: d ? '#111318' : '#eef0f4',
+          panelBg: d ? '#1d2028' : '#f6f7f9',
+          panelBorder: d ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.06)',
+          panelRadius: '12px',
+          pillRadius: '10px',
+          keyRadius: '8px',
+          keyBg: d ? '#282c36' : '#ffffff',
+          fnKeyBg: d ? '#21242d' : '#e6e8ee',
+          accentBg: '#4f46e5',
+          accentText: '#ffffff',
+          accentMuted: d ? '#a5b4fc' : '#4f46e5',
+          textPrimary: d ? '#f3f4f6' : '#111827',
+          textSecondary: d ? '#8b92a2' : '#6b7280',
+          shadow: d ? '0 12px 28px rgba(0,0,0,0.38)' : '0 8px 22px rgba(15,23,42,0.08)',
+          blur: 'none'
+        };
+      }
+      if (st.style === 'glass') {
+        return {
+          stageBg: d ? '#0c0e14' : '#e6ebf2',
+          panelBg: d ? 'rgba(26, 30, 42, 0.68)' : 'rgba(255, 255, 255, 0.72)',
+          panelBorder: d ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.85)',
+          panelRadius: '16px',
+          pillRadius: '9999px',
+          keyRadius: '10px',
+          keyBg: d ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.85)',
+          fnKeyBg: d ? 'rgba(255,255,255,0.04)' : 'rgba(15,23,42,0.06)',
+          accentBg: d ? '#0ea5e9' : '#0284c7',
+          accentText: '#ffffff',
+          accentMuted: d ? '#7dd3fc' : '#0369a1',
+          textPrimary: d ? '#f8fafc' : '#0f172a',
+          textSecondary: d ? '#94a3b8' : '#64748b',
+          shadow: d ? '0 16px 36px rgba(0,0,0,0.48)' : '0 12px 30px rgba(2,132,199,0.10)',
+          blur: 'blur(16px)'
+        };
+      }
+      return {
+        stageBg: d ? '#0a0a0b' : '#f4f4f2',
+        panelBg: d ? '#141416' : '#ffffff',
+        panelBorder: d ? 'rgba(255,255,255,0.14)' : 'rgba(0,0,0,0.14)',
+        panelRadius: '6px',
+        pillRadius: '6px',
+        keyRadius: '5px',
+        keyBg: d ? '#1f1f22' : '#f9f9f8',
+        fnKeyBg: d ? '#18181b' : '#ebebea',
+        accentBg: d ? '#f4f4f5' : '#18181b',
+        accentText: d ? '#09090b' : '#fafafa',
+        accentMuted: d ? '#d4d4d8' : '#3f3f46',
+        textPrimary: d ? '#f4f4f5' : '#18181b',
+        textSecondary: d ? '#71717a' : '#71717a',
+        shadow: d ? '0 8px 20px rgba(0,0,0,0.5)' : '0 4px 12px rgba(0,0,0,0.06)',
+        blur: 'none'
+      };
+    }
+
+    function render() {
+      const p = palette();
+      const stage = document.getElementById('stage');
+      stage.style.background = p.stageBg;
+      stage.style.borderColor = p.panelBorder;
+      document.getElementById('ambient-orb').style.opacity = st.style === 'glass' ? '1' : '0';
+      document.getElementById('btn-dark').textContent = st.dark ? '底色: 深色' : '底色: 浅色';
+
+      ['tonal','glass','ink'].forEach(k => {
+        const b = document.getElementById('sbtn-' + k);
+        b.className = k === st.style
+          ? 'px-2 py-0.5 rounded font-medium ime-anim bg-[var(--secondary)] text-[var(--secondary-foreground)]'
+          : 'px-2 py-0.5 rounded font-medium ime-anim text-[var(--muted-foreground)]';
+      });
+
+      renderDesktop(p);
+      renderMobile(p);
+    }
+
+    function renderDesktop(p) {
+      const ed = document.getElementById('desk-editor');
+      ed.style.background = p.panelBg;
+      ed.style.borderColor = p.panelBorder;
+      ed.style.color = p.textPrimary;
+
+      const box = document.getElementById('desk-cand-box');
+      box.style.background = p.panelBg;
+      box.style.border = `1px solid ${p.panelBorder}`;
+      box.style.borderRadius = p.panelRadius;
+      box.style.boxShadow = p.shadow;
+      box.style.backdropFilter = p.blur;
+
+      const pbar = document.getElementById('desk-preedit-bar');
+      pbar.style.borderBottom = `1px solid ${p.panelBorder}`;
+      pbar.style.color = p.accentMuted;
+
+      const cands = ['小鹤双拼', '细化水平', '喜欢视频', '现货商品', '循环赛跑'];
+      const clist = document.getElementById('desk-cands');
+      clist.className = st.verticalCand ? 'flex flex-col items-stretch gap-1 tabular text-sm min-w-[140px]' : 'flex items-center gap-1.5 tabular text-sm';
+      clist.innerHTML = cands.map((w, i) => {
+        if (i === 0) {
+          return `<div class="px-2.5 py-0.5 font-medium flex items-center gap-1.5" style="background:${p.accentBg}; color:${p.accentText}; border-radius:${p.keyRadius};">
+            <span class="text-xs opacity-75">1</span><span>${w}</span>
+          </div>`;
+        }
+        return `<div class="px-2 py-0.5 flex items-center gap-1.5" style="color:${p.textPrimary};">
+          <span class="text-xs" style="color:${p.textSecondary};">${i + 1}</span><span>${w}</span>
+        </div>`;
+      }).join('');
+
+      const sbar = document.getElementById('desk-status-bar');
+      sbar.style.background = p.panelBg;
+      sbar.style.border = `1px solid ${p.panelBorder}`;
+      sbar.style.borderRadius = p.pillRadius;
+      sbar.style.boxShadow = p.shadow;
+      sbar.style.backdropFilter = p.blur;
+      sbar.style.color = p.textPrimary;
+
+      const extraIconsHtml = st.deskTools.map(id => {
+        const t = TOOLS.find(x => x.id === id);
+        return `<button onmouseenter="showTip('${t.name}')" onmouseleave="resetTip()" class="w-7 h-7 flex items-center justify-center rounded-md hover:opacity-100 opacity-80 tap-scale ime-anim" style="color:${p.textPrimary};" title="${t.name}">
+          ${ICONS[id]}
+        </button>`;
+      }).join('');
+
+      const dividerHtml = st.deskTools.length > 0
+        ? `<span class="w-px h-3.5 mx-0.5" style="background:${p.panelBorder};"></span>`
+        : '';
+
+      sbar.innerHTML = `
+        <button onclick="toggleDeskCustomize()" onmouseenter="showTip('PureIME 图标 (点击可自定义工具栏)')" onmouseleave="resetTip()" class="w-7 h-7 flex items-center justify-center rounded-md tap-scale ime-anim" style="color:${p.accentMuted};" title="PureIME 图标">
+          ${ICONS.logo}
+        </button>
+        <button onclick="toggleZh()" onmouseenter="showTip('点击切换 中 / En')" onmouseleave="resetTip()" class="w-7 h-7 flex items-center justify-center rounded-md font-semibold text-xs tap-scale ime-anim" style="background:${p.fnKeyBg}; color:${p.textPrimary}; border-radius:${p.keyRadius};" title="中/英文状态">
+          ${st.zhMode ? '中' : 'En'}
+        </button>
+        ${dividerHtml}
+        ${extraIconsHtml}
+      `;
+
+      const pgrid = document.getElementById('picker-grid');
+      pgrid.innerHTML = TOOLS.map(t => {
+        const active = st.deskTools.includes(t.id);
+        return `<button onclick="toggleToolInDesk('${t.id}')" onmouseenter="showTip('${t.name}')" class="p-2 rounded-lg flex flex-col items-center justify-center ime-anim tap-scale" style="background:${active ? 'rgba(99,102,241,0.25)' : 'rgba(255,255,255,0.05)'}; border:1px solid ${active ? 'rgba(129,140,248,0.5)' : 'transparent'};">
+          ${ICONS[t.id]}
+        </button>`;
+      }).join('');
+
+      document.getElementById('desk-foot-note').textContent = st.deskTools.length === 0
+        ? '当前为默认初始态：仅「输入法图标 + 中/En」2 个元素'
+        : `已自定义挂载 ${st.deskTools.length} 个纯图标工具`;
+    }
+
+    function renderMobile(p) {
+      const frame = document.getElementById('mob-frame');
+      frame.style.background = p.panelBg;
+      frame.style.border = `1px solid ${p.panelBorder}`;
+      frame.style.boxShadow = p.shadow;
+      frame.style.backdropFilter = p.blur;
+
+      const tbar = document.getElementById('mob-icon-toolbar');
+      const cbar = document.getElementById('mob-cand-bar');
+
+      const showToolbar = st.mobDualBar || !st.mobTyping;
+      tbar.classList.toggle('hidden', !showToolbar);
+      tbar.style.borderBottom = st.mobTyping ? `1px solid ${p.panelBorder}` : 'none';
+
+      const mobIcons = ['clipboard', 'phrases', 'mic', 'transfer', 'translate', 'recorder'];
+      tbar.innerHTML = `
+        <button class="w-7 h-7 flex items-center justify-center tap-scale" style="color:${p.accentMuted};" title="PureIME 菜单">${ICONS.logo}</button>
+        <div class="flex items-center gap-3.5" style="color:${p.textSecondary};">
+          ${mobIcons.map(id => `<button class="w-7 h-7 flex items-center justify-center hover:opacity-100 opacity-85 tap-scale" style="color:${p.textPrimary};">${ICONS[id]}</button>`).join('')}
+        </div>
+        <button class="w-7 h-7 flex items-center justify-center opacity-70 tap-scale" style="color:${p.textSecondary};" title="收起键盘">${ICONS.collapse}</button>
+      `;
+
+      if (st.mobTyping) {
+        cbar.classList.remove('hidden');
+        const foldBtn = !st.mobDualBar
+          ? `<button onclick="toggleMobTyping()" class="w-6 h-6 flex items-center justify-center rounded mr-1" style="background:${p.fnKeyBg}; color:${p.textSecondary};">${ICONS.expandRight}</button>`
+          : '';
+        cbar.innerHTML = `
+          <div class="flex items-center gap-2 overflow-hidden">
+            ${foldBtn}
+            <span class="text-xs font-mono px-1.5 py-0.5 rounded" style="background:${p.fnKeyBg}; color:${p.accentMuted};">xh'sp</span>
+            <span class="px-2 py-0.5 text-xs font-medium" style="background:${p.accentBg}; color:${p.accentText}; border-radius:${p.keyRadius};">小鹤双拼</span>
+            <span class="text-xs" style="color:${p.textPrimary};">喜欢</span>
+            <span class="text-xs" style="color:${p.textSecondary};">细化</span>
+            <span class="text-xs" style="color:${p.textSecondary};">信号</span>
+          </div>
+          <button class="w-6 h-6 flex items-center justify-center opacity-65" style="color:${p.textSecondary};">${ICONS.collapse}</button>
+        `;
+      } else {
+        cbar.innerHTML = `<div class="w-full text-center text-xs py-0.5 opacity-45" style="color:${p.textSecondary};">（未打字空闲态：候选栏留白或显示刚复制胶囊）</div>`;
+      }
+
+      const grid = document.getElementById('mob-grid');
+      grid.innerHTML = FLYPY.map((row, rIdx) => {
+        const pad = rIdx === 1 ? 'px-3.5' : '';
+        return `<div class="flex justify-center gap-1 ${pad}">` + row.map(([k, sub]) => {
+          const isFn = k === 'SHIFT' || k === 'BS';
+          const wCls = isFn ? 'w-10' : 'flex-1';
+          const content = k === 'SHIFT' ? ICONS.shift : (k === 'BS' ? ICONS.backspace : `<span class="text-xs font-medium leading-tight">${k}</span>`);
+          const subHtml = (!isFn && st.mobSub)
+            ? `<span class="text-[9px] leading-none opacity-75" style="color:${p.accentMuted};">${sub}</span>`
+            : (!isFn ? `<span class="text-[9px] leading-none opacity-0">.</span>` : '');
+          return `<button class="${wCls} h-9 tap-scale ime-anim flex flex-col items-center justify-center" style="background:${isFn ? p.fnKeyBg : p.keyBg}; color:${p.textPrimary}; border-radius:${p.keyRadius};">
+            ${subHtml}${content}
+          </button>`;
+        }).join('') + `</div>`;
+      }).join('');
+
+      const brow = document.getElementById('mob-bottom-row');
+      brow.innerHTML = `
+        <button class="col-span-2 h-9 text-xs font-medium tap-scale flex items-center justify-center" style="background:${p.fnKeyBg}; color:${p.textSecondary}; border-radius:${p.keyRadius};">123</button>
+        <button class="col-span-1 h-9 text-xs tap-scale flex items-center justify-center" style="background:${p.fnKeyBg}; color:${p.textSecondary}; border-radius:${p.keyRadius};">，</button>
+        <button class="col-span-6 h-9 text-xs tap-scale flex items-center justify-center gap-1.5" style="background:${p.keyBg}; color:${p.textSecondary}; border-radius:${p.keyRadius};">
+          <span class="font-medium" style="color:${p.textPrimary};">鹤</span>
+        </button>
+        <button class="col-span-1 h-9 text-xs tap-scale flex items-center justify-center" style="background:${p.fnKeyBg}; color:${p.textSecondary}; border-radius:${p.keyRadius};">。</button>
+        <button class="col-span-2 h-9 tap-scale flex items-center justify-center" style="background:${p.accentBg}; color:${p.accentText}; border-radius:${p.keyRadius};">${ICONS.enter}</button>
+      `;
+    }
+
+    function switchView(v) {
+      st.view = v;
+      document.getElementById('pane-desktop').classList.toggle('hidden', v !== 'desktop');
+      document.getElementById('pane-mobile').classList.toggle('hidden', v !== 'mobile');
+      document.getElementById('vbtn-desktop').className = v === 'desktop'
+        ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+        : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      document.getElementById('vbtn-mobile').className = v === 'mobile'
+        ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+        : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+    }
+
+    function setStyle(s) { st.style = s; render(); }
+    function toggleDark() { st.dark = !st.dark; render(); }
+    function toggleZh() { st.zhMode = !st.zhMode; render(); }
+    function toggleCandDir() {
+      st.verticalCand = !st.verticalCand;
+      document.getElementById('btn-dir').textContent = '候选: ' + (st.verticalCand ? '竖排' : '横排');
+      render();
+    }
+    function toggleDeskCustomize() {
+      st.pickerOpen = !st.pickerOpen;
+      document.getElementById('desk-picker').classList.toggle('hidden', !st.pickerOpen);
+    }
+    function toggleToolInDesk(id) {
+      const idx = st.deskTools.indexOf(id);
+      if (idx >= 0) st.deskTools.splice(idx, 1);
+      else st.deskTools.push(id);
+      render();
+    }
+    function resetDeskBar() {
+      st.deskTools = [];
+      render();
+    }
+    function showTip(txt) { document.getElementById('hover-tip').textContent = txt; }
+    function resetTip() { document.getElementById('hover-tip').textContent = '悬停右下角图标可预览功能说明'; }
+
+    function toggleMobTopMode() {
+      st.mobDualBar = !st.mobDualBar;
+      document.getElementById('btn-mob-mode').textContent = st.mobDualBar
+        ? '顶栏: 双层常驻 (纯图标栏在候选上方)'
+        : '顶栏: 智能折叠 (输入时让位给候选)';
+      render();
+    }
+    function toggleMobTyping() {
+      st.mobTyping = !st.mobTyping;
+      document.getElementById('btn-mob-typing').textContent = st.mobTyping ? '状态: 正在输入' : '状态: 空闲未打字';
+      render();
+    }
+    function toggleMobSub() {
+      st.mobSub = !st.mobSub;
+      document.getElementById('btn-mob-sub').textContent = '双拼角标: ' + (st.mobSub ? '开' : '关');
+      render();
+    }
+
+    render();
+  </script>
+</body>
+</html>

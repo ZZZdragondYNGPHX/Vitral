@@ -1,0 +1,530 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-anim { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .tap-s:active { transform: scale(0.95); }
+    .tabular { font-variant-numeric: tabular-nums; }
+    @keyframes pulseBar {
+      0%, 100% { transform: scaleY(0.3); opacity: 0.55; }
+      50% { transform: scaleY(1); opacity: 1; }
+    }
+    .wbar { animation: pulseBar 700ms ease-in-out infinite; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Round 3 Workbench Navigation -->
+    <div class="flex flex-wrap items-center justify-between gap-1.5 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex flex-wrap items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="setTab('clip')" id="tbtn-clip" class="px-2 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]">1. 剪贴板浮窗 (置顶实测)</button>
+        <button onclick="setTab('send')" id="tbtn-send" class="px-2 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">2. 隔空闪传面板</button>
+        <button onclick="setTab('ai')" id="tbtn-ai" class="px-2 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">3. 边写边译 & 录音笔</button>
+        <button onclick="setTab('quanpin')" id="tbtn-quanpin" class="px-2 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">4. 全拼键帽收尾</button>
+      </div>
+
+      <button onclick="toggleTheme()" id="btn-theme" class="px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-anim">深色晶透</button>
+    </div>
+
+    <!-- Frosted Glass Stage (Fixed 364px height, zero scrollbars) -->
+    <div id="stage" class="rounded-xl relative overflow-hidden ime-anim" style="height:364px;">
+      <div class="pointer-events-none absolute -top-14 left-12 w-60 h-60 rounded-full" style="background:radial-gradient(circle, rgba(14,165,233,0.30) 0%, transparent 70%); filter:blur(24px);"></div>
+      <div class="pointer-events-none absolute -bottom-12 right-10 w-64 h-64 rounded-full" style="background:radial-gradient(circle, rgba(99,102,241,0.24) 0%, rgba(16,185,129,0.12) 60%, transparent 75%); filter:blur(26px);"></div>
+
+      <!-- ================= TAB 1: CLIPBOARD DUAL-TRACK POPOVER ================= -->
+      <div id="pane-clip" class="h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <div class="flex items-center justify-between" id="clip-top-hint">
+          <span>演示上限 N=4 条：点右侧「图钉」可锁定免淘汰，点「+ 模拟新 Ctrl+C」观察瞬态覆盖与环形队列挤出</span>
+          <button onclick="simNewCopy()" id="btn-sim-copy" class="px-2.5 py-1 rounded-full font-medium tap-s ime-anim">+ 模拟新 Ctrl+C 复制</button>
+        </div>
+
+        <!-- Centered Frosted Clipboard Panel (Shared visual structure for Desktop Popover & Mobile In-Keyboard Sheet) -->
+        <div id="clip-panel" class="w-full max-w-lg mx-auto rounded-2xl p-3 space-y-2 ime-anim">
+          <!-- Panel Header (Pure Icons) -->
+          <div class="flex items-center justify-between pb-1.5" id="clip-hdr">
+            <div class="flex items-center gap-2">
+              <span class="font-medium text-xs">剪贴板协同</span>
+              <span class="px-2 py-0.5 rounded-full text-[11px] tabular" id="clip-cap-pill"></span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <button onclick="clearUnpinned()" class="p-1 rounded-lg opacity-75 hover:opacity-100 tap-s" title="清空未置顶条目" id="btn-clear-unpin"></button>
+            </div>
+          </div>
+
+          <!-- Track 1: Single-Slot Live Transient Buffer -->
+          <div id="live-slot-card" class="rounded-xl px-2.5 py-1.5 flex items-center justify-between ime-anim"></div>
+
+          <!-- Track 2: N-Item Ring Buffer (Pinned immune to eviction) -->
+          <div id="ring-list" class="space-y-1.5"></div>
+        </div>
+
+        <div class="text-center opacity-65" id="clip-toast">点击任意剪贴板卡片可直接上屏粘贴；置顶项永久保存在 Koofr 不受 N 上限挤压</div>
+      </div>
+
+      <!-- ================= TAB 2: AIR TRANSFER (MY DEVICES + LOCALSEND RADAR) ================= -->
+      <div id="pane-send" class="hidden h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <div class="flex items-center justify-between" id="send-hint">
+          <span>点击任意设备即可体验「局域网 P2P 直连」与「跨网 Koofr 传完即焚」双通道状态流转</span>
+          <button onclick="toggleRadar()" id="btn-radar" class="px-2.5 py-0.5 rounded-full ime-anim"></button>
+        </div>
+
+        <div id="send-panel" class="w-full max-w-lg mx-auto rounded-2xl p-3.5 space-y-3 ime-anim">
+          <!-- Zone 1: My Paired Devices -->
+          <div class="space-y-1.5">
+            <div class="flex items-center justify-between opacity-75">
+              <span>我的关联设备（点选或拖入文件即发）</span>
+              <span class="text-[11px]">端到端加密</span>
+            </div>
+            <div class="grid grid-cols-3 gap-2" id="my-devs"></div>
+          </div>
+
+          <!-- Zone 2: Nearby LocalSend Peers -->
+          <div class="space-y-1.5 pt-2" id="nearby-zone">
+            <div class="flex items-center justify-between opacity-75">
+              <span>传给其他人（免流量 LocalSend 协议附近发现）</span>
+              <span id="radar-badge" class="text-[11px]"></span>
+            </div>
+            <div id="nearby-list" class="flex items-center gap-2"></div>
+          </div>
+
+          <!-- Ephemeral Transfer Status Strip -->
+          <div id="send-status-bar" class="rounded-xl px-3 py-2 flex items-center justify-between tabular ime-anim"></div>
+        </div>
+
+        <div class="text-center opacity-60" id="send-foot">跨网文件仅借道 Koofr /relay/ 流式中转，对端完成 SHA-256 校验后立即 DELETE 物理销毁</div>
+      </div>
+
+      <!-- ================= TAB 3: INLINE TRANSLATE & P2 AI VOICE RECORDER ================= -->
+      <div id="pane-ai" class="hidden h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <div class="flex items-center justify-between" id="ai-hint">
+          <div class="flex items-center gap-1.5">
+            <button onclick="setAiSub('trans')" id="aisub-trans" class="px-2.5 py-0.5 rounded-full font-medium ime-anim">A. 内嵌单行「边写边译 / 润色」</button>
+            <button onclick="setAiSub('rec')" id="aisub-rec" class="px-2.5 py-0.5 rounded-full font-medium ime-anim">B. 独立微胶囊「AI 录音笔 (P2)」</button>
+          </div>
+          <span class="opacity-70">零聊天窗口噪音 · 用完即隐</span>
+        </div>
+
+        <!-- Subview A: Slim Inline Translation & Polish Bar -->
+        <div id="ai-view-trans" class="w-full max-w-lg mx-auto space-y-3 my-auto">
+          <div id="trans-bar" class="rounded-2xl p-3 space-y-2.5 ime-anim">
+            <div class="flex items-center justify-between pb-1.5" id="trans-hdr">
+              <div class="flex items-center gap-1.5">
+                <span class="px-2 py-0.5 rounded-full font-medium text-[11px]" id="trans-mode-badge">边写边译</span>
+                <button onclick="cycleLang()" id="btn-lang" class="px-2 py-0.5 rounded-full text-[11px] ime-anim"></button>
+              </div>
+              <button onclick="togglePolishMode()" id="btn-polish" class="px-2 py-0.5 rounded-full text-[11px] ime-anim">切换: 口语纠错润色</button>
+            </div>
+            <div class="space-y-1.5">
+              <div class="opacity-70 text-[11px]" id="trans-src">原文：这款输入法主打极简晶透毛玻璃体验，绝不堆砌臃肿功能。</div>
+              <div class="rounded-xl px-3 py-2 font-medium flex items-center justify-between" id="trans-dst"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Subview B: Detachable Mini AI Voice Recorder Capsule -->
+        <div id="ai-view-rec" class="hidden w-full max-w-md mx-auto my-auto">
+          <div id="rec-card" class="rounded-2xl p-3.5 space-y-2.5 ime-anim">
+            <div class="flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-rose-500 animate-ping"></span>
+                <span class="font-medium">AI 录音速记（独立微浮窗）</span>
+                <span class="font-mono opacity-75 tabular" id="rec-timer">01:28</span>
+              </div>
+              <div class="flex items-center gap-1.5">
+                <button onclick="toggleRecState()" id="btn-rec-done" class="px-2.5 py-0.5 rounded-full font-medium tap-s ime-anim">完成并提炼</button>
+              </div>
+            </div>
+
+            <!-- Live Waveform or Summarized Result -->
+            <div id="rec-body" class="rounded-xl p-2.5 space-y-1.5"></div>
+          </div>
+        </div>
+
+        <div class="text-center opacity-60">平时不占键盘空间；点击工具栏对应纯图标时原地丝滑展开</div>
+      </div>
+
+      <!-- ================= TAB 4: QUANPIN (FULL PINYIN) KEYCAP LAYOUT ================= -->
+      <div id="pane-quanpin" class="hidden h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <div class="flex items-center justify-between" id="qp-hint">
+          <div class="flex items-center gap-1.5">
+            <button onclick="setQpMode(0)" id="qp-0" class="px-2.5 py-0.5 rounded-full ime-anim">方案 A: 右上极淡上滑符号</button>
+            <button onclick="setQpMode(1)" id="qp-1" class="px-2.5 py-0.5 rounded-full ime-anim">方案 B: 纯净无副标字母</button>
+            <button onclick="setQpMode(2)" id="qp-2" class="px-2.5 py-0.5 rounded-full ime-anim">方案 C: 顶部独立数字行</button>
+          </div>
+          <span class="opacity-70">全拼无需右下角韵母，键帽更舒展</span>
+        </div>
+
+        <div id="qp-kb" class="w-full max-w-md mx-auto rounded-2xl p-2 space-y-1 ime-anim"></div>
+
+        <div class="text-center opacity-65">工具栏支持一键在「小鹤双拼（双副标）」与「全拼（上方所选样式）」间切换</div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const ICONS = {
+      pin: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1 1 1 0 0 1 1 1z"/></svg>`,
+      pinFill: `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 1 1 0 0 0 1-1V4a1 1 0 0 0-1-1H8a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1 1 1 0 0 1 1 1z"/></svg>`,
+      trash: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`,
+      x: `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
+      laptop: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"/><path d="M2 20h20"/></svg>`,
+      phone: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M12 18h.01"/></svg>`,
+      pc: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8"/><path d="M12 17v4"/></svg>`
+    };
+
+    const SAMPLE_COPIES = [
+      'export RUSTFLAGS="-C target-cpu=native"',
+      'https://github.com/iDvel/rime-ice',
+      'Koofr App Password 已更新备份',
+      '小鹤双拼韵母映射校验通过',
+      'DirectComposition 亚克力圆角参数: 12px'
+    ];
+
+    const QP_ROWS = [
+      [['Q','1'],['W','2'],['E','3'],['R','4'],['T','5'],['Y','6'],['U','7'],['I','8'],['O','9'],['P','0']],
+      [['A','@'],['S','#'],['D','¥'],['F','%'],['G','&'],['H','*'],['J','-'],['K','+'],['L','/']],
+      [['⇧',''],['Z','('],['X',')'],['C','!'],['V','?'],['B',':'],['N','"'],['M',';'],['⌫','']]
+    ];
+
+    let st = {
+      tab: 'clip',
+      dark: true,
+      copySeq: 0,
+      liveText: 'https://app.koofr.net/dav/Koofr',
+      ring: [
+        { id: 1, text: 'https://app.koofr.net/dav/Koofr', pinned: true, src: 'CachyOS' },
+        { id: 2, text: 'librime + 雾凇词库 + 万象语法模型', pinned: false, src: 'Windows 11' },
+        { id: 3, text: 'sherpa-onnx-sense-voice-int8', pinned: false, src: 'Android' }
+      ],
+      maxN: 4,
+      radarOn: true,
+      sendMsg: '就绪：点击上方任意设备体验跨端秒传与阅后即焚流程',
+      aiSub: 'trans',
+      langs: ['中 → EN (英语)', '中 → JA (日语)', '中 → DE (德语)'],
+      langIdx: 0,
+      polishMode: false,
+      recSummarized: false,
+      qpMode: 0 // 0=右上符号, 1=纯字母, 2=顶部独立数字行
+    };
+
+    function gTheme() {
+      const d = st.dark;
+      return {
+        stageBg: d ? '#0b0e15' : '#e5ebf4',
+        panelBg: d ? 'rgba(24, 29, 42, 0.70)' : 'rgba(255, 255, 255, 0.75)',
+        border: d ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.88)',
+        cardBg: d ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.86)',
+        subBg: d ? 'rgba(255,255,255,0.04)' : 'rgba(15,23,42,0.05)',
+        accent: d ? '#0ea5e9' : '#0284c7',
+        accentSoft: d ? 'rgba(14,165,233,0.18)' : 'rgba(2,132,199,0.13)',
+        accentText: d ? '#7dd3fc' : '#0369a1',
+        text: d ? '#f8fafc' : '#0f172a',
+        muted: d ? '#94a3b8' : '#64748b',
+        shadow: d ? '0 16px 36px rgba(0,0,0,0.48)' : '0 12px 28px rgba(15,23,42,0.09)'
+      };
+    }
+
+    function render() {
+      const g = gTheme();
+      const stage = document.getElementById('stage');
+      stage.style.background = g.stageBg;
+      stage.style.border = `1px solid ${g.border}`;
+      document.getElementById('btn-theme').textContent = st.dark ? '深色晶透' : '浅色冰晶';
+
+      renderClip(g);
+      renderSend(g);
+      renderAi(g);
+      renderQuanpin(g);
+    }
+
+    function renderClip(g) {
+      document.getElementById('clip-top-hint').style.color = g.muted;
+      document.getElementById('clip-toast').style.color = g.muted;
+      const bSim = document.getElementById('btn-sim-copy');
+      bSim.style.background = g.accent;
+      bSim.style.color = '#fff';
+
+      const panel = document.getElementById('clip-panel');
+      panel.style.background = g.panelBg;
+      panel.style.border = `1px solid ${g.border}`;
+      panel.style.boxShadow = g.shadow;
+      panel.style.backdropFilter = 'blur(18px)';
+      panel.style.color = g.text;
+
+      document.getElementById('clip-hdr').style.borderBottom = `1px solid ${g.border}`;
+      const capPill = document.getElementById('clip-cap-pill');
+      capPill.style.background = g.accentSoft;
+      capPill.style.color = g.accentText;
+      const pinnedCount = st.ring.filter(x => x.pinned).length;
+      capPill.textContent = `环形队列 ${st.ring.length}/${st.maxN} · 已置顶 ${pinnedCount}`;
+
+      const bClr = document.getElementById('btn-clear-unpin');
+      bClr.innerHTML = ICONS.trash;
+      bClr.style.color = g.muted;
+
+      const live = document.getElementById('live-slot-card');
+      live.style.background = g.accentSoft;
+      live.style.border = `1px solid ${g.accent}`;
+      live.innerHTML = `
+        <div class="truncate pr-2">
+          <span class="font-semibold mr-1.5" style="color:${g.accentText};">⚡ 瞬态槽</span>
+          <span class="font-mono">${st.liveText}</span>
+        </div>
+        <span class="text-[11px] shrink-0 opacity-75" style="color:${g.accentText};">下次复制即覆盖</span>
+      `;
+
+      const sorted = [...st.ring.filter(x => x.pinned), ...st.ring.filter(x => !x.pinned)];
+      document.getElementById('ring-list').innerHTML = sorted.map(item => `
+        <div onclick="pasteItem('${item.text.replace(/'/g, '')}')" class="rounded-xl px-2.5 py-1.5 flex items-center justify-between cursor-pointer ime-anim hover:opacity-95" style="background:${item.pinned ? g.cardBg : g.subBg}; border:1px solid ${item.pinned ? g.border : 'transparent'};">
+          <div class="truncate pr-2 flex items-center gap-2">
+            <span class="truncate">${item.text}</span>
+            <span class="text-[10px] px-1.5 py-0.5 rounded-full shrink-0" style="background:${g.subBg}; color:${g.muted};">${item.src}</span>
+          </div>
+          <div class="flex items-center gap-1 shrink-0" onclick="event.stopPropagation()">
+            <button onclick="togglePin(${item.id})" class="w-6 h-6 rounded-lg flex items-center justify-center tap-s" style="color:${item.pinned ? g.accent : g.muted}; background:${item.pinned ? g.accentSoft : 'transparent'};" title="${item.pinned ? '取消置顶' : '置顶保留'}">
+              ${item.pinned ? ICONS.pinFill : ICONS.pin}
+            </button>
+            <button onclick="delClip(${item.id})" class="w-6 h-6 rounded-lg flex items-center justify-center opacity-60 hover:opacity-100 tap-s" style="color:${g.muted};" title="删除">
+              ${ICONS.x}
+            </button>
+          </div>
+        </div>
+      `).join('');
+    }
+
+    function renderSend(g) {
+      document.getElementById('send-hint').style.color = g.muted;
+      document.getElementById('send-foot').style.color = g.muted;
+      const bRad = document.getElementById('btn-radar');
+      bRad.textContent = st.radarOn ? '附近发现雷达: 开启' : '附近发现雷达: 关闭';
+      bRad.style.background = st.radarOn ? g.accentSoft : g.subBg;
+      bRad.style.color = st.radarOn ? g.accentText : g.muted;
+
+      const panel = document.getElementById('send-panel');
+      panel.style.background = g.panelBg;
+      panel.style.border = `1px solid ${g.border}`;
+      panel.style.boxShadow = g.shadow;
+      panel.style.backdropFilter = 'blur(18px)';
+      panel.style.color = g.text;
+
+      const devs = [
+        { name: 'CachyOS 主力本', mode: 'LAN 局域网秒传', icon: 'laptop', lan: true },
+        { name: 'Android 手机', mode: 'LAN 局域网秒传', icon: 'phone', lan: true },
+        { name: 'Windows 11 台式', mode: 'Koofr 跨网中转', icon: 'pc', lan: false }
+      ];
+      document.getElementById('my-devs').innerHTML = devs.map(dv => `
+        <button onclick="simTransfer('${dv.name}', ${dv.lan})" class="rounded-xl p-2.5 flex flex-col items-start gap-1 tap-s ime-anim text-left" style="background:${g.cardBg}; border:1px solid ${g.border};">
+          <div class="flex items-center justify-between w-full">
+            <span style="color:${g.accentText};">${ICONS[dv.icon]}</span>
+            <span class="w-2 h-2 rounded-full" style="background:${dv.lan ? '#10b981' : '#f59e0b'};"></span>
+          </div>
+          <div class="font-medium truncate w-full">${dv.name}</div>
+          <div class="text-[10px]" style="color:${g.muted};">${dv.mode}</div>
+        </button>
+      `).join('');
+
+      const nz = document.getElementById('nearby-zone');
+      nz.style.borderTop = `1px solid ${g.border}`;
+      document.getElementById('radar-badge').textContent = st.radarOn ? '正在广播 mDNS...' : '已隐身';
+      document.getElementById('nearby-list').innerHTML = st.radarOn
+        ? `<button onclick="simTransfer('同事的 iPad (LocalSend)', true)" class="px-3 py-1.5 rounded-full flex items-center gap-1.5 tap-s ime-anim" style="background:${g.subBg}; border:1px solid ${g.border};">
+             <span class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
+             <span>同事的 iPad · 免流量直连</span>
+           </button>`
+        : `<span class="opacity-50 py-1">已关闭附近陌生设备可见性，仅响应我的关联设备</span>`;
+
+      const sbar = document.getElementById('send-status-bar');
+      sbar.style.background = g.accentSoft;
+      sbar.style.color = g.accentText;
+      sbar.innerHTML = `<span>${st.sendMsg}</span>`;
+    }
+
+    function renderAi(g) {
+      document.getElementById('ai-hint').style.color = g.muted;
+      ['trans','rec'].forEach(k => {
+        const b = document.getElementById('aisub-' + k);
+        const on = st.aiSub === k;
+        b.style.background = on ? g.accentSoft : g.subBg;
+        b.style.color = on ? g.accentText : g.muted;
+        document.getElementById('ai-view-' + k).classList.toggle('hidden', !on);
+      });
+
+      const tbar = document.getElementById('trans-bar');
+      tbar.style.background = g.panelBg;
+      tbar.style.border = `1px solid ${g.border}`;
+      tbar.style.boxShadow = g.shadow;
+      tbar.style.backdropFilter = 'blur(18px)';
+      tbar.style.color = g.text;
+
+      document.getElementById('trans-hdr').style.borderBottom = `1px solid ${g.border}`;
+      const badge = document.getElementById('trans-mode-badge');
+      badge.style.background = g.accent;
+      badge.style.color = '#fff';
+      badge.textContent = st.polishMode ? '口语整理与纠错' : '边写边译';
+
+      const bLang = document.getElementById('btn-lang');
+      bLang.style.background = g.subBg;
+      bLang.style.color = g.accentText;
+      bLang.textContent = st.polishMode ? '风格: 精炼书面语' : st.langs[st.langIdx];
+
+      const bPol = document.getElementById('btn-polish');
+      bPol.style.background = g.subBg;
+      bPol.style.color = g.muted;
+      bPol.textContent = st.polishMode ? '切换: 边写边译' : '切换: 口语纠错润色';
+
+      const dst = document.getElementById('trans-dst');
+      dst.style.background = g.cardBg;
+      dst.style.border = `1px solid ${g.border}`;
+      const outs = [
+        'Built with airy frosted-glass minimalism, completely free of feature bloat.',
+        '透明感のあるすりガラス風ミニマルデザインで、余計な機能を一切排除。',
+        'Minimalistisches Milchglas-Design, völlig frei von unnötigem Ballast.'
+      ];
+      const polishOut = '本输入法采用极简晶透毛玻璃设计，摒弃一切冗余功能。';
+      dst.innerHTML = `
+        <span class="pr-2">${st.polishMode ? polishOut : outs[st.langIdx]}</span>
+        <span class="px-2 py-0.5 rounded-full text-[11px] shrink-0" style="background:${g.accentSoft}; color:${g.accentText};">回车上屏</span>
+      `;
+
+      // Recorder mini capsule
+      const rcard = document.getElementById('rec-card');
+      rcard.style.background = g.panelBg;
+      rcard.style.border = `1px solid ${g.border}`;
+      rcard.style.boxShadow = g.shadow;
+      rcard.style.backdropFilter = 'blur(18px)';
+      rcard.style.color = g.text;
+
+      const bDone = document.getElementById('btn-rec-done');
+      bDone.style.background = g.accent;
+      bDone.style.color = '#fff';
+      bDone.textContent = st.recSummarized ? '重新演示录音' : '完成并提炼';
+
+      const rbody = document.getElementById('rec-body');
+      rbody.style.background = g.subBg;
+      if (!st.recSummarized) {
+        rbody.innerHTML = `
+          <div class="flex items-center justify-center gap-1.5 py-3">
+            ${[0,120,240,90,200,60,160,280].map(d => `<span class="w-1 h-6 rounded-full bg-sky-400 wbar" style="animation-delay:${d}ms"></span>`).join('')}
+          </div>
+          <div class="text-center opacity-75">SenseVoice 本地实时转写：「…多端互传文件在校验接收后立即销毁…」</div>
+        `;
+      } else {
+        rbody.innerHTML = `
+          <div class="font-medium" style="color:${g.accentText};">✨ AI 纪要提炼（点击一键插入光标处）：</div>
+          <div class="opacity-90">1. 锁定晶透毛玻璃材质与圆润胶囊工具栏；</div>
+          <div class="opacity-90">2. 剪贴板执行 N 条环形持久化 + 图钉置顶保护，互传文件阅后即焚。</div>
+        `;
+      }
+    }
+
+    function renderQuanpin(g) {
+      document.getElementById('qp-hint').style.color = g.muted;
+      [0,1,2].forEach(i => {
+        const b = document.getElementById('qp-' + i);
+        const on = st.qpMode === i;
+        b.style.background = on ? g.accentSoft : g.subBg;
+        b.style.color = on ? g.accentText : g.muted;
+      });
+
+      const kb = document.getElementById('qp-kb');
+      kb.style.background = g.panelBg;
+      kb.style.border = `1px solid ${g.border}`;
+      kb.style.boxShadow = g.shadow;
+      kb.style.backdropFilter = 'blur(18px)';
+
+      const numRowHtml = st.qpMode === 2
+        ? `<div class="flex gap-1">${['1','2','3','4','5','6','7','8','9','0'].map(n => `<div class="flex-1 h-7 rounded-lg flex items-center justify-center text-xs tabular" style="background:${g.subBg}; color:${g.text};">${n}</div>`).join('')}</div>`
+        : '';
+
+      const keyH = st.qpMode === 2 ? 'h-8' : 'h-9';
+      const rowsHtml = QP_ROWS.map((row, rIdx) => {
+        const pad = rIdx === 1 ? 'px-3.5' : '';
+        return `<div class="flex gap-1 ${pad}">` + row.map(([k, up]) => {
+          const isFn = k === '⇧' || k === '⌫';
+          const wCls = isFn ? 'w-10' : 'flex-1';
+          const upHtml = (!isFn && st.qpMode === 0)
+            ? `<span class="absolute top-0.5 right-1 text-[9px] opacity-60 tabular" style="color:${g.muted};">${up}</span>`
+            : '';
+          return `<div class="${wCls} ${keyH} relative rounded-xl flex items-center justify-center text-xs font-medium" style="background:${isFn ? g.subBg : g.cardBg}; color:${g.text};">
+            ${upHtml}<span>${k}</span>
+          </div>`;
+        }).join('') + `</div>`;
+      }).join('');
+
+      kb.innerHTML = numRowHtml + rowsHtml;
+    }
+
+    function setTab(t) {
+      st.tab = t;
+      ['clip','send','ai','quanpin'].forEach(k => {
+        document.getElementById('pane-' + k).classList.toggle('hidden', k !== t);
+        document.getElementById('tbtn-' + k).className = k === t
+          ? 'px-2 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+          : 'px-2 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      });
+    }
+
+    function toggleTheme() { st.dark = !st.dark; render(); }
+
+    function togglePin(id) {
+      const it = st.ring.find(x => x.id === id);
+      if (it) it.pinned = !it.pinned;
+      renderClip(gTheme());
+    }
+    function delClip(id) {
+      st.ring = st.ring.filter(x => x.id !== id);
+      renderClip(gTheme());
+    }
+    function clearUnpinned() {
+      st.ring = st.ring.filter(x => x.pinned);
+      document.getElementById('clip-toast').textContent = '已清空所有未置顶临时条目，置顶条目安全保留';
+      renderClip(gTheme());
+    }
+    function simNewCopy() {
+      const txt = SAMPLE_COPIES[st.copySeq % SAMPLE_COPIES.length];
+      st.copySeq++;
+      st.liveText = txt;
+      st.ring = st.ring.filter(x => x.text !== txt);
+      st.ring.unshift({ id: Date.now(), text: txt, pinned: false, src: '刚刚复制' });
+      while (st.ring.length > st.maxN) {
+        // Evict oldest UNPINNED item!
+        let evicted = false;
+        for (let i = st.ring.length - 1; i >= 0; i--) {
+          if (!st.ring[i].pinned) {
+            const old = st.ring.splice(i, 1)[0];
+            document.getElementById('clip-toast').textContent = `队列满 N=${st.maxN}：已自动淘汰最旧未置顶项「${old.text.slice(0, 18)}...」，置顶项完好保留`;
+            evicted = true;
+            break;
+          }
+        }
+        if (!evicted) break;
+      }
+      renderClip(gTheme());
+    }
+    function pasteItem(txt) {
+      document.getElementById('clip-toast').textContent = `已上屏粘贴：${txt}`;
+    }
+
+    function toggleRadar() { st.radarOn = !st.radarOn; renderSend(gTheme()); }
+    function simTransfer(target, isLan) {
+      if (isLan) {
+        st.sendMsg = `⚡ 正在通过局域网 P2P 直传至「${target}」(68 MB/s · 0 云盘占用)... 完成！`;
+      } else {
+        st.sendMsg = `☁ 跨网加密流式上传 Koofr ->「${target}」已校验签收 -> Koofr 临时分块已立即 DELETE 销毁！`;
+      }
+      renderSend(gTheme());
+    }
+
+    function setAiSub(s) { st.aiSub = s; renderAi(gTheme()); }
+    function cycleLang() { st.langIdx = (st.langIdx + 1) % st.langs.length; renderAi(gTheme()); }
+    function togglePolishMode() { st.polishMode = !st.polishMode; renderAi(gTheme()); }
+    function toggleRecState() { st.recSummarized = !st.recSummarized; renderAi(gTheme()); }
+    function setQpMode(m) { st.qpMode = m; renderQuanpin(gTheme()); }
+
+    render();
+  </script>
+</body>
+</html>

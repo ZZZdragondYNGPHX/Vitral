@@ -1,5 +1,5 @@
 use super::lattice::LatticeSlot;
-use super::onnx_models::HwOnnxBundle;
+use super::onnx_models::{HwOnnxBundle, RerankerLock};
 use super::Mode2Slot;
 use crate::eng::gram::{encode_char, EncodedChar, RimeGramDb};
 use crate::error::VitralError;
@@ -437,10 +437,8 @@ impl<'a> ScoreCtx<'a> {
 
         let mut w_score = 0.0f32;
         if len == 1 {
-            if let Some(list) = self.corpus.char_readings.get(&word[0]) {
-                if let Some((_, w)) = list.first() {
-                    w_score += W_CORPUS * 0.15 * ((*w as f32).max(1.0)).ln();
-                }
+            if let Some((_, w)) = self.corpus.char_readings(word[0]).next() {
+                w_score += W_CORPUS * 0.15 * ((w as f32).max(1.0)).ln();
             }
         } else {
             if let Some(w) = self.corpus.lookup_word_chars(word) {
@@ -1100,6 +1098,17 @@ pub fn decode_lattice_3tier(
     bundle: &HwOnnxBundle,
     ctx: &HwDecodeContext<'_>,
 ) -> Vec<Mode2Slot> {
+    decode_lattice(lattice, prior_locked_chars, initial_baseline_chars, bundle, ctx, RerankerLock::Wait).0
+}
+
+pub(super) fn decode_lattice(
+    lattice: &[LatticeSlot],
+    prior_locked_chars: &HashMap<(usize, usize), String>,
+    initial_baseline_chars: &[String],
+    bundle: &HwOnnxBundle,
+    ctx: &HwDecodeContext<'_>,
+    reranker_lock: RerankerLock,
+) -> (Vec<Mode2Slot>, bool) {
     let HwDecodeContext {
         imported,
         gram,
@@ -1108,7 +1117,7 @@ pub fn decode_lattice_3tier(
         offline_guard,
     } = *ctx;
     if lattice.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
 
     // Resolve locks per slot (entropy lock OR prior manual lock)
@@ -1172,7 +1181,8 @@ pub fn decode_lattice_3tier(
         .filter(|&i| !lattice[i].locked_by_entropy && !manual_flags[i])
         .collect();
 
-    if !elastic_indices.is_empty() && bundle.has_reranker_onnx() {
+    let mut rerank_pending = false;
+    if !elastic_indices.is_empty() {
         if let Some(ref tok) = bundle.tokenizer {
             let mut active_tier2_indices = elastic_indices.clone();
             if active_tier2_indices.len() > MAX_TIER2_SLOTS {
@@ -1207,9 +1217,14 @@ pub fn decode_lattice_3tier(
                 cands_per_item.push(cands);
             }
 
-            if let Some(mlm_scores) =
-                bundle.score_rbt3_masked_batch(&sequences, &mask_positions, &cands_per_item)
-            {
+            let scores = bundle.score_rbt3_with_lock(
+                &sequences,
+                &mask_positions,
+                &cands_per_item,
+                reranker_lock,
+            );
+            rerank_pending = scores.is_err();
+            if let Ok(Some(mlm_scores)) = scores {
                 for (item_idx, &slot_i) in active_tier2_indices.iter().enumerate() {
                     let row = &mlm_scores[item_idx];
                     let mut min_lp = f32::INFINITY;
@@ -1250,7 +1265,7 @@ pub fn decode_lattice_3tier(
     }
 
     // Tier 3 (Optional BYOK constrained slot disambiguation hook — receives all elastic slots)
-    if let Some(hook) = tier3 {
+    if let Some(hook) = tier3.filter(|_| !rerank_pending) {
         let network_allowed = offline_guard.map(|g| !g.is_pure_offline()).unwrap_or(true);
         if network_allowed && !elastic_indices.is_empty() {
             let req = Tier3SlotRequest {
@@ -1277,7 +1292,7 @@ pub fn decode_lattice_3tier(
     }
 
     // Materialize Mode2Slots preserving lock & retroactive flags
-    lattice
+    let slots = lattice
         .iter()
         .enumerate()
         .map(|(i, slot)| {
@@ -1307,7 +1322,8 @@ pub fn decode_lattice_3tier(
                 top8: updated_top8[i].clone(),
             }
         })
-        .collect()
+        .collect();
+    (slots, rerank_pending)
 }
 
 fn run_tier1_stack(

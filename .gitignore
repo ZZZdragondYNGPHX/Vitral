@@ -52,8 +52,3 @@ __pycache__/
 *.p12
 .env
 .env.local
-
-# Local validation suites and fixtures
-/tests/
-**/src/test/
-**/tests/

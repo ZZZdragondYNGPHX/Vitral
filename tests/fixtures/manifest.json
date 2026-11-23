@@ -1,0 +1,159 @@
+{
+  "schema_version": "1.0.0",
+  "fixtures_root": "tests/fixtures",
+  "total_files": 19,
+  "files": [
+    {
+      "path": "audio/audio_manifest.json",
+      "sha256": "a8367486ec344089d072f485291ed448631e480469103f19fd21b12603476bea",
+      "size_bytes": 3043,
+      "category": "audio",
+      "format": "json",
+      "description": "Programmatically verified audio clip metadata, transcripts, RMS/peak, and SHA-256 manifest"
+    },
+    {
+      "path": "audio/long_20s_16k.wav",
+      "sha256": "230accab1b879ac78793491106ed8d02d8cfbe5d041645fe2b2cc49cfc0e837c",
+      "size_bytes": 1143810,
+      "category": "audio",
+      "format": "wav",
+      "description": "16kHz mono 16-bit PCM continuous multi-sentence Mandarin speech clip (>20s)"
+    },
+    {
+      "path": "audio/mandarin_mixed_en_16k.wav",
+      "sha256": "936a5ad35ecd26155e765e5173028d91cb53235c359bdf0b20c609a6f0c62f4c",
+      "size_bytes": 113960,
+      "category": "audio",
+      "format": "wav",
+      "description": "16kHz mono 16-bit PCM mixed Mandarin + English ('Vitral') speech clip"
+    },
+    {
+      "path": "audio/mandarin_short_16k.wav",
+      "sha256": "b986fd61478433b8674feecea66ee24bd3679983a7b5a4b3751b5226788d6121",
+      "size_bytes": 102382,
+      "category": "audio",
+      "format": "wav",
+      "description": "16kHz mono 16-bit PCM short Mandarin speech clip"
+    },
+    {
+      "path": "audio/silence_noise_16k.wav",
+      "sha256": "2da678fcbf704cf7618058568cece2de29eaffb8e29014d670ba1b409076fcec",
+      "size_bytes": 80044,
+      "category": "audio",
+      "format": "wav",
+      "description": "16kHz mono 16-bit PCM low-amplitude deterministic pink noise clip (2.5s)"
+    },
+    {
+      "path": "handwriting/mode1_di.json",
+      "sha256": "86a5055d11f1881e32a4494df9d7d34c9ea4282c47bbbd3000d055baf7268b22",
+      "size_bytes": 4006,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 1 single-char stroke trace for 頔 (14 strokes, dí, Xiaohe di)"
+    },
+    {
+      "path": "handwriting/mode1_mao.json",
+      "sha256": "f341d2dabd1f3fe0db4f252f24234d1d2f188b3d91af4ca60826b931274eb0f7",
+      "size_bytes": 3293,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 1 single-char stroke trace for 耄 (10 strokes, mào, Xiaohe mc)"
+    },
+    {
+      "path": "handwriting/mode1_slow_reversed.json",
+      "sha256": "7bf9f564de31ecce120ee2e4f087dd6d221335c98bafdce395acb19bdfd9af26",
+      "size_bytes": 3380,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 1 slow (>5000ms) reverse-stroke-order trace for 耄 verifying no premature auto-clear"
+    },
+    {
+      "path": "handwriting/mode2_baoguang_laodeng.json",
+      "sha256": "3a507f1a50de82dda9e0729945814fd7b839f2d9e069b797a0af0597b7a10693",
+      "size_bytes": 16866,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 2 superimposed trace (曝光 -> 爆光老登金币) with ambiguous slot 0 and click-to-override spec"
+    },
+    {
+      "path": "handwriting/mode2_clear_locked.json",
+      "sha256": "7ea7969a088651f1900f63761ddea7f7c6a60a16fa5cc5cabaf6318b16f6801e",
+      "size_bytes": 16587,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 2 superimposed trace with crisp slot 0 日 locked by visual-entropy gate (non-mutation)"
+    },
+    {
+      "path": "handwriting/mode2_horizontal_connected.json",
+      "sha256": "37bb0ca015b09bf21cef4f1a91ca7ad4d73be56ff13eae9317879a5b40471712",
+      "size_bytes": 6708,
+      "category": "handwriting",
+      "format": "json",
+      "description": "Mode 2 horizontal connected trace for 手写中文 with strictly increasing centroid_x"
+    },
+    {
+      "path": "lexicons/corrupt.scel",
+      "sha256": "c8dfcccb3c5c2c6fe03ebebc6d1ae1878a6ce077b68d3474d1161f5554f25c03",
+      "size_bytes": 256,
+      "category": "lexicons",
+      "format": "scel",
+      "description": "256-byte bad-magic truncated .scel negative fixture triggering clean rejection"
+    },
+    {
+      "path": "lexicons/expected_polyphones.json",
+      "sha256": "e1e1298c67ff1078f06e0a3c9870ed8c12f13dbdf4d85c5f8f61a9f05a21f2c8",
+      "size_bytes": 4358,
+      "category": "lexicons",
+      "format": "json",
+      "description": "Deterministic ground-truth oracle mapping polyphone readings in polyphone_unannotated.txt"
+    },
+    {
+      "path": "lexicons/malformed_edge.txt",
+      "sha256": "c57a40673980740183b43604dffaed06827a1505ce0e476cea9f2cdf2d5935ad",
+      "size_bytes": 1237,
+      "category": "lexicons",
+      "format": "txt",
+      "description": "Valid UTF-8 negative fixture with blank/whitespace/comment/bad-tab/bad-weight/emoji/>256-char lines"
+    },
+    {
+      "path": "lexicons/polyphone_unannotated.txt",
+      "sha256": "b9f120e043c2dc4e60181d75e55474140d45a92442c0ca3c715aa863d00d8625",
+      "size_bytes": 169,
+      "category": "lexicons",
+      "format": "txt",
+      "description": "Pure un-annotated Chinese phrases exercising >=2 readings each for 重/行/长/乐/得/发"
+    },
+    {
+      "path": "lexicons/sample_hotwords.scel",
+      "sha256": "b9ce34933cca29a9a040a0091f950f81163ca3dabdeb24959b1e20975ca5563d",
+      "size_bytes": 10124,
+      "category": "lexicons",
+      "format": "scel",
+      "description": "Genuine Sogou .scel v1 binary lexicon with 413-entry pinyin table and 12 Vitral domain/hotword phrases"
+    },
+    {
+      "path": "lexicons/sample_pairs.tsv",
+      "sha256": "9683d731f5bfd9d82d80ef847db105d6dbf4844859cb2b832179833e567110c4",
+      "size_bytes": 323,
+      "category": "lexicons",
+      "format": "tsv",
+      "description": "3-column tab-separated lexicon (word, toneless pinyin, integer weight)"
+    },
+    {
+      "path": "lexicons/sample_terms.dict.yaml",
+      "sha256": "2a28e6223a1c783c573651a59259c75e69ff5ea1d82daad330f6733ac029fb0d",
+      "size_bytes": 623,
+      "category": "lexicons",
+      "format": "dict.yaml",
+      "description": "Rime v1.0 dictionary fixture with # comments and unsorted integer weights"
+    },
+    {
+      "path": "quanpin/corpus.json",
+      "sha256": "374db2e97081b00cda58a3d44bb75f1c2fc7a3c20fa4453ac571e3c8ca47d470",
+      "size_bytes": 24079,
+      "category": "quanpin",
+      "format": "json",
+      "description": "18-case progressive multi-length ambiguous Quanpin benchmark corpus (6 short, 6 medium, 6 long)"
+    }
+  ]
+}

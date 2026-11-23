@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-anim { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .tap-s:active { transform: scale(0.95); }
+    .tabular { font-variant-numeric: tabular-nums; }
+    @keyframes fixFlash {
+      0% { box-shadow: 0 0 0 0 rgba(56,189,248,0.75); }
+      50% { box-shadow: 0 0 16px 3px rgba(56,189,248,0.55); }
+      100% { box-shadow: 0 0 0 0 rgba(56,189,248,0); }
+    }
+    .retro-glow { animation: fixFlash 900ms ease-out; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Mode Switcher -->
+    <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="setMode('cont')" id="mbtn-cont" class="px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]">模式二: 连续书写 & 混淆网格回溯纠偏</button>
+        <button onclick="setMode('lookup')" id="mbtn-lookup" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">模式一: 会写不会拼 (注全拼+小鹤码)</button>
+      </div>
+
+      <button onclick="toggleDark()" id="btn-dark" class="px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-anim">深色晶透</button>
+    </div>
+
+    <!-- Frosted Glass Stage (Fixed 372px height, zero vertical scroll) -->
+    <div id="stage" class="rounded-xl relative overflow-hidden ime-anim" style="height:372px;">
+      <div class="pointer-events-none absolute -top-12 left-12 w-56 h-56 rounded-full" style="background:radial-gradient(circle, rgba(14,165,233,0.30) 0%, transparent 70%); filter:blur(22px);"></div>
+      <div class="pointer-events-none absolute -bottom-12 right-10 w-64 h-64 rounded-full" style="background:radial-gradient(circle, rgba(99,102,241,0.24) 0%, rgba(16,185,129,0.12) 60%, transparent 75%); filter:blur(26px);"></div>
+
+      <!-- ================= MODE 2: CONTINUOUS LATTICE RETROACTIVE DISAMBIGUATION ================= -->
+      <div id="pane-cont" class="h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <!-- Step-by-Step Interactive Walkthrough of User's Exact Example -->
+        <div class="flex flex-wrap items-center justify-between gap-1.5" id="cont-ctrl">
+          <div class="flex items-center gap-1">
+            <button onclick="setStep(1)" id="step-1" class="px-2.5 py-1 rounded-full font-medium tap-s ime-anim">① 潦草写「曝/爆」</button>
+            <button onclick="setStep(2)" id="step-2" class="px-2.5 py-1 rounded-full font-medium tap-s ime-anim">② 第2字写「光」→ 曝光</button>
+            <button onclick="setStep(3)" id="step-3" class="px-2.5 py-1 rounded-full font-medium tap-s ime-anim">③ 续写「老登金币」→ 回溯改「爆」!</button>
+          </div>
+          <span class="opacity-75" id="canvas-submode-badge">原位叠写粒子淡出 + 横排连写自适应</span>
+        </div>
+
+        <!-- Live Target Preedit Input Bar (Showing Retroactive Flip & Click-to-Override Confusion Pill) -->
+        <div id="preedit-card" class="rounded-2xl p-3 space-y-2 ime-anim">
+          <div class="flex items-center justify-between">
+            <span class="opacity-70">输入框 Composing 预编辑实时状态（点击带蓝光下划线的弹性字可手动切换备选）：</span>
+            <span id="stage-badge" class="px-2 py-0.5 rounded-full text-[11px] font-mono"></span>
+          </div>
+          <div class="flex items-center justify-between">
+            <div id="composing-line" class="flex items-center gap-1 text-base font-medium tracking-wide"></div>
+            <div id="override-pill" class="hidden flex items-center gap-1 text-xs"></div>
+          </div>
+        </div>
+
+        <!-- Bottom Split: Left = Confusion Lattice Visualizer | Right = Interactive Ink Pad -->
+        <div class="grid grid-cols-12 gap-3 flex-1 pt-2">
+          <div id="lattice-card" class="col-span-7 rounded-2xl p-3 flex flex-col justify-between ime-anim">
+            <div class="font-medium flex items-center justify-between">
+              <span>底层混淆网格 (Confusion Lattice) 与三级解码状态</span>
+              <span class="text-[11px] opacity-65 tabular">CASIA 过切分 + 远距 PMI</span>
+            </div>
+            <div id="lattice-slots" class="flex items-center gap-1.5 py-1 overflow-x-auto"></div>
+            <div id="decoder-reason" class="rounded-xl px-2.5 py-1.5 text-[11px]"></div>
+          </div>
+
+          <div id="cont-pad-card" class="col-span-5 rounded-2xl p-2.5 flex flex-col justify-between relative ime-anim">
+            <div class="flex items-center justify-between px-1 opacity-75 text-[11px]">
+              <span>晶透叠写/连写区 (可用鼠标试画笔锋)</span>
+              <button onclick="clearInk('cont-canvas')" class="underline opacity-80 hover:opacity-100">清屏</button>
+            </div>
+            <canvas id="cont-canvas" width="260" height="118" class="w-full rounded-xl cursor-crosshair"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= MODE 1: PHONETIC LOOKUP ("会写不会拼") ================= -->
+      <div id="pane-lookup" class="hidden h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <div class="flex items-center justify-between" id="lookup-hint">
+          <span>专为「知道怎么写、不知道怎么拼」设计：三端通用，每个候选字醒目标注「声调全拼 + 小鹤双拼简码」</span>
+          <div class="flex items-center gap-1">
+            <button onclick="setLookupSample(0)" id="lsmp-0" class="px-2 py-0.5 rounded-full ime-anim">示例: 耄</button>
+            <button onclick="setLookupSample(1)" id="lsmp-1" class="px-2 py-0.5 rounded-full ime-anim">示例: 頔</button>
+            <button onclick="setLookupSample(2)" id="lsmp-2" class="px-2 py-0.5 rounded-full ime-anim">示例: 龘</button>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-12 gap-3 my-auto">
+          <!-- Left: Frosted Drawing Pad (Desktop Mini Floating Pad / Mobile Canvas) -->
+          <div id="lookup-pad-card" class="col-span-5 rounded-2xl p-3 space-y-2 ime-anim">
+            <div class="flex items-center justify-between">
+              <span class="font-medium">识音单字画板（容忍倒插笔顺）</span>
+              <button onclick="clearInk('lookup-canvas')" class="text-[11px] opacity-75 hover:opacity-100">重写</button>
+            </div>
+            <canvas id="lookup-canvas" width="250" height="175" class="w-full rounded-xl cursor-crosshair"></canvas>
+            <div class="text-[11px] opacity-65 text-center">不自动抢先清屏，从容写完每一笔</div>
+          </div>
+
+          <!-- Right: Phonetic + Xiaohe Shuangpin Annotated Candidates -->
+          <div id="lookup-res-card" class="col-span-7 rounded-2xl p-3.5 flex flex-col justify-between ime-anim">
+            <div class="space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="font-semibold">识别结果与双拼识音教学卡</span>
+                <span class="px-2 py-0.5 rounded-full text-[11px]" id="lookup-charset-badge">GB18030 大字符集离线识别</span>
+              </div>
+              <div id="lookup-cands" class="grid grid-cols-2 gap-2 pt-1"></div>
+            </div>
+
+            <div id="lookup-teach-tip" class="rounded-xl px-3 py-2 flex items-center justify-between"></div>
+          </div>
+        </div>
+
+        <div class="text-center opacity-65">点击任意候选字即刻上屏，同时记住小鹤双拼编码，下次无需再手写</div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const LOOKUP_SAMPLES = [
+      {
+        strokeChar: '耄',
+        cands: [
+          { ch: '耄', py: 'mào', fly: 'mc', desc: '耄耋之年（八九十岁）' },
+          { ch: '笔', py: 'bǐ',  fly: 'bi', desc: '形近备选' },
+          { ch: '老', py: 'lǎo', fly: 'lc', desc: '部首关联字' },
+          { ch: '毛', py: 'máo', fly: 'mc', desc: '部件关联字' }
+        ]
+      },
+      {
+        strokeChar: '頔',
+        cands: [
+          { ch: '頔', py: 'dí',   fly: 'di', desc: '美好；人名常用生僻字' },
+          { ch: '顿', py: 'dùn',  fly: 'dy', desc: '形近备选' },
+          { ch: '颂', py: 'sòng', fly: 'ss', desc: '页部形近字' },
+          { ch: '颇', py: 'pō',   fly: 'po', desc: '页部形近字' }
+        ]
+      },
+      {
+        strokeChar: '龘',
+        cands: [
+          { ch: '龘', py: 'dá',   fly: 'da', desc: '群龙腾飞貌（三龙叠字）' },
+          { ch: '龖', py: 'dá',   fly: 'da', desc: '双龙并飞（二龙叠字）' },
+          { ch: '龙', py: 'lóng', fly: 'ls', desc: '基础部件字' },
+          { ch: '龚', py: 'gōng', fly: 'gs', desc: '形近备选' }
+        ]
+      }
+    ];
+
+    let st = {
+      mode: 'cont',
+      dark: true,
+      step: 3,
+      manualPickFirst: null, // user override on slot 0 ('爆' | '曝' | '瀑')
+      showOverride: false,
+      lookupIdx: 0,
+      strokes: { 'cont-canvas': [], 'lookup-canvas': [] }
+    };
+
+    function gTheme() {
+      const d = st.dark;
+      return {
+        stageBg: d ? '#0b0e15' : '#e5ebf4',
+        panelBg: d ? 'rgba(24, 29, 42, 0.72)' : 'rgba(255, 255, 255, 0.76)',
+        border: d ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.88)',
+        cardBg: d ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.88)',
+        subBg: d ? 'rgba(255,255,255,0.04)' : 'rgba(15,23,42,0.05)',
+        accent: d ? '#0ea5e9' : '#0284c7',
+        accentSoft: d ? 'rgba(14,165,233,0.20)' : 'rgba(2,132,199,0.14)',
+        accentText: d ? '#7dd3fc' : '#0369a1',
+        text: d ? '#f8fafc' : '#0f172a',
+        muted: d ? '#94a3b8' : '#64748b',
+        ink: d ? '#7dd3fc' : '#0284c7',
+        gridLine: d ? 'rgba(255,255,255,0.06)' : 'rgba(15,23,42,0.06)',
+        shadow: d ? '0 16px 36px rgba(0,0,0,0.48)' : '0 12px 28px rgba(15,23,42,0.09)'
+      };
+    }
+
+    function glass(el, g) {
+      el.style.background = g.panelBg;
+      el.style.border = `1px solid ${g.border}`;
+      el.style.boxShadow = g.shadow;
+      el.style.backdropFilter = 'blur(18px)';
+      el.style.color = g.text;
+    }
+
+    function render() {
+      const g = gTheme();
+      const stage = document.getElementById('stage');
+      stage.style.background = g.stageBg;
+      stage.style.border = `1px solid ${g.border}`;
+      document.getElementById('btn-dark').textContent = st.dark ? '深色晶透' : '浅色冰晶';
+
+      renderCont(g);
+      renderLookup(g);
+      redrawCanvas('cont-canvas');
+      redrawCanvas('lookup-canvas');
+    }
+
+    function renderCont(g) {
+      glass(document.getElementById('preedit-card'), g);
+      glass(document.getElementById('lattice-card'), g);
+      glass(document.getElementById('cont-pad-card'), g);
+
+      [1,2,3].forEach(n => {
+        const b = document.getElementById('step-' + n);
+        const on = st.step === n;
+        b.style.background = on ? g.accent : g.subBg;
+        b.style.color = on ? '#fff' : g.text;
+        b.style.border = `1px solid ${on ? g.accent : g.border}`;
+      });
+
+      const sBadge = document.getElementById('stage-badge');
+      sBadge.style.background = g.accentSoft;
+      sBadge.style.color = g.accentText;
+
+      const comp = document.getElementById('composing-line');
+      const over = document.getElementById('override-pill');
+      const slotsEl = document.getElementById('lattice-slots');
+      const reasonEl = document.getElementById('decoder-reason');
+      reasonEl.style.background = g.subBg;
+      reasonEl.style.border = `1px solid ${g.border}`;
+
+      let firstChar = st.manualPickFirst || (st.step === 3 ? '爆' : '曝');
+
+      if (st.step === 1) {
+        sBadge.textContent = 't=1 · 视觉高歧义弹性槽位已标记';
+        comp.innerHTML = `<button onclick="toggleOverride()" class="px-2 py-0.5 rounded-lg border-b-2" style="border-color:${g.accent}; background:${g.subBg};">${firstChar}<span class="text-xs opacity-65 ml-1">(待定)</span></button>`;
+        slotsEl.innerHTML = slotBox(g, '槽位 1 [弹性]', [[firstChar === '曝' ? '曝 0.47' : '爆 0.43', true], [firstChar === '曝' ? '爆 0.43' : '曝 0.47', false], ['瀑 0.05', false]]);
+        reasonEl.innerHTML = `字迹「日/火」偏旁潦草，Top-1 与 Top-2 视觉分差 Δp=0.04 &lt; 0.15：开启<b>弹性可回溯门控</b>，保留完整混淆集等待后文消歧。`;
+      } else if (st.step === 2) {
+        sBadge.textContent = 't=2 · 二元语法命中高频词「曝光」';
+        comp.innerHTML = `
+          <button onclick="toggleOverride()" class="px-2 py-0.5 rounded-lg border-b-2" style="border-color:${g.accent}; background:${g.subBg};">${firstChar}</button>
+          <span class="px-1.5 py-0.5">光</span>
+        `;
+        slotsEl.innerHTML =
+          slotBox(g, '槽位 1 [弹性]', [['曝 0.47', firstChar === '曝'], ['爆 0.43', firstChar === '爆']]) +
+          `<span class="opacity-50">→</span>` +
+          slotBox(g, '槽位 2 [确定]', [['光 0.96', true]]);
+        reasonEl.innerHTML = `第 1 级本地 N-gram 解码：<code>P("曝光") ≫ P("爆光")</code>，当前二字最优路径优先呈现为<b>「曝光」</b>，但槽位 1 的备选项「爆」仍在内存网格中保留！`;
+      } else {
+        sBadge.textContent = 't=6 · 远距共现 + 双向语义触发原位回溯改字!';
+        comp.innerHTML = `
+          <button onclick="toggleOverride()" class="px-2.5 py-0.5 rounded-lg font-semibold retro-glow" style="background:${g.accentSoft}; color:${g.accentText}; border-bottom:2px solid ${g.accent};" title="已自动由『曝』修正为『爆』，点击可手动改回">${firstChar}</button>
+          <span>光</span><span>老</span><span>登</span><span>金</span><span>币</span>
+        `;
+        slotsEl.innerHTML =
+          slotBox(g, '槽位 1 [已回溯翻盘!]', [['爆 (回溯胜出)', firstChar === '爆'], ['曝 (原暂选)', firstChar === '曝']]) +
+          `<span class="opacity-50">→</span>` +
+          slotBox(g, '槽位 2', [['光 0.96', true]]) +
+          `<span class="opacity-50">→</span>` +
+          slotBox(g, '槽位 3~4', [['老登', true]]) +
+          `<span class="opacity-50">→</span>` +
+          slotBox(g, '槽位 5~6', [['金币', true]]);
+        reasonEl.innerHTML = `<span style="color:${g.accentText}; font-weight:600;">⚡ 动态回溯生效：</span>检测到远距动宾框架<b>「爆…金币」</b>与结果补语<b>「爆光」</b>，整句路径分反超「曝光」，自动通过 Composing API 将首字原位改为<b>「${firstChar}光老登金币」</b>！`;
+      }
+
+      over.classList.toggle('hidden', !st.showOverride);
+      over.innerHTML = `<span class="opacity-70">手动锁定首字:</span>` + ['爆','曝','瀑'].map(ch =>
+        `<button onclick="pickOverride('${ch}')" class="px-2 py-0.5 rounded-full tap-s" style="background:${firstChar === ch ? g.accent : g.cardBg}; color:${firstChar === ch ? '#fff' : g.text};">${ch}</button>`
+      ).join('');
+    }
+
+    function slotBox(g, title, items) {
+      return `<div class="shrink-0 rounded-xl px-2.5 py-1.5 space-y-1" style="background:${g.subBg}; border:1px solid ${g.border};">
+        <div class="text-[10px]" style="color:${g.muted};">${title}</div>
+        ${items.map(([txt, win]) => `<div class="px-1.5 py-0.5 rounded text-[11px] font-mono" style="background:${win ? g.accentSoft : 'transparent'}; color:${win ? g.accentText : g.muted};">${win ? '✓ ' : ''}${txt}</div>`).join('')}
+      </div>`;
+    }
+
+    function renderLookup(g) {
+      document.getElementById('lookup-hint').style.color = g.muted;
+      glass(document.getElementById('lookup-pad-card'), g);
+      glass(document.getElementById('lookup-res-card'), g);
+
+      const badge = document.getElementById('lookup-charset-badge');
+      badge.style.background = g.accentSoft;
+      badge.style.color = g.accentText;
+
+      [0,1,2].forEach(i => {
+        const b = document.getElementById('lsmp-' + i);
+        const on = st.lookupIdx === i;
+        b.style.background = on ? g.accent : g.subBg;
+        b.style.color = on ? '#fff' : g.text;
+      });
+
+      const s = LOOKUP_SAMPLES[st.lookupIdx];
+      document.getElementById('lookup-cands').innerHTML = s.cands.map((c, idx) => `
+        <div class="rounded-xl p-2.5 flex items-center justify-between cursor-pointer tap-s ime-anim" style="background:${idx === 0 ? g.accentSoft : g.subBg}; border:1px solid ${idx === 0 ? g.accent : g.border};">
+          <div class="flex items-center gap-2.5">
+            <span class="text-xl font-semibold">${c.ch}</span>
+            <div>
+              <div class="font-mono font-medium text-xs" style="color:${g.accentText};">${c.py}</div>
+              <div class="text-[10px]" style="color:${g.muted};">${c.desc}</div>
+            </div>
+          </div>
+          <span class="px-2 py-0.5 rounded-full font-mono text-[11px] font-semibold" style="background:${g.cardBg}; color:${g.text};" title="小鹤双拼键位">鹤 [${c.fly}]</span>
+        </div>
+      `).join('');
+
+      const top = s.cands[0];
+      const tip = document.getElementById('lookup-teach-tip');
+      tip.style.background = g.subBg;
+      tip.style.border = `1px solid ${g.border}`;
+      tip.innerHTML = `
+        <span>💡 识音记忆：<b>「${top.ch}」</b>读作 <b>${top.py}</b>，下次在小鹤双拼直接敲 <code class="px-1.5 py-0.5 rounded font-mono" style="background:${g.accentSoft}; color:${g.accentText};">${top.fly}</code> 即可打出！</span>
+      `;
+    }
+
+    function initCanvas(id) {
+      const cvs = document.getElementById(id);
+      let drawing = false;
+      const pos = e => {
+        const r = cvs.getBoundingClientRect();
+        return [(e.clientX - r.left) * (cvs.width / r.width), (e.clientY - r.top) * (cvs.height / r.height)];
+      };
+      cvs.addEventListener('mousedown', e => {
+        drawing = true;
+        st.strokes[id].push([pos(e)]);
+        redrawCanvas(id);
+      });
+      window.addEventListener('mousemove', e => {
+        if (!drawing) return;
+        const arr = st.strokes[id];
+        arr[arr.length - 1].push(pos(e));
+        redrawCanvas(id);
+      });
+      window.addEventListener('mouseup', () => { drawing = false; });
+    }
+
+    function redrawCanvas(id) {
+      const cvs = document.getElementById(id);
+      if (!cvs) return;
+      const ctx = cvs.getContext('2d');
+      const g = gTheme();
+      ctx.clearRect(0, 0, cvs.width, cvs.height);
+
+      // Subtle Tianzige / guideline grid
+      ctx.fillStyle = g.subBg;
+      ctx.fillRect(0, 0, cvs.width, cvs.height);
+      ctx.strokeStyle = g.gridLine;
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, cvs.height / 2); ctx.lineTo(cvs.width, cvs.height / 2);
+      ctx.moveTo(cvs.width / 2, 0); ctx.lineTo(cvs.width / 2, cvs.height);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Ghost watermark sample if user hasn't drawn custom strokes yet
+      if (st.strokes[id].length === 0) {
+        ctx.fillStyle = g.muted;
+        ctx.globalAlpha = 0.24;
+        ctx.font = id === 'lookup-canvas' ? '84px sans-serif' : '32px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        const txt = id === 'lookup-canvas'
+          ? LOOKUP_SAMPLES[st.lookupIdx].strokeChar
+          : (st.step === 1 ? '曝/爆' : (st.step === 2 ? '曝光' : '爆光老登金币'));
+        ctx.fillText(txt, cvs.width / 2, cvs.height / 2);
+        ctx.globalAlpha = 1;
+      }
+
+      // User drawn luminous strokes
+      ctx.strokeStyle = g.ink;
+      ctx.lineWidth = 3.2;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      st.strokes[id].forEach(pts => {
+        if (pts.length < 2) return;
+        ctx.beginPath();
+        ctx.moveTo(pts[0][0], pts[0][1]);
+        for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+        ctx.stroke();
+      });
+    }
+
+    function clearInk(id) { st.strokes[id] = []; redrawCanvas(id); }
+
+    function setMode(m) {
+      st.mode = m;
+      document.getElementById('pane-cont').classList.toggle('hidden', m !== 'cont');
+      document.getElementById('pane-lookup').classList.toggle('hidden', m !== 'lookup');
+      document.getElementById('mbtn-cont').className = m === 'cont'
+        ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+        : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      document.getElementById('mbtn-lookup').className = m === 'lookup'
+        ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+        : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      redrawCanvas('cont-canvas');
+      redrawCanvas('lookup-canvas');
+    }
+
+    function toggleDark() { st.dark = !st.dark; render(); }
+    function setStep(n) { st.step = n; st.manualPickFirst = null; st.showOverride = (n === 3); render(); }
+    function toggleOverride() { st.showOverride = !st.showOverride; renderCont(gTheme()); }
+    function pickOverride(ch) { st.manualPickFirst = ch; renderCont(gTheme()); }
+    function setLookupSample(i) { st.lookupIdx = i; st.strokes['lookup-canvas'] = []; render(); }
+
+    initCanvas('cont-canvas');
+    initCanvas('lookup-canvas');
+    window.addEventListener('themechange', render);
+    st.showOverride = true;
+    render();
+  </script>
+</body>
+</html>

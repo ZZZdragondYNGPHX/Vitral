@@ -9,7 +9,7 @@ fn word_score(chars: &[char], corpus: &RimeDictCorpus) -> f64 {
     best[0] = 0.0;
     for i in 0..chars.len() {
         best[i + 1] = best[i + 1].max(best[i] - 21.0);
-        for j in i + 1..=(i + corpus.max_word_chars).min(chars.len()) {
+        for j in i + 1..=(i + corpus.max_word_chars()).min(chars.len()) {
             if let Some(weight) = corpus.lookup_word_chars(&chars[i..j]) {
                 let log_prob = (weight as f64 + 1.0).ln() - 21.0;
                 // Cardinal expressions form a productive class before a measure word:
@@ -87,12 +87,9 @@ pub(super) fn evaluate(
     let mut best = score + 1.5;
     let mut alternative = None;
     for start in 0..chars.len() {
-        for end in start + 3..=(start + corpus.max_word_chars).min(chars.len()) {
+        for end in start + 3..=(start + corpus.max_word_chars()).min(chars.len()) {
             let key = syllables[start..end].join(" ");
-            let Some(words) = corpus.spaced_pinyin_to_words.get(&key) else {
-                continue;
-            };
-            let Some((word, _)) = words.first() else {
+            let Some((word, _)) = corpus.spaced_pinyin_words(&key).next() else {
                 continue;
             };
             if chars[start..end].iter().copied().eq(word.chars()) {

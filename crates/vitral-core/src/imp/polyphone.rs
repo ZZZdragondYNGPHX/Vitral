@@ -1,10 +1,20 @@
+mod compact;
+
 use crate::imp::xiaohe::{normalize_syllable, syllable_to_xiaohe};
+use compact::{as_u32, CorpusWriter, Fingerprint, Section::*, CHAR_VALUE, WEIGHTED_VALUE};
 use parking_lot::Mutex;
 use pinyin::{ToPinyin, ToPinyinMulti};
+use sha2::{Digest, Sha256};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::fs;
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+
+pub use compact::RimeDictCorpus;
 
 const CORPUS_BLOOM_WORDS: usize = 131_072; // 131,072 * 8B = 1 MiB
 const CORPUS_BLOOM_BITS: u64 = (CORPUS_BLOOM_WORDS as u64) * 64;
@@ -37,326 +47,261 @@ fn corpus_bloom_hashes(k: u128) -> (u64, u64) {
     (h1, h2)
 }
 
-#[derive(Debug)]
-pub struct RimeDictCorpus {
-    pub char_readings: HashMap<char, Vec<(String, u64)>>,
-    pub word_readings: HashMap<String, (Vec<String>, u64)>,
-    pub spaced_pinyin_to_words: HashMap<String, Vec<(String, u64)>>,
-    pub max_word_chars: usize,
-    /// Bounded reading buckets keyed by one initial per syllable.
-    pub initial_readings: HashMap<String, Vec<String>>,
-    pub abbreviations: HashMap<String, Vec<(String, u64)>>,
-    pub continuations: HashMap<String, Vec<(String, u64)>>,
-    word_bloom: Vec<u64>,
-}
+const DICTIONARIES: [(&str, u64, bool); 5] = [
+    ("8105.dict.yaml", 50, true),
+    ("41448.dict.yaml", 10, false),
+    ("base.dict.yaml", 100, true),
+    ("ext.dict.yaml", 80, true),
+    ("others.dict.yaml", 25, false),
+];
 
-static CORPUS_CACHE: OnceLock<Mutex<HashMap<String, Arc<RimeDictCorpus>>>> = OnceLock::new();
+type CorpusKey = (Option<PathBuf>, Fingerprint);
+static CORPUS_CACHE: OnceLock<Mutex<HashMap<CorpusKey, Arc<RimeDictCorpus>>>> = OnceLock::new();
+
+fn source_fingerprint(dicts: Option<&Path>) -> Fingerprint {
+    let mut hash = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    if let Some(dir) = dicts {
+        for (name, _, _) in DICTIONARIES {
+            let path = dir.join(name);
+            let encoded = path.as_os_str().as_encoded_bytes();
+            hash.update((encoded.len() as u64).to_le_bytes());
+            hash.update(encoded);
+            match File::open(&path) {
+                Ok(mut file) => {
+                    let mut len = 0u64;
+                    hash.update([1]);
+                    loop {
+                        match file.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                len += n as u64;
+                                hash.update(&buf[..n]);
+                            }
+                            Err(_) => {
+                                hash.update([2]);
+                                break;
+                            }
+                        }
+                    }
+                    hash.update(len.to_le_bytes());
+                }
+                Err(_) => hash.update([0]),
+            }
+        }
+    }
+    hash.finalize().into()
+}
 
 impl RimeDictCorpus {
     pub fn load_or_fallback(assets_dir: Option<&Path>) -> Arc<Self> {
-        let key = assets_dir
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "__fallback__".to_string());
+        Self::load_or_fallback_with_cache(assets_dir, None)
+    }
 
+    pub fn load_or_fallback_with_cache(
+        assets_dir: Option<&Path>,
+        cache_dir: Option<&Path>,
+    ) -> Arc<Self> {
+        let assets = assets_dir.map(|path| path.canonicalize().unwrap_or_else(|_| path.to_owned()));
+        let dicts = assets.as_ref().map(|dir| dir.join("rime/cn_dicts"));
         let cache = CORPUS_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
         let mut guard = cache.lock();
-        if let Some(c) = guard.get(&key) {
-            return Arc::clone(c);
-        }
-        let built = Arc::new(Self::build(assets_dir));
-        guard.insert(key, Arc::clone(&built));
-        built
-    }
 
-    fn build(assets_dir: Option<&Path>) -> Self {
-        let mut char_readings: HashMap<char, Vec<(String, u64)>> = HashMap::new();
-        let mut word_readings: HashMap<String, (Vec<String>, u64)> = HashMap::new();
-        let mut spaced_pinyin_to_words: HashMap<String, Vec<(String, u64)>> = HashMap::new();
-
-        let cn_dicts = assets_dir.map(|d| d.join("rime").join("cn_dicts"));
-        let has_dicts = cn_dicts.as_ref().is_some_and(|p| p.is_dir());
-
-        if let Some(dir) = cn_dicts.filter(|_| has_dicts) {
-            Self::parse_rime_dict_file(
-                &dir.join("8105.dict.yaml"),
-                50,
-                true,
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-            Self::parse_rime_dict_file(
-                &dir.join("41448.dict.yaml"),
-                10,
-                false,
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-            Self::parse_rime_dict_file(
-                &dir.join("base.dict.yaml"),
-                100,
-                true,
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-            Self::parse_rime_dict_file(
-                &dir.join("ext.dict.yaml"),
-                80,
-                true,
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-            Self::parse_rime_dict_file(
-                &dir.join("others.dict.yaml"),
-                25,
-                false,
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-        }
-
-        // Seed minimal core fallback entries if assets/rime/cn_dicts is absent (e.g., sandboxed unit tests)
-        if word_readings.is_empty() {
-            Self::seed_core_fallback(
-                &mut char_readings,
-                &mut word_readings,
-                &mut spaced_pinyin_to_words,
-            );
-        }
-
-        for list in char_readings.values_mut() {
-            list.sort_by_key(|a| std::cmp::Reverse(a.1));
-        }
-
-        let mut max_word_chars = 1usize;
-        for w in word_readings.keys() {
-            max_word_chars = max_word_chars.max(w.chars().count());
-        }
-
-        // Sort and cap candidate lists per spaced_pinyin key for fast O(1) lattice lookup
-        for (key, list) in &mut spaced_pinyin_to_words {
-            let limit = if key.contains(' ') { 48 } else { 120 };
-            list.sort_by_key(|a| std::cmp::Reverse(a.1));
-            let mut seen = HashSet::with_capacity(list.len().min(limit));
-            list.retain(|(w, _)| seen.insert(w.clone()));
-            list.truncate(limit);
-        }
-
-        let mut initial_readings: HashMap<String, Vec<String>> = HashMap::new();
-        for reading in spaced_pinyin_to_words.keys() {
-            let syllables: Vec<_> = reading.split_whitespace().collect();
-            if !(2..=6).contains(&syllables.len()) {
-                continue;
-            }
-            let key: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
-            let bucket = initial_readings.entry(key).or_default();
-            let weight = |r: &str| spaced_pinyin_to_words[r][0].1;
-            let rank = bucket.partition_point(|r| {
-                weight(r) > weight(reading) || (weight(r) == weight(reading) && r < reading)
-            });
-            if rank < 128 {
-                bucket.insert(rank, reading.clone());
-                bucket.truncate(128);
-            }
-        }
-        for bucket in initial_readings.values_mut() {
-            bucket.shrink_to_fit();
-        }
-        initial_readings.shrink_to_fit();
-
-        // Bound every initials bucket while building it; never collect the entire corpus twice.
-        let mut abbreviations: HashMap<String, Vec<(String, u64)>> = HashMap::new();
-        for (word, (syllables, weight)) in &word_readings {
-            if !(2..=6).contains(&syllables.len()) || word.chars().count() != syllables.len() {
-                continue;
-            }
-            let key: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
-            let bucket = abbreviations.entry(key).or_default();
-            bucket.push((word.clone(), *weight));
-            bucket.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            bucket.truncate(16);
-        }
-        abbreviations.shrink_to_fit();
-        // Single-character contexts need more coverage than longer, more specific prefixes.
-        let mut continuations: HashMap<String, Vec<(String, u64)>> = HashMap::new();
-        for (word, (_, weight)) in &word_readings {
-            if !(2..=6).contains(&word.chars().count()) {
-                continue;
-            }
-            for (prefix_len, (offset, _)) in word.char_indices().skip(1).take(3).enumerate() {
-                let limit = if prefix_len == 0 { 24 } else { 10 };
-                let bucket = continuations.entry(word[..offset].to_string()).or_default();
-                let suffix = &word[offset..];
-                let rank = bucket.partition_point(|(text, w)| {
-                    *w > *weight || (*w == *weight && text.as_str() < suffix)
+        loop {
+            let fingerprint = source_fingerprint(dicts.as_deref());
+            let key = (assets.clone(), fingerprint);
+            let cache_path = cache_dir
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .zip(dicts.as_ref().filter(|dir| dir.is_dir()))
+                .map(|(dir, dicts)| {
+                    let path_hash = Sha256::digest(dicts.as_os_str().as_encoded_bytes());
+                    dir.join(format!("rime-corpus-{path_hash:x}.bin"))
                 });
-                if rank < limit {
-                    bucket.insert(rank, (suffix.to_string(), *weight));
-                    bucket.truncate(limit);
-                }
-            }
-        }
-        for bucket in continuations.values_mut() {
-            bucket.shrink_to_fit();
-        }
-        continuations.shrink_to_fit();
-        char_readings.shrink_to_fit();
-        word_readings.shrink_to_fit();
-        spaced_pinyin_to_words.shrink_to_fit();
-
-        let mut word_bloom = vec![0u64; CORPUS_BLOOM_WORDS];
-        let mut tmp_chars = ['\0'; 5];
-        for w in word_readings.keys() {
-            let mut cnt = 0usize;
-            let mut fit = true;
-            for ch in w.chars() {
-                if cnt >= 5 {
-                    fit = false;
-                    break;
-                }
-                tmp_chars[cnt] = ch;
-                cnt += 1;
-            }
-            if fit && cnt >= 1 {
-                if let Some(k) = pack_word_u128(&tmp_chars[..cnt]) {
-                    let (h1, h2) = corpus_bloom_hashes(k);
-                    for probe in 0..4u64 {
-                        let bit = h1.wrapping_add(probe.wrapping_mul(h2)) & (CORPUS_BLOOM_BITS - 1);
-                        word_bloom[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+            if let Some(corpus) = guard.get(&key) {
+                if let Some(path) = &cache_path {
+                    if !File::open(path)
+                        .is_ok_and(|mut file| Self::file_matches_source(&mut file, &fingerprint))
+                    {
+                        let _ = corpus.write_atomic(path);
                     }
                 }
+                return Arc::clone(corpus);
             }
-        }
-
-        Self {
-            char_readings,
-            word_readings,
-            spaced_pinyin_to_words,
-            max_word_chars: max_word_chars.min(12),
-            initial_readings,
-            abbreviations,
-            continuations,
-            word_bloom,
-        }
-    }
-
-    #[inline]
-    pub fn may_contain_chars(&self, chars: &[char]) -> bool {
-        if chars.is_empty() {
-            return false;
-        }
-        let Some(k) = pack_word_u128(chars) else {
-            return true;
-        };
-        let (h1, h2) = corpus_bloom_hashes(k);
-        for probe in 0..4u64 {
-            let bit = h1.wrapping_add(probe.wrapping_mul(h2)) & (CORPUS_BLOOM_BITS - 1);
-            if (self.word_bloom[(bit >> 6) as usize] & (1u64 << (bit & 63))) == 0 {
-                return false;
-            }
-        }
-        true
-    }
-
-    #[inline]
-    pub fn lookup_word_chars(&self, chars: &[char]) -> Option<u64> {
-        if !self.may_contain_chars(chars) {
-            return None;
-        }
-        if chars.len() <= 8 {
-            let mut buf = [0u8; 32];
-            let mut pos = 0usize;
-            for &c in chars {
-                let s = c.encode_utf8(&mut buf[pos..]);
-                pos += s.len();
-            }
-            // SAFETY: `encode_utf8` writes valid UTF-8 into `buf[..pos]`.
-            let s = unsafe { std::str::from_utf8_unchecked(&buf[..pos]) };
-            self.word_readings.get(s).map(|&(_, w)| w)
-        } else {
-            let s: String = chars.iter().collect();
-            self.word_readings.get(&s).map(|&(_, w)| w)
-        }
-    }
-
-    #[inline]
-    pub fn lookup_joined_str(&self, w1: &str, w2: &str) -> Option<u64> {
-        let total_bytes = w1.len() + w2.len();
-        if total_bytes == 0 {
-            return None;
-        }
-        if total_bytes <= 64 {
-            let mut buf = [0u8; 64];
-            buf[..w1.len()].copy_from_slice(w1.as_bytes());
-            buf[w1.len()..total_bytes].copy_from_slice(w2.as_bytes());
-            // SAFETY: `w1` and `w2` are valid UTF-8 slices concatenated sequentially.
-            let s = unsafe { std::str::from_utf8_unchecked(&buf[..total_bytes]) };
-            let mut chs = ['\0'; 6];
-            let mut n = 0usize;
-            for ch in s.chars() {
-                if n >= 6 {
-                    break;
+            // Keep active readers alive through their Arcs while dropping the stale cache entry.
+            guard.retain(|(dir, _), _| dir != &assets);
+            let mapped = cache_path
+                .as_ref()
+                .and_then(|path| Self::open(path, &fingerprint));
+            let (corpus, complete, needs_write) = match mapped {
+                Some(corpus) => (corpus, true, false),
+                None => {
+                    let (builder, complete) =
+                        CorpusBuilder::load(dicts.as_deref().filter(|dir| dir.is_dir()));
+                    (builder.finish(&fingerprint), complete, true)
                 }
-                chs[n] = ch;
-                n += 1;
+            };
+            if source_fingerprint(dicts.as_deref()) != fingerprint {
+                continue;
             }
-            if n <= 5 && !self.may_contain_chars(&chs[..n]) {
-                return None;
+            let corpus = Arc::new(corpus);
+            if complete {
+                if let Some(path) = cache_path.filter(|_| needs_write) {
+                    let _ = corpus.write_atomic(&path);
+                }
+                guard.insert(key, Arc::clone(&corpus));
             }
-            self.word_readings.get(s).map(|&(_, w)| w)
-        } else {
-            let mut s = String::with_capacity(total_bytes);
-            s.push_str(w1);
-            s.push_str(w2);
-            self.word_readings.get(&s).map(|&(_, w)| w)
+            return corpus;
+        }
+    }
+}
+
+type WordId = u32;
+type SyllableId = u16;
+type Weighted<T> = (T, u64);
+
+struct WordReading {
+    start: usize,
+    len: usize,
+    weight: u64,
+}
+
+#[derive(Default)]
+struct CorpusBuilder {
+    syllable_ids: HashMap<Box<str>, SyllableId>,
+    syllables: Vec<Box<str>>,
+    char_readings: HashMap<char, Vec<Weighted<SyllableId>>>,
+    word_ids: HashMap<Box<str>, WordId>,
+    words: Vec<WordReading>,
+    word_syllables: Vec<SyllableId>,
+    homophones: HashMap<Box<str>, Vec<Weighted<WordId>>>,
+}
+
+impl CorpusBuilder {
+    fn load(dicts: Option<&Path>) -> (Self, bool) {
+        let mut excluded = [false; DICTIONARIES.len()];
+        loop {
+            let mut builder = Self::default();
+            if let Some(dir) = dicts {
+                let failure =
+                    DICTIONARIES
+                        .iter()
+                        .enumerate()
+                        .find(|&(index, &(name, weight, overrides))| {
+                            !excluded[index]
+                                && builder
+                                    .parse_file(&dir.join(name), weight, overrides)
+                                    .is_err()
+                        });
+                if let Some((index, _)) = failure {
+                    // Discard a partially read dictionary just as an invalid UTF-8 file is skipped.
+                    excluded[index] = true;
+                    continue;
+                }
+            }
+            if builder.words.is_empty() {
+                builder.seed_core_fallback();
+            }
+            return (builder, !excluded.contains(&true));
         }
     }
 
-    fn parse_rime_dict_file(
-        path: &Path,
-        default_weight: u64,
-        allow_override: bool,
-        char_readings: &mut HashMap<char, Vec<(String, u64)>>,
-        word_readings: &mut HashMap<String, (Vec<String>, u64)>,
-        spaced_pinyin_to_words: &mut HashMap<String, Vec<(String, u64)>>,
-    ) {
-        let Ok(content) = fs::read_to_string(path) else {
-            return;
-        };
-        let mut in_body = false;
+    fn syllable_id(&mut self, raw: &str) -> io::Result<Option<SyllableId>> {
+        if let Some(&id) = self.syllable_ids.get(raw) {
+            return Ok(Some(id));
+        }
+        let normalized = normalize_syllable(raw);
+        if normalized.is_empty() {
+            return Ok(None);
+        }
+        if let Some(&id) = self.syllable_ids.get(normalized.as_str()) {
+            return Ok(Some(id));
+        }
+        let id = SyllableId::try_from(self.syllables.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "too many Rime syllables"))?;
+        let normalized = normalized.into_boxed_str();
+        self.syllables.push(normalized.clone());
+        self.syllable_ids.insert(normalized, id);
+        Ok(Some(id))
+    }
 
-        for line in content.lines() {
+    fn add_character(&mut self, ch: char, syllable: SyllableId, weight: u64, overrides: bool) {
+        let list = self.char_readings.entry(ch).or_default();
+        if let Some((_, current)) = list.iter_mut().find(|(id, _)| *id == syllable) {
+            if overrides {
+                *current = (*current).max(weight);
+            }
+        } else {
+            list.push((syllable, weight));
+        }
+    }
+
+    fn add_word(&mut self, word: &str, syllables: &[SyllableId], weight: u64) -> WordId {
+        if let Some(&id) = self.word_ids.get(word) {
+            let entry = &mut self.words[id as usize];
+            if weight > entry.weight {
+                self.word_syllables[entry.start..entry.start + entry.len]
+                    .copy_from_slice(syllables);
+                entry.weight = weight;
+            }
+            return id;
+        }
+        let id = as_u32(self.words.len());
+        self.word_ids.insert(word.into(), id);
+        self.words.push(WordReading {
+            start: self.word_syllables.len(),
+            len: syllables.len(),
+            weight,
+        });
+        self.word_syllables.extend_from_slice(syllables);
+        id
+    }
+
+    fn add_homophone(&mut self, reading: &str, word: WordId, weight: u64) {
+        if let Some(list) = self.homophones.get_mut(reading) {
+            list.push((word, weight));
+        } else {
+            self.homophones.insert(reading.into(), vec![(word, weight)]);
+        }
+    }
+
+    fn parse_file(&mut self, path: &Path, default_weight: u64, overrides: bool) -> io::Result<()> {
+        let file = match File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let mut reader = BufReader::new(file);
+        let mut in_body = false;
+        let mut line = String::new();
+        let mut syllables = Vec::new();
+        let mut spaced = String::new();
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
             let trimmed = line.trim();
             if !in_body {
-                if trimmed == "..." {
-                    in_body = true;
-                }
+                in_body = trimmed == "...";
                 continue;
             }
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             let mut cols = line.split('\t');
-            let Some(text_raw) = cols.next() else {
+            let text = cols.next().unwrap().trim();
+            let Some(code) = cols.next().filter(|_| !text.is_empty()) else {
                 continue;
             };
-            let text = text_raw.trim();
-            if text.is_empty() {
-                continue;
+            syllables.clear();
+            for raw in code.split_whitespace() {
+                if let Some(id) = self.syllable_id(raw)? {
+                    syllables.push(id);
+                }
             }
-            let Some(code_raw) = cols.next() else {
-                continue;
-            };
-            let syllables: Vec<String> = code_raw
-                .split_whitespace()
-                .map(normalize_syllable)
-                .filter(|s| !s.is_empty())
-                .collect();
-            if syllables.is_empty() {
+            let char_count = text.chars().count();
+            if syllables.len() != char_count {
                 continue;
             }
             let weight = cols
@@ -364,47 +309,194 @@ impl RimeDictCorpus {
                 .and_then(|w| w.trim().parse::<u64>().ok())
                 .unwrap_or(default_weight)
                 .max(1);
-
-            let char_cnt = text.chars().count();
-            if char_cnt == 1 && syllables.len() == 1 {
-                let ch = text.chars().next().unwrap();
-                let list = char_readings.entry(ch).or_default();
-                if let Some(existing) = list.iter_mut().find(|(s, _)| s == &syllables[0]) {
-                    if allow_override && weight > existing.1 {
-                        existing.1 = weight;
-                    }
-                } else {
-                    list.push((syllables[0].clone(), weight));
+            if char_count == 1 {
+                self.add_character(
+                    text.chars().next().unwrap(),
+                    syllables[0],
+                    weight,
+                    overrides,
+                );
+            }
+            spaced.clear();
+            for &id in &syllables {
+                if !spaced.is_empty() {
+                    spaced.push(' ');
                 }
+                spaced.push_str(&self.syllables[usize::from(id)]);
+            }
+            let word = self.add_word(text, &syllables, weight);
+            self.add_homophone(&spaced, word, weight);
+        }
+        Ok(())
+    }
+
+    fn finish(self, fingerprint: &Fingerprint) -> RimeDictCorpus {
+        let (writer, max_word_chars) = self.into_writer();
+        writer.finish(fingerprint, max_word_chars)
+    }
+
+    fn into_writer(mut self) -> (CorpusWriter, usize) {
+        let mut writer = CorpusWriter::new();
+        for syllable in &self.syllables {
+            let id = writer.string(syllable);
+            writer
+                .section(Syllables)
+                .extend_from_slice(&id.to_le_bytes());
+        }
+        let mut characters: Vec<_> = self.char_readings.into_iter().collect();
+        characters.sort_unstable_by_key(|(ch, _)| *ch);
+        for (ch, mut readings) in characters {
+            readings.sort_by_key(|&(_, weight)| Reverse(weight));
+            let start = writer.section(CharValues).len() / CHAR_VALUE;
+            writer.row(Chars, ch as u32, start, readings.len());
+            for (id, weight) in readings {
+                let values = writer.section(CharValues);
+                values.extend_from_slice(&id.to_le_bytes());
+                values.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+
+        let mut words: Vec<_> = self
+            .word_ids
+            .iter()
+            .map(|(text, &id)| (text.as_ref(), id))
+            .collect();
+        words.sort_unstable_by_key(|&(word, _)| word);
+        let mut word_strings = vec![0; words.len()];
+        let mut bloom = vec![0u64; CORPUS_BLOOM_WORDS];
+        let mut max_word_chars = 1;
+        let mut abbreviations: HashMap<_, Vec<(WordId, &str, u64)>> = HashMap::new();
+        let mut continuations: HashMap<&str, Vec<(&str, u64)>> = HashMap::new();
+        for (word, id) in words {
+            let entry = &self.words[id as usize];
+            let syllables = &self.word_syllables[entry.start..entry.start + entry.len];
+            let str_id = writer.string(word);
+            word_strings[id as usize] = str_id;
+            if syllables.is_empty() {
+                continue;
+            }
+            let start = writer.section(WordSyllables).len() / 2;
+            writer.row(Words, str_id, start, entry.len);
+            writer
+                .section(Words)
+                .extend_from_slice(&entry.weight.to_le_bytes());
+            for syllable in syllables {
+                writer
+                    .section(WordSyllables)
+                    .extend_from_slice(&syllable.to_le_bytes());
             }
 
-            if syllables.len() == char_cnt {
-                let spaced = syllables.join(" ");
-                spaced_pinyin_to_words
-                    .entry(spaced)
-                    .or_default()
-                    .push((text.to_string(), weight));
-
-                match word_readings.get_mut(text) {
-                    Some((prev_syls, prev_w)) => {
-                        if weight > *prev_w {
-                            *prev_syls = syllables;
-                            *prev_w = weight;
-                        }
-                    }
-                    None => {
-                        word_readings.insert(text.to_string(), (syllables, weight));
-                    }
+            max_word_chars = max_word_chars.max(entry.len);
+            if entry.len <= 5 {
+                let mut chars = ['\0'; 5];
+                for (target, ch) in chars.iter_mut().zip(word.chars()) {
+                    *target = ch;
+                }
+                let key = pack_word_u128(&chars[..entry.len]).unwrap();
+                let (h1, h2) = corpus_bloom_hashes(key);
+                for probe in 0..4u64 {
+                    let bit = h1.wrapping_add(probe.wrapping_mul(h2)) & (CORPUS_BLOOM_BITS - 1);
+                    bloom[(bit >> 6) as usize] |= 1u64 << (bit & 63);
+                }
+            }
+            if (2..=6).contains(&entry.len) {
+                let initials = initials(
+                    syllables
+                        .iter()
+                        .map(|&id| self.syllables[usize::from(id)].as_ref()),
+                )
+                .unwrap();
+                insert_ranked(
+                    abbreviations.entry(initials).or_default(),
+                    16,
+                    (id, word, entry.weight),
+                    |&(_, text, weight)| (Reverse(weight), text),
+                );
+                for (i, (offset, _)) in word.char_indices().skip(1).take(3).enumerate() {
+                    let (prefix, suffix) = word.split_at(offset);
+                    // Both slices borrow the existing word, including on a new bucket.
+                    let bucket = continuations.entry(prefix).or_default();
+                    insert_ranked(
+                        bucket,
+                        if i == 0 { 24 } else { 10 },
+                        (suffix, entry.weight),
+                        |&(text, weight)| (Reverse(weight), text),
+                    );
                 }
             }
         }
+        for word in bloom {
+            writer.section(Bloom).extend_from_slice(&word.to_le_bytes());
+        }
+
+        let mut homophones: Vec<_> = self.homophones.iter_mut().collect();
+        homophones.sort_unstable_by_key(|&(reading, _)| reading.as_ref());
+        let mut initial_readings: HashMap<_, Vec<(u32, &str, u64)>> = HashMap::new();
+        let mut seen = HashSet::with_capacity(120);
+        for (reading, words) in homophones {
+            let limit = if reading.contains(' ') { 48 } else { 120 };
+            words.sort_by_key(|&(_, weight)| Reverse(weight));
+            seen.clear();
+            words.retain(|&(word, _)| seen.len() < limit && seen.insert(word));
+            let key = writer.string(reading);
+            let start = writer.section(ReadingValues).len() / WEIGHTED_VALUE;
+            writer.row(Readings, key, start, words.len());
+            for &(word, weight) in words.iter() {
+                writer.weighted(ReadingValues, word_strings[word as usize], weight);
+            }
+            if let Some(initials) = initials(reading.split(' ')) {
+                let entry = (key, reading.as_ref(), words[0].1);
+                insert_ranked(
+                    initial_readings.entry(initials).or_default(),
+                    128,
+                    entry,
+                    |&(_, text, weight)| (Reverse(weight), text),
+                );
+            }
+        }
+
+        let mut initial_readings: Vec<_> = initial_readings.into_iter().collect();
+        initial_readings.sort_unstable_by_key(|(key, _)| *key);
+        for (initials, readings) in initial_readings {
+            let key = writer.string(initials_text(&initials));
+            let start = writer.section(InitialValues).len() / 4;
+            writer.row(Initials, key, start, readings.len());
+            for (reading, _, _) in readings {
+                writer
+                    .section(InitialValues)
+                    .extend_from_slice(&reading.to_le_bytes());
+            }
+        }
+
+        let mut abbreviations: Vec<_> = abbreviations.into_iter().collect();
+        abbreviations.sort_unstable_by_key(|(key, _)| *key);
+        for (initials, words) in abbreviations {
+            let key = writer.string(initials_text(&initials));
+            let start = writer.section(AbbreviationValues).len() / WEIGHTED_VALUE;
+            writer.row(Abbreviations, key, start, words.len());
+            for (word, _, weight) in words {
+                writer.weighted(AbbreviationValues, word_strings[word as usize], weight);
+            }
+        }
+
+        let mut continuations: Vec<_> = continuations.into_iter().collect();
+        continuations.sort_unstable_by_key(|&(prefix, _)| prefix);
+        for (prefix, suffixes) in continuations {
+            let key = writer.string(prefix);
+            let start = writer.section(ContinuationValues).len() / WEIGHTED_VALUE;
+            writer.row(Continuations, key, start, suffixes.len());
+            for (suffix, weight) in suffixes {
+                let id = self.word_ids.get(suffix).map_or_else(
+                    || writer.string(suffix),
+                    |&word| word_strings[word as usize],
+                );
+                writer.weighted(ContinuationValues, id, weight);
+            }
+        }
+        (writer, max_word_chars.min(12))
     }
 
-    fn seed_core_fallback(
-        char_readings: &mut HashMap<char, Vec<(String, u64)>>,
-        word_readings: &mut HashMap<String, (Vec<String>, u64)>,
-        spaced_pinyin_to_words: &mut HashMap<String, Vec<(String, u64)>>,
-    ) {
+    fn seed_core_fallback(&mut self) {
         const FALLBACK_CHARS: &[(&str, &str, u64)] = &[
             ("你", "ni", 10_000_000),
             ("好", "hao", 10_000_000),
@@ -453,14 +545,19 @@ impl RimeDictCorpus {
         ];
         for &(ch_s, syl, w) in FALLBACK_CHARS {
             let ch = ch_s.chars().next().unwrap();
-            char_readings
-                .entry(ch)
-                .or_default()
-                .push((syl.to_string(), w));
-            spaced_pinyin_to_words
-                .entry(syl.to_string())
-                .or_default()
-                .push((ch_s.to_string(), w));
+            let syllable = self.syllable_id(syl).unwrap().unwrap();
+            self.add_character(ch, syllable, w, false);
+            // Fallback characters are homophones but are absent from word lookup.
+            let id = *self.word_ids.entry(ch_s.into()).or_insert_with(|| {
+                let id = as_u32(self.words.len());
+                self.words.push(WordReading {
+                    start: 0,
+                    len: 0,
+                    weight: 0,
+                });
+                id
+            });
+            self.add_homophone(syl, id, w);
         }
         const FALLBACK_WORDS: &[(&str, &str, u64)] = &[
             ("你好", "ni hao", 1_000_000),
@@ -530,13 +627,36 @@ impl RimeDictCorpus {
             ("金币", "jin bi", 501_098),
         ];
         for &(w, py, freq) in FALLBACK_WORDS {
-            let syls: Vec<String> = py.split_whitespace().map(str::to_string).collect();
-            word_readings.insert(w.to_string(), (syls, freq));
-            spaced_pinyin_to_words
-                .entry(py.to_string())
-                .or_default()
-                .push((w.to_string(), freq));
+            let syllables: Vec<_> = py
+                .split_whitespace()
+                .map(|s| self.syllable_id(s).unwrap().unwrap())
+                .collect();
+            let word = self.add_word(w, &syllables, freq);
+            self.add_homophone(py, word, freq);
         }
+    }
+}
+
+fn initials(syllables: impl Iterator<Item = impl AsRef<str>>) -> Option<[u8; 6]> {
+    let mut key = [0; 6];
+    let mut len = 0;
+    for syllable in syllables {
+        *key.get_mut(len)? = syllable.as_ref().as_bytes()[0];
+        len += 1;
+    }
+    (len >= 2).then_some(key)
+}
+
+fn initials_text(key: &[u8; 6]) -> &str {
+    std::str::from_utf8(key).unwrap().trim_end_matches('\0')
+}
+
+fn insert_ranked<T, K: Ord>(bucket: &mut Vec<T>, limit: usize, value: T, key: impl Fn(&T) -> K) {
+    let value_key = key(&value);
+    let rank = bucket.partition_point(|entry| key(entry) < value_key);
+    if rank < limit {
+        bucket.insert(rank, value);
+        bucket.truncate(limit);
     }
 }
 
@@ -950,21 +1070,19 @@ impl PolyphoneAnnotator {
         let mut results: Vec<(String, String)> = Vec::new();
         let mut seen_toned: HashSet<String> = HashSet::new();
 
-        if let Some(dict_list) = self.corpus.char_readings.get(&ch) {
-            for (untoned, _) in dict_list {
-                // Find matching toned variant from `pinyin` crate
-                let mut matched = false;
-                for toned in &toned_candidates {
-                    if normalize_syllable(toned) == *untoned && seen_toned.insert(toned.clone()) {
-                        let xh = syllable_to_xiaohe(toned);
-                        results.push((toned.clone(), xh));
-                        matched = true;
-                    }
+        for (untoned, _) in self.corpus.char_readings(ch) {
+            // Find matching toned variant from `pinyin` crate
+            let mut matched = false;
+            for toned in &toned_candidates {
+                if normalize_syllable(toned) == untoned && seen_toned.insert(toned.clone()) {
+                    let xh = syllable_to_xiaohe(toned);
+                    results.push((toned.clone(), xh));
+                    matched = true;
                 }
-                if !matched && toned_candidates.is_empty() && seen_toned.insert(untoned.clone()) {
-                    let xh = syllable_to_xiaohe(untoned);
-                    results.push((untoned.clone(), xh));
-                }
+            }
+            if !matched && toned_candidates.is_empty() && seen_toned.insert(untoned.to_owned()) {
+                let xh = syllable_to_xiaohe(untoned);
+                results.push((untoned.to_owned(), xh));
             }
         }
 
@@ -995,7 +1113,7 @@ impl PolyphoneAnnotator {
         let mut dp_prev: Vec<Option<(usize, Vec<String>)>> = vec![None; n + 1];
         dp_score[0] = 0.0;
 
-        let max_len = self.corpus.max_word_chars.min(n).max(4.min(n));
+        let max_len = self.corpus.max_word_chars().min(n).max(4.min(n));
         let overrides = toned_word_overrides();
 
         for i in 0..n {
@@ -1014,9 +1132,7 @@ impl PolyphoneAnnotator {
                             toned_slice.iter().map(|s| normalize_syllable(s)).collect();
                         let corpus_w = self
                             .corpus
-                            .word_readings
-                            .get(&span)
-                            .map(|(_, w)| *w)
+                            .word_weight(&span)
                             .unwrap_or(200_000)
                             .max(200_000);
                         let edge_score = ((corpus_w as f64) + 1.0).ln()
@@ -1030,14 +1146,14 @@ impl PolyphoneAnnotator {
                         continue;
                     }
                 }
-                if let Some((syls, weight)) = self.corpus.word_readings.get(&span) {
-                    let edge_score = ((*weight as f64) + 1.0).ln()
+                if let Some((syls, weight)) = self.corpus.word_reading(&span) {
+                    let edge_score = ((weight as f64) + 1.0).ln()
                         + (len as f64) * 14.0
                         + ((len - 1) as f64) * 4.0;
                     let cand = dp_score[i] + edge_score;
                     if cand > dp_score[i + len] {
                         dp_score[i + len] = cand;
-                        dp_prev[i + len] = Some((i, syls.clone()));
+                        dp_prev[i + len] = Some((i, syls.map(str::to_owned).collect()));
                     }
                 }
             }
@@ -1047,9 +1163,9 @@ impl PolyphoneAnnotator {
             let syl = self.single_char_untoned_with_context(&chars, i);
             let char_w = self
                 .corpus
-                .char_readings
-                .get(&ch)
-                .and_then(|v| v.first().map(|x| x.1))
+                .char_readings(ch)
+                .next()
+                .map(|(_, weight)| weight)
                 .unwrap_or(100);
             let single_score = ((char_w as f64) + 1.0).ln() * 0.75;
             let cand = dp_score[i] + single_score;
@@ -1177,10 +1293,9 @@ impl PolyphoneAnnotator {
 
         if let Some(first) = self
             .corpus
-            .char_readings
-            .get(&ch)
-            .and_then(|v| v.first())
-            .map(|x| x.0.clone())
+            .char_readings(ch)
+            .next()
+            .map(|(syllable, _)| syllable.to_owned())
         {
             return first;
         }
@@ -1340,8 +1455,209 @@ impl PolyphoneAnnotator {
 }
 
 #[cfg(test)]
-mod continuation_tests {
+mod corpus_tests {
     use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        assets: PathBuf,
+        dicts: PathBuf,
+        cache: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("vitral-corpus-{name}-{}", std::process::id()));
+            let assets = root.join("assets");
+            let dicts = assets.join("rime/cn_dicts");
+            let cache = root.join("data");
+            fs::create_dir_all(&dicts).unwrap();
+            Self {
+                root,
+                assets,
+                dicts,
+                cache,
+            }
+        }
+
+        fn dict(&self, name: &str, body: &str) {
+            fs::write(
+                self.dicts.join(name),
+                format!("---\nname: test\n...\n{body}"),
+            )
+            .unwrap();
+        }
+
+        fn load(&self) -> Arc<RimeDictCorpus> {
+            RimeDictCorpus::load_or_fallback_with_cache(Some(&self.assets), Some(&self.cache))
+        }
+
+        fn forget_corpus(&self) {
+            let assets = self.assets.canonicalize().unwrap();
+            CORPUS_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .retain(|(path, _), _| path.as_ref() != Some(&assets));
+        }
+
+        fn cache_file(&self) -> PathBuf {
+            let entries: Vec<_> = self
+                .cache
+                .read_dir()
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .collect();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].extension().unwrap(), "bin");
+            entries.into_iter().next().unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if CORPUS_CACHE.get().is_some() {
+                self.forget_corpus();
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn owned_and_mapped_corpora_preserve_readings_weights_and_order() {
+        let f = Fixture::new("roundtrip");
+        f.dict("8105.dict.yaml", "行\txing\t91\n行\thang\t91\n");
+        f.dict("41448.dict.yaml", "行\txing\t999\n");
+        let long = "𠀀".repeat(17);
+        f.dict("base.dict.yaml", &format!(
+            "重庆\tzhòng qìng\t30\n重庆\tchong qing\t40\n重请\tchong qing\t40\n重庆\tchong qing\t15\n崇敬\tchong jing\t50\n沉静\tchen jing\t50\n重庆市\tchong qing shi\t60\n女儿\tnǚ ér\t5\n{long}\t{}\t200\n",
+            ["he"; 17].join(" "),
+        ));
+        let owned = RimeDictCorpus::load_or_fallback(Some(&f.assets));
+        assert!(!owned.is_mapped());
+        assert!(Arc::ptr_eq(&f.load(), &owned));
+        f.forget_corpus();
+        let mapped = f.load();
+        assert!(mapped.is_mapped());
+
+        for corpus in [owned, mapped] {
+            assert_eq!(corpus.max_word_chars(), 12);
+            assert_eq!(
+                corpus.char_readings('行').collect::<Vec<_>>(),
+                [("xing", 91), ("hang", 91)]
+            );
+            let (syllables, weight) = corpus.word_reading("重庆").unwrap();
+            assert_eq!(weight, 40);
+            assert_eq!(syllables.collect::<Vec<_>>(), ["chong", "qing"]);
+            assert_eq!(
+                corpus.word_reading("女儿").unwrap().0.collect::<Vec<_>>(),
+                ["nv", "er"]
+            );
+            assert_eq!(corpus.spaced_pinyin_words("xing").next(), Some(("行", 999)));
+            assert_eq!(
+                corpus.spaced_pinyin_words("chong qing").collect::<Vec<_>>(),
+                [("重庆", 40), ("重请", 40)]
+            );
+            assert_eq!(
+                corpus.spaced_pinyin_words("zhong qing").next(),
+                Some(("重庆", 30))
+            );
+            assert_eq!(
+                corpus.initial_readings("cj").collect::<Vec<_>>(),
+                ["chen jing", "chong jing"]
+            );
+            assert_eq!(
+                corpus.abbreviations("cq").collect::<Vec<_>>(),
+                [("重庆", 40), ("重请", 40)]
+            );
+            assert_eq!(
+                corpus.continuations("重").collect::<Vec<_>>(),
+                [("庆市", 60), ("庆", 40), ("请", 40)]
+            );
+            assert_eq!(corpus.continuations("重庆").next(), Some(("市", 60)));
+            assert_eq!(corpus.lookup_word_chars(&['重', '庆']), Some(40));
+            assert_eq!(corpus.lookup_word_chars(&['重', '量']), None);
+            assert_eq!(corpus.lookup_word_chars(&['𠀀'; 17]), Some(200));
+            assert_eq!(corpus.lookup_joined_str("重", "庆"), Some(40));
+            assert_eq!(corpus.lookup_joined_str("", ""), None);
+            assert_eq!(corpus.lookup_joined_str("𠀀", &"𠀀".repeat(16)), Some(200));
+        }
+    }
+
+    #[test]
+    fn invalid_disk_cache_is_rebuilt() {
+        let f = Fixture::new("invalid");
+        f.dict("base.dict.yaml", "重庆\tchong qing\t40\n");
+        assert!(!f.load().is_mapped());
+        let path = f.cache_file();
+        let valid = fs::read(&path).unwrap();
+        let fingerprint = source_fingerprint(Some(&f.dicts));
+        let mut invalid = vec![
+            valid[..valid.len() - 1].to_vec(),
+            valid.clone(),
+            valid.clone(),
+            valid.clone(),
+        ];
+        invalid[1][0] ^= 1; // magic
+        invalid[2][16] ^= 1; // source fingerprint
+        *invalid[3].last_mut().unwrap() ^= 1; // payload
+        invalid.extend(compact::invalid_layouts(&valid));
+        for bytes in invalid {
+            f.forget_corpus();
+            fs::write(&path, bytes).unwrap();
+            assert!(RimeDictCorpus::open(&path, &fingerprint).is_none());
+            let rebuilt = f.load();
+            assert!(!rebuilt.is_mapped());
+            assert_eq!(rebuilt.word_weight("重庆"), Some(40));
+            assert_eq!(fs::read(&path).unwrap(), valid);
+        }
+    }
+
+    #[test]
+    fn reloading_same_source_path_invalidates_owned_and_mapped_readers() {
+        let f = Fixture::new("reload");
+        f.dict("base.dict.yaml", "重庆\tchong qing\t40\n");
+        f.load();
+        f.forget_corpus();
+        let mut engine = crate::eng::pure_rust::PureRustEngine::with_corpus_cache(
+            Some(&f.assets),
+            Some(&f.cache),
+        );
+        let mut imported =
+            crate::imp::ImportedLexiconIndex::with_corpus_cache(Some(&f.assets), Some(&f.cache));
+        let old = Arc::clone(engine.get_corpus());
+        assert!(old.is_mapped());
+        assert!(Arc::ptr_eq(imported.corpus(), &old));
+
+        f.dict("base.dict.yaml", "重庆市\tchong qing shi\t60\n");
+        engine.reload_assets(Some(&f.assets));
+        imported.reload_assets(Some(&f.assets));
+        let updated = engine.get_corpus();
+        assert!(Arc::ptr_eq(updated, imported.corpus()));
+        assert_eq!(updated.word_weight("重庆"), None);
+        assert_eq!(updated.word_weight("重庆市"), Some(60));
+        assert_eq!(old.word_weight("重庆"), Some(40));
+        assert_eq!(old.word_weight("重庆市"), None);
+        let count = CORPUS_CACHE
+            .get()
+            .unwrap()
+            .lock()
+            .keys()
+            .filter(|(assets, _)| assets.as_ref() == Some(&f.assets))
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn unavailable_disk_cache_uses_owned_corpus() {
+        let f = Fixture::new("unavailable");
+        f.dict("base.dict.yaml", "重庆\tchong qing\t40\n");
+        fs::write(&f.cache, []).unwrap();
+        let corpus = f.load();
+        assert!(!corpus.is_mapped());
+        assert_eq!(corpus.word_weight("重庆"), Some(40));
+    }
 
     #[test]
     fn homophone_bucket_limits_distinguish_single_and_multiple_syllables() {
@@ -1357,18 +1673,21 @@ mod continuation_tests {
             }
         }
         fs::write(dict_dir.join("base.dict.yaml"), dict).unwrap();
-        let corpus = RimeDictCorpus::build(Some(&root));
+        let corpus = RimeDictCorpus::load_or_fallback(Some(&root));
         fs::remove_dir_all(root).unwrap();
-        assert_eq!(corpus.spaced_pinyin_to_words["shi"].len(), 120);
-        assert_eq!(corpus.spaced_pinyin_to_words["shi shi"].len(), 48);
-        assert_eq!(corpus.spaced_pinyin_to_words["shi"][119].1, 881);
-        assert_eq!(corpus.spaced_pinyin_to_words["shi shi"][47].1, 953);
+        assert_eq!(corpus.spaced_pinyin_words("shi").len(), 120);
+        assert_eq!(corpus.spaced_pinyin_words("shi shi").len(), 48);
+        assert_eq!(corpus.spaced_pinyin_words("shi").nth(119).unwrap().1, 881);
+        assert_eq!(
+            corpus.spaced_pinyin_words("shi shi").nth(47).unwrap().1,
+            953
+        );
     }
 
     #[test]
     fn continuation_buckets_keep_wider_single_character_coverage() {
-        let root = std::env::temp_dir()
-            .join(format!("vitral-continuation-bounds-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("vitral-continuation-bounds-{}", std::process::id()));
         let dict_dir = root.join("rime/cn_dicts");
         fs::create_dir_all(&dict_dir).unwrap();
         let mut dict = String::from("---\nname: test\n...\n");
@@ -1383,10 +1702,10 @@ mod continuation_tests {
             }
         }
         fs::write(dict_dir.join("base.dict.yaml"), dict).unwrap();
-        let corpus = RimeDictCorpus::build(Some(&root));
+        let corpus = RimeDictCorpus::load_or_fallback(Some(&root));
         fs::remove_dir_all(root).unwrap();
         for (prefix, limit) in [("正", 24), ("人工", 10), ("输入法", 10)] {
-            let bucket = &corpus.continuations[prefix];
+            let bucket: Vec<_> = corpus.continuations(prefix).collect();
             assert_eq!(bucket.len(), limit);
             assert_eq!(bucket[0].1, 100);
             assert_eq!(bucket[limit - 1].1, 101 - limit as u64);

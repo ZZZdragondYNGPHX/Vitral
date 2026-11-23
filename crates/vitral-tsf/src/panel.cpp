@@ -1,6 +1,7 @@
 #include "vitral_tokens.hpp"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <d2d1.h>
 #include <d3d11.h>
 #include <dcomp.h>
@@ -8,6 +9,7 @@
 #include <dwrite.h>
 #include <msctf.h>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <windows.h>
 #include <wrl/client.h>
@@ -98,6 +100,20 @@ HRESULT reg(bool install) {
 }
 using Event = void (*)(void *, int, int, const wchar_t *, const float *,
                        size_t);
+struct PanelText {
+  const char *data;
+  size_t len;
+  std::string_view view() const { return {data, len}; }
+};
+std::wstring wideText(std::string_view text) {
+  const int len = static_cast<int>(text.size());
+  const int size =
+      MultiByteToWideChar(CP_UTF8, 0, text.data(), len, nullptr, 0);
+  std::wstring wide(size, L'\0');
+  if (size)
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), len, wide.data(), size);
+  return wide;
+}
 struct Panel;
 struct Surface {
   Panel *panel;
@@ -106,8 +122,24 @@ struct Surface {
   ComPtr<IDCompositionTarget> target;
   ComPtr<IDCompositionVisual> visual;
   ComPtr<IDCompositionSurface> surface;
+  int width = 0, height = 0, selected = -1;
+  bool dirty = true, glowing = false, faded = false;
+  void redraw() {
+    if (wnd)
+      InvalidateRect(wnd, nullptr, FALSE);
+  }
+  void invalidate() {
+    dirty = true;
+    redraw();
+  }
   void show(int x, int y, int width, int height);
   void paint();
+};
+struct Candidate {
+  std::string text;
+  std::wstring label;
+  ComPtr<IDWriteTextLayout> layout;
+  float width = 62.f, left = 0.f, right = 0.f;
 };
 struct Panel {
   Event event;
@@ -122,46 +154,71 @@ struct Panel {
   bool active = false, english = false, ink = false, drawing = false;
   bool idle = false;
   int count = 0, mode = 0, selected = 0;
+  uint64_t page = 0;
+  std::string preedit;
+  const ThemePalette *palette = &currentPalette();
   RECT caret{};
   ULONGLONG last = GetTickCount64(), glow = 0;
-  std::wstring words[5];
-  float cellLeft[5]{};
-  float cellRight[5]{};
+  Candidate candidates[5];
   int totalChoiceWidth = 100;
   std::vector<float> points;
   void send(int op, int index = 0, const wchar_t *text = nullptr) {
     event(owner, op, index, text, nullptr, 0);
   }
-  void measureChoices() {
-    float cursor = 8.f;
+  bool updateChoices(const PanelText *words, int newCount) {
+    bool changed = count != newCount;
+    count = newCount;
     for (int i = 0; i < count; i++) {
-      float width = 62.f;
-      if (write && font) {
-        std::wstring full = std::to_wstring(i + 1) + L" " + words[i];
-        ComPtr<IDWriteTextLayout> layout;
-        if (SUCCEEDED(write->CreateTextLayout(full.c_str(), (UINT32)full.size(),
-                                              font.Get(), 400.f, 40.f,
-                                              &layout))) {
+      auto &c = candidates[i];
+      const auto word = words[i].view();
+      if (c.label.empty() || c.text != word) {
+        changed = true;
+        c.text = word;
+        c.label = std::to_wstring(i + 1) + L" " + wideText(word);
+        c.width = 62.f;
+        c.layout.Reset();
+        if (write && font &&
+            SUCCEEDED(
+                write->CreateTextLayout(c.label.data(), (UINT32)c.label.size(),
+                                        font.Get(), 400.f, 38.f, &c.layout))) {
           DWRITE_TEXT_METRICS m{};
-          if (SUCCEEDED(layout->GetMetrics(&m)))
-            width = (std::max)(56.f, std::ceil(m.widthIncludingTrailingWhitespace) + 24.f);
+          if (SUCCEEDED(c.layout->GetMetrics(&m)))
+            c.width =
+                (std::max)(56.f, std::ceil(m.widthIncludingTrailingWhitespace) +
+                                     24.f);
+          c.layout->SetMaxWidth(c.width);
         }
       }
-      cellLeft[i] = cursor;
-      cellRight[i] = cursor + width;
-      cursor = cellRight[i] + 4.f;
+    }
+    if (!changed)
+      return false;
+    float cursor = 8.f;
+    for (int i = 0; i < count; i++) {
+      auto &c = candidates[i];
+      c.left = cursor;
+      c.right = cursor + c.width;
+      cursor = c.right + 4.f;
     }
     totalChoiceWidth = (std::max)(110, (int)std::ceil(cursor + 4.f));
+    return true;
+  }
+  void refreshTheme() {
+    const auto *next = &currentPalette();
+    if (palette != next) {
+      palette = next;
+      status.invalidate();
+      choices.invalidate();
+    }
   }
   int hitChoice(int x) const {
     for (int i = 0; i < count; i++) {
-      if (x >= cellLeft[i] && x <= cellRight[i])
+      if (x >= candidates[i].left && x <= candidates[i].right)
         return i;
     }
     return -1;
   }
   void place();
-  void init() {
+  void initGraphics() {
     D3D_FEATURE_LEVEL level;
     HRESULT h = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
                                   D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr, 0,
@@ -173,6 +230,37 @@ struct Panel {
     ComPtr<IDXGIDevice> dx;
     if (gpu && SUCCEEDED(gpu.As(&dx)))
       DCompositionCreateDevice(dx.Get(), IID_PPV_ARGS(&compositor));
+  }
+  void bindSurface(Surface &s) {
+    s.surface.Reset();
+    s.visual.Reset();
+    s.target.Reset();
+    s.width = 0;
+    s.height = 0;
+    s.selected = -1;
+    s.faded = false;
+    s.dirty = true;
+    if (s.wnd && compositor &&
+        SUCCEEDED(compositor->CreateTargetForHwnd(s.wnd, TRUE, &s.target)) &&
+        SUCCEEDED(compositor->CreateVisual(&s.visual)))
+      s.target->SetRoot(s.visual.Get());
+  }
+  bool recoverGraphics() {
+    status.surface.Reset();
+    status.visual.Reset();
+    status.target.Reset();
+    choices.surface.Reset();
+    choices.visual.Reset();
+    choices.target.Reset();
+    compositor.Reset();
+    gpu.Reset();
+    initGraphics();
+    bindSurface(status);
+    bindSurface(choices);
+    return compositor != nullptr;
+  }
+  void init() {
+    initGraphics();
     D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf());
     DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
                         reinterpret_cast<IUnknown **>(write.GetAddressOf()));
@@ -198,37 +286,108 @@ struct Panel {
   }
 };
 void Surface::paint() {
-  if (!wnd || !visual || !panel->d2d || !panel->font)
+  if (!wnd || !panel->d2d || !panel->font)
     return;
-  RECT r;
-  GetClientRect(wnd, &r);
-  int w = r.right, h = r.bottom;
-  if (!w || !h)
+  bool recovered = false;
+  auto ensureDevice = [&]() -> bool {
+    if (panel->compositor) {
+      BOOL valid = FALSE;
+      if (SUCCEEDED(panel->compositor->CheckDeviceState(&valid)) && valid &&
+          visual)
+        return true;
+    }
+    if (recovered)
+      return false;
+    recovered = true;
+    return panel->recoverGraphics() && visual != nullptr;
+  };
+  if (!ensureDevice())
     return;
-  const ThemePalette &pal = currentPalette();
-  ComPtr<IDCompositionSurface> s;
-  if (FAILED(panel->compositor->CreateSurface(
-          w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED, &s)))
+  for (int attempt = 0; attempt < 2; ++attempt) {
+  RECT client{};
+  if (!GetClientRect(wnd, &client) || IsRectEmpty(&client))
     return;
+  const int w = client.right, h = client.bottom;
+  const auto &pal = *panel->palette;
+  if (status && faded != panel->idle) {
+    ComPtr<IDCompositionEffectGroup> alpha;
+    if (SUCCEEDED(panel->compositor->CreateEffectGroup(&alpha)) &&
+        SUCCEEDED(alpha->SetOpacity(
+            panel->idle ? (float)motion::kDesktopIdleOpacity : 1.f)) &&
+        SUCCEEDED(visual->SetEffect(alpha.Get())) &&
+        SUCCEEDED(panel->compositor->Commit()))
+      faded = panel->idle;
+  }
+  const int nextSelected = !status && !panel->ink && panel->selected >= 0 &&
+                                   panel->selected < panel->count
+                               ? panel->selected
+                               : -1;
+  const bool nextGlow = !status && GetTickCount64() < panel->glow;
+  const bool resize = !surface || width != w || height != h;
+  const bool full = resize || dirty || glowing != nextGlow;
+  RECT damage = client;
+  if (!full) {
+    if (selected == nextSelected)
+      return;
+    RECT cells{};
+    for (int i : {selected, nextSelected}) {
+      if (i >= 0) {
+        const auto &c = panel->candidates[i];
+        RECT bounds{(LONG)c.left - 1, 2, (LONG)c.right + 1, 40};
+        UnionRect(&cells, &cells, &bounds);
+      }
+    }
+    if (!IntersectRect(&damage, &cells, &client))
+      return;
+  }
+  ComPtr<IDCompositionSurface> replacement;
+  auto *s = surface.Get();
+  dirty = true;
+  auto retryOnDeviceLoss = [&]() -> bool {
+    if (!recovered && panel->recoverGraphics() && visual != nullptr) {
+      recovered = true;
+      return true;
+    }
+    return false;
+  };
+  if (resize) {
+    if (FAILED(panel->compositor->CreateSurface(
+            w, h, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_ALPHA_MODE_PREMULTIPLIED,
+            &replacement))) {
+      if (retryOnDeviceLoss())
+        continue;
+      return;
+    }
+    s = replacement.Get();
+  }
   POINT origin;
   ComPtr<IDXGISurface> dx;
-  if (FAILED(s->BeginDraw(nullptr, IID_PPV_ARGS(&dx), &origin)))
+  if (FAILED(
+          s->BeginDraw(full ? nullptr : &damage, IID_PPV_ARGS(&dx), &origin))) {
+    if (retryOnDeviceLoss())
+      continue;
     return;
+  }
   ComPtr<ID2D1RenderTarget> rt;
   auto props = D2D1::RenderTargetProperties(
       D2D1_RENDER_TARGET_TYPE_DEFAULT,
       D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                         D2D1_ALPHA_MODE_PREMULTIPLIED),
       96, 96);
-  if (SUCCEEDED(
-          panel->d2d->CreateDxgiSurfaceRenderTarget(dx.Get(), props, &rt))) {
+  HRESULT painted =
+      panel->d2d->CreateDxgiSurfaceRenderTarget(dx.Get(), props, &rt);
+  if (SUCCEEDED(painted)) {
     rt->BeginDraw();
-    rt->SetTransform(
-        D2D1::Matrix3x2F::Translation((float)origin.x, (float)origin.y));
+    rt->SetTransform(D2D1::Matrix3x2F::Translation(
+        float(origin.x - damage.left), float(origin.y - damage.top)));
+    rt->PushAxisAlignedClip(D2D1::RectF((float)damage.left, (float)damage.top,
+                                        (float)damage.right,
+                                        (float)damage.bottom),
+                            D2D1_ANTIALIAS_MODE_ALIASED);
     rt->Clear(D2D1::ColorF(0, 0.f));
     ComPtr<ID2D1SolidColorBrush> b;
-    rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), &b);
-    if (b) {
+    painted = rt->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1), &b);
+    if (SUCCEEDED(painted)) {
       auto color = [&](RgbaColor c, float alphaScale = 1.f) {
         b->SetColor(D2D1::ColorF(c.r / 255.f, c.g / 255.f, c.b / 255.f,
                                  c.alpha * alphaScale));
@@ -263,9 +422,11 @@ void Surface::paint() {
                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
       } else {
         for (int i = 0; i < panel->count; i++) {
-          const float left = panel->cellLeft[i];
-          const float right = panel->cellRight[i];
-          const bool activeItem = (i == panel->selected && !panel->ink);
+          const auto &candidate = panel->candidates[i];
+          const float left = candidate.left, right = candidate.right;
+          if (right + 1 <= damage.left || left - 1 >= damage.right)
+            continue;
+          const bool activeItem = i == nextSelected;
           if (activeItem) {
             auto pill = D2D1::RoundedRect(
                 D2D1::RectF(left, 5.f, right, 37.f),
@@ -276,11 +437,15 @@ void Surface::paint() {
             color(pal.accent_primary, 0.38f);
             rt->DrawRoundedRectangle(pill, b.Get(), 1.f);
           }
-          std::wstring text = std::to_wstring(i + 1) + L" " + panel->words[i];
           color(activeItem ? pal.accent_text : pal.text_primary);
-          rt->DrawText(text.data(), (UINT32)text.size(), panel->font.Get(),
-                       D2D1::RectF(left, 2.f, right, 40.f), b.Get(),
-                       D2D1_DRAW_TEXT_OPTIONS_CLIP);
+          if (candidate.layout) {
+            rt->DrawTextLayout({left, 2.f}, candidate.layout.Get(), b.Get(),
+                               D2D1_DRAW_TEXT_OPTIONS_CLIP);
+          } else {
+            rt->DrawText(candidate.label.data(), (UINT32)candidate.label.size(),
+                         panel->font.Get(), D2D1::RectF(left, 2.f, right, 40.f),
+                         b.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+          }
         }
         if (panel->ink) {
           // Recessed handwriting surface + subtle guide lines
@@ -305,36 +470,56 @@ void Surface::paint() {
                          {p[i] * w, 44.f + p[i + 1] * (h - 54.f)}, b.Get(),
                          (float)handwriting::kStrokeWidthPx);
         }
-        if (GetTickCount64() < panel->glow) {
+        if (nextGlow) {
           color(pal.retroactive_fix_glow);
           rt->DrawLine({12.f, 40.f}, {(float)w - 12.f, 40.f}, b.Get(), 2.2f);
         }
       }
     }
-    rt->EndDraw();
+    rt->PopAxisAlignedClip();
+    const HRESULT drawn = rt->EndDraw();
+    if (SUCCEEDED(painted))
+      painted = drawn;
   }
-  s->EndDraw();
-  visual->SetContent(s.Get());
-  surface = s;
-  ComPtr<IDCompositionEffectGroup> alpha;
-  if (SUCCEEDED(panel->compositor->CreateEffectGroup(&alpha))) {
-    alpha->SetOpacity(status && panel->idle ? (float)motion::kDesktopIdleOpacity
-                                            : 1.f);
-    visual->SetEffect(alpha.Get());
+  rt.Reset();
+  dx.Reset();
+  const HRESULT ended = s->EndDraw();
+  if (FAILED(painted) || FAILED(ended) ||
+      (resize && FAILED(visual->SetContent(s))) ||
+      FAILED(panel->compositor->Commit())) {
+    if (retryOnDeviceLoss())
+      continue;
+    return;
   }
-  panel->compositor->Commit();
+  if (resize) {
+    surface.Swap(replacement);
+    width = w;
+    height = h;
+  }
+  selected = nextSelected;
+  glowing = nextGlow;
+  dirty = false;
+  if (recovered) {
+    Surface &other = status ? panel->choices : panel->status;
+    if (other.wnd && IsWindowVisible(other.wnd))
+      other.redraw();
+  }
+  return;
+  }
 }
 void Surface::show(int x, int y, int w, int h) {
   if (!wnd)
     return;
   RECT old{};
   GetWindowRect(wnd, &old);
-  if (!IsWindowVisible(wnd) || old.left != x || old.top != y ||
-      old.right - old.left != w || old.bottom - old.top != h) {
+  const bool visible = IsWindowVisible(wnd);
+  const bool resize = old.right - old.left != w || old.bottom - old.top != h;
+  if (!visible || old.left != x || old.top != y || resize) {
     SetWindowPos(wnd, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(wnd, nullptr, FALSE);
   }
+  if (!visible || resize || dirty)
+    redraw();
 }
 void Panel::place() {
   auto fg = GetForegroundWindow();
@@ -353,8 +538,8 @@ void Panel::place() {
   GetCursorPos(&mouse);
   bool was_idle = idle;
   idle = GetTickCount64() - last >= motion::kDesktopIdleFadeDelayMs;
-  if (idle != was_idle && status.wnd)
-    InvalidateRect(status.wnd, nullptr, FALSE);
+  if (idle != was_idle)
+    status.redraw();
   bool edge =
       idle && !(mouse.x >= a.right - sw - 14 && mouse.y >= a.bottom - 65);
   status.show(edge ? a.right - sw / 2 : a.right - sw - 14, a.bottom - 54, sw,
@@ -363,7 +548,6 @@ void Panel::place() {
     ShowWindow(choices.wnd, SW_HIDE);
     return;
   }
-  measureChoices();
   int w = ink ? (std::max)(360, totalChoiceWidth) : totalChoiceWidth;
   int h = ink ? 216 : 44;
   int x = caret.right || caret.bottom ? caret.left : a.right - w - 14;
@@ -398,12 +582,22 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
   }
   case WM_MOUSEACTIVATE:
     return MA_NOACTIVATE;
+  case WM_THEMECHANGED:
+  case WM_SETTINGCHANGE:
+    if (s->status)
+      p.refreshTheme();
+    break;
   case WM_TIMER:
     if (wp == 2) {
-      KillTimer(win, 2);
-      InvalidateRect(win, nullptr, FALSE);
+      const auto now = GetTickCount64();
+      if (now < p.glow) {
+        SetTimer(win, 2, (UINT)(p.glow - now), nullptr);
+      } else {
+        KillTimer(win, 2);
+        s->redraw();
+      }
     } else if (p.active) {
-      p.send(8);
+      p.refreshTheme();
       p.place();
     }
     return 0;
@@ -468,7 +662,7 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
                      std::clamp(float(y - 44) / (std::max)(1L, r.bottom - 54),
                                 0.f, 1.f),
                      float(GetTickCount64() % 600000)});
-    InvalidateRect(win, nullptr, FALSE);
+    s->invalidate();
     if (msg == WM_LBUTTONUP) {
       p.drawing = false;
       ReleaseCapture();
@@ -514,10 +708,7 @@ extern "C" void *vitral_panel_open(void *owner, Event event) {
     int backdrop = 3;
     DwmSetWindowAttribute(win, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop,
                           sizeof(backdrop));
-    if (p->compositor &&
-        SUCCEEDED(p->compositor->CreateTargetForHwnd(win, TRUE, &s->target)) &&
-        SUCCEEDED(p->compositor->CreateVisual(&s->visual)))
-      s->target->SetRoot(s->visual.Get());
+    p->bindSurface(*s);
   }
   if (p->status.wnd) {
     SetTimer(p->status.wnd, 1, 750, nullptr);
@@ -536,31 +727,40 @@ extern "C" void vitral_panel_close(Panel *p) {
   UnregisterClassW(L"Vitral.Tsf.Panel", module());
 }
 extern "C" void vitral_panel_update(Panel *p, bool active, bool english,
-                                    int mode, const RECT *caret,
-                                    const wchar_t *const *words, int count,
-                                    int selected, bool glow, bool activity) {
+                                    int mode, PanelText preedit, uint64_t page,
+                                    const RECT *caret, const PanelText *words,
+                                    int count, int selected, bool glow,
+                                    bool activity) {
   if (!p)
     return;
+  if (active && !p->active)
+    p->refreshTheme();
+  if (p->english != english)
+    p->status.invalidate();
+  const auto preeditText = preedit.view();
+  const bool labelsChanged = p->updateChoices(words, std::clamp(count, 0, 5));
+  if (labelsChanged || p->preedit != preeditText || p->page != page ||
+      p->mode != mode) {
+    p->preedit = preeditText;
+    p->page = page;
+    p->choices.invalidate();
+  } else if (!p->ink && p->selected != selected) {
+    p->choices.redraw();
+  }
   p->active = active;
   p->english = english;
   p->ink = mode != 0;
   p->mode = mode;
-  p->count = (std::min)(5, count);
   p->selected = selected;
   if (caret)
     p->caret = *caret;
-  for (int i = 0; i < p->count; i++)
-    p->words[i] = words[i];
   if (glow && p->choices.wnd) {
     p->glow = GetTickCount64() + handwriting::kRetroactiveHighlightDurationMs;
     SetTimer(p->choices.wnd, 2, handwriting::kRetroactiveHighlightDurationMs,
              nullptr);
+    p->choices.redraw();
   }
   if (activity)
     p->last = GetTickCount64();
   p->place();
-  if (p->status.wnd)
-    InvalidateRect(p->status.wnd, nullptr, FALSE);
-  if (p->choices.wnd)
-    InvalidateRect(p->choices.wnd, nullptr, FALSE);
 }

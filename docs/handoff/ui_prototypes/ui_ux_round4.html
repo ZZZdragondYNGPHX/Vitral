@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-anim { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .tap-s:active { transform: scale(0.95); }
+    .tabular { font-variant-numeric: tabular-nums; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Round 4 Final Workbench Navigation -->
+    <div class="flex flex-wrap items-center justify-between gap-1.5 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex flex-wrap items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="setTab('verify')" id="tbtn-verify" class="px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]">1. 简码(ksb) & 多设备滑动验收</button>
+        <button onclick="setTab('cloud')" id="tbtn-cloud" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">2. 设置中心: Koofr 与单机/换机</button>
+        <button onclick="setTab('habit')" id="tbtn-habit" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">3. 词库直导 & 越用越顺手引擎</button>
+      </div>
+
+      <button onclick="toggleTheme()" id="btn-theme" class="px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-anim">深色晶透</button>
+    </div>
+
+    <!-- Frosted Glass Stage (Fixed 370px height, zero vertical overflow) -->
+    <div id="stage" class="rounded-xl relative overflow-hidden ime-anim" style="height:370px;">
+      <div class="pointer-events-none absolute -top-14 left-10 w-60 h-60 rounded-full" style="background:radial-gradient(circle, rgba(14,165,233,0.30) 0%, transparent 70%); filter:blur(24px);"></div>
+      <div class="pointer-events-none absolute -bottom-14 right-8 w-64 h-64 rounded-full" style="background:radial-gradient(circle, rgba(99,102,241,0.24) 0%, rgba(16,185,129,0.12) 60%, transparent 75%); filter:blur(26px);"></div>
+
+      <!-- ================= TAB 1: PINNED SHORTHAND (ksb) + MULTI-DEVICE SCROLL STRIP ================= -->
+      <div id="pane-verify" class="h-full flex flex-col justify-between p-3.5 relative z-10 text-xs">
+        <!-- Upper Card: Pinned Clipboard Shorthand Trigger (ksb) + Live Candidate Bar Preview -->
+        <div id="ksb-card" class="rounded-2xl p-3 space-y-2 ime-anim">
+          <div class="flex items-center justify-between">
+            <span class="font-medium">① 剪贴板置顶项「快捷简码」直调（无敏感过滤 · 点简码胶囊可试打）</span>
+            <div class="flex items-center gap-1.5">
+              <button onclick="tryCode('ksb')" class="px-2 py-0.5 rounded-full font-mono ime-anim tap-s" id="try-ksb">试打 ksb</button>
+              <button onclick="tryCode('ssh')" class="px-2 py-0.5 rounded-full font-mono ime-anim tap-s" id="try-ssh">试打 ssh</button>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-2" id="pinned-Demo-list"></div>
+
+          <!-- Simulated Candidate Bar responding to 'ksb' / 'ssh' -->
+          <div id="ksb-cand-preview" class="rounded-xl px-3 py-1.5 flex items-center justify-between tabular"></div>
+        </div>
+
+        <!-- Lower Card: 8-Device Horizontal Scrollable Air Transfer Strip -->
+        <div id="multidev-card" class="rounded-2xl p-3 space-y-2 ime-anim">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <span class="font-medium">② 多设备隔空闪传（8 台关联设备 · 在线与常传自动排前 · 支持滚轮横滑）</span>
+            </div>
+            <div class="flex items-center gap-1">
+              <input id="dev-filter" type="text" placeholder="筛选设备..." oninput="renderVerify(gTheme())" class="w-24 px-2 py-0.5 rounded-full text-xs outline-none" />
+              <button onclick="scrollDevs(-160)" class="w-6 h-6 rounded-full flex items-center justify-center tap-s" id="btn-scr-l">‹</button>
+              <button onclick="scrollDevs(160)" class="w-6 h-6 rounded-full flex items-center justify-center tap-s" id="btn-scr-r">›</button>
+            </div>
+          </div>
+
+          <!-- Horizontal Momentum Scroll Track -->
+          <div id="dev-strip" onwheel="wheelHorizontal(event)" class="flex items-center gap-2 overflow-x-auto no-scrollbar py-0.5"></div>
+
+          <div id="multidev-status" class="text-[11px] opacity-80 truncate">点击任意设备卡片即可发送；常用设备会自动前置至最左侧第 1 顺位</div>
+        </div>
+      </div>
+
+      <!-- ================= TAB 2: SETTINGS STUDIO — KOOFR WEBDAV & ONE-CLICK MIGRATION ================= -->
+      <div id="pane-cloud" class="hidden h-full p-3.5 relative z-10 text-xs flex flex-col justify-between">
+        <div id="cloud-studio" class="rounded-2xl p-3.5 h-full flex flex-col justify-between ime-anim">
+          <div class="flex items-center justify-between pb-2" id="cloud-hdr">
+            <div class="flex items-center gap-2">
+              <span class="font-semibold text-sm">PureIME 配置中心 · 私有云与安全</span>
+              <span class="px-2 py-0.5 rounded-full text-[11px]" id="conn-badge"></span>
+            </div>
+            <button onclick="toggleOfflineMode()" id="btn-offline" class="px-3 py-1 rounded-full font-medium tap-s ime-anim"></button>
+          </div>
+
+          <div class="grid grid-cols-12 gap-3 my-auto">
+            <!-- Left: Koofr WebDAV Credentials -->
+            <div class="col-span-7 rounded-xl p-3 space-y-2" id="dav-form">
+              <div class="font-medium flex items-center justify-between">
+                <span>Koofr 250GB WebDAV 连接配置</span>
+                <span class="font-mono text-[11px] opacity-70">TLS 1.3 · ChaCha20 加密</span>
+              </div>
+              <div class="space-y-1.5">
+                <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between font-mono text-[11px]" id="dav-url">
+                  <span class="opacity-60">端点</span><span>https://app.koofr.net/dav/Koofr</span>
+                </div>
+                <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between font-mono text-[11px]" id="dav-auth">
+                  <span class="opacity-60">独立应用密码</span><span>•••• •••• •••• •••• (已验证)</span>
+                </div>
+              </div>
+              <div class="flex items-center justify-between pt-1">
+                <span class="opacity-75">剪贴板环形队列上限 N：</span>
+                <div class="flex items-center gap-2">
+                  <input type="range" min="20" max="200" step="10" value="50" oninput="updateCapN(this.value)" class="w-24 accent-sky-500 cursor-pointer" />
+                  <span id="cap-n-val" class="font-mono tabular font-semibold">50 条</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Right: 3-Tier Storage Monitor & Migration Assistant -->
+            <div class="col-span-5 rounded-xl p-3 flex flex-col justify-between" id="dav-stats">
+              <div class="space-y-1.5">
+                <div class="font-medium">三级生命周期云盘占用</div>
+                <div class="flex justify-between opacity-85"><span>永久词库与 .scel 包</span><span class="font-mono tabular">18.4 MB</span></div>
+                <div class="flex justify-between opacity-85"><span>双轨剪贴板 (含置顶)</span><span class="font-mono tabular">142 KB</span></div>
+                <div class="flex justify-between" style="color:#34d399;"><span>闪传临时中转区 (/relay)</span><span class="font-mono tabular">0 B (已焚毁)</span></div>
+              </div>
+              <button onclick="simRestore()" id="btn-migrate" class="w-full py-2 rounded-xl font-medium tap-s ime-anim text-center">
+                ⇄ 换机一键拉取全量配置与词库
+              </button>
+            </div>
+          </div>
+
+          <div id="cloud-foot" class="text-[11px] opacity-75 text-center">Linux / Windows 桌面端共享此 Tauri v2 晶透面板；Android 端采用同源 Compose 卡片</div>
+        </div>
+      </div>
+
+      <!-- ================= TAB 3: LEXICON STUDIO & "越用越顺手" RETENTION ENGINE ================= -->
+      <div id="pane-habit" class="hidden h-full p-3.5 relative z-10 text-xs">
+        <div class="grid grid-cols-12 gap-3 h-full">
+          <!-- Left: Multi-Format Dictionary Importer -->
+          <div id="lex-card" class="col-span-5 rounded-2xl p-3 flex flex-col justify-between ime-anim">
+            <div class="space-y-2">
+              <div class="flex items-center justify-between">
+                <span class="font-semibold">多格式词库直导中心</span>
+                <span class="text-[11px] opacity-70">三端自动同步</span>
+              </div>
+              <div onclick="simAddScel()" id="drop-zone" class="rounded-xl p-2.5 text-center cursor-pointer ime-anim tap-s">
+                <div class="font-medium">+ 拖入或点击导入词库</div>
+                <div class="text-[11px] opacity-75 mt-0.5">搜狗 .scel / .dict.yaml / 纯文本自动注音</div>
+              </div>
+              <div id="lex-items" class="space-y-1.5"></div>
+            </div>
+            <div class="text-[11px] opacity-70 tabular" id="lex-foot">已锁定：小鹤双拼(双副标) / 全拼(5排数字+右上符号)</div>
+          </div>
+
+          <!-- Right: "越用越顺手" Adaptive Retention Switches + Candidate Size Preview -->
+          <div id="habit-card" class="col-span-7 rounded-2xl p-3 flex flex-col justify-between ime-anim">
+            <div class="space-y-1.5">
+              <div class="font-semibold flex items-center justify-between">
+                <span>「越用越顺手」自适应手感引擎</span>
+                <span class="text-[11px] opacity-70">零打扰提升长期留存</span>
+              </div>
+              <div id="habit-toggles" class="space-y-1.5 pt-0.5"></div>
+            </div>
+
+            <!-- Live Candidate Font Size Slider Preview -->
+            <div id="size-preview-box" class="rounded-xl px-3 py-2 flex items-center justify-between">
+              <div class="flex items-center gap-2">
+                <span class="opacity-75">候选字号预览</span>
+                <input type="range" min="13" max="19" value="15" oninput="updPreviewFont(this.value)" class="w-20 accent-sky-500 cursor-pointer" />
+              </div>
+              <div id="live-font-cand" class="flex items-center gap-2 font-medium tabular" style="font-size:15px;">
+                <span class="px-2 py-0.5 rounded-full text-white" style="background:#0ea5e9;">1 顺手</span>
+                <span class="opacity-80">2 纯粹</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const PIN_DATA = [
+      { code: 'ksb', text: 'https://app.koofr.net/dav/Koofr', label: 'Koofr WebDAV 地址' },
+      { code: 'ssh', text: 'ssh user@example.org', label: '服务器登录示例' }
+    ];
+
+    let DEVS = [
+      { id: 1, name: 'CachyOS 主力本', tag: 'LAN 极速 · 常传 #1', online: 'lan', count: 42 },
+      { id: 2, name: 'Pixel 9 Pro', tag: 'LAN 极速 · 常传 #2', online: 'lan', count: 35 },
+      { id: 3, name: 'Win11 游戏台式', tag: 'Koofr 跨网 · 常传 #3', online: 'wan', count: 19 },
+      { id: 4, name: 'Galaxy Tab 平板', tag: 'LAN 极速', online: 'lan', count: 11 },
+      { id: 5, name: 'ThinkPad 办公本', tag: 'Koofr 跨网', online: 'wan', count: 8 },
+      { id: 6, name: 'Ubuntu 家用服务器', tag: 'LAN 极速', online: 'lan', count: 6 },
+      { id: 7, name: 'Surface 便携本', tag: '离线 · 投递待收', online: 'off', count: 3 },
+      { id: 8, name: '备用测试安卓机', tag: '离线 · 投递待收', online: 'off', count: 1 }
+    ];
+
+    let st = {
+      tab: 'verify',
+      dark: true,
+      activeCode: 'ksb',
+      offline: false,
+      capN: 50,
+      dicts: [
+        { name: '雾凇拼音精校词库 + 万象语法', count: '82.4万', on: true },
+        { name: '计算机与AI系统工程.scel', count: '3.6万', on: true },
+        { name: '个人常用专业术语表.txt (自动注音)', count: '1,420', on: true }
+      ],
+      habits: [
+        { id: 'frecency', title: 'Frecency 近期高频优先 + 时间衰减调频', desc: '近期常打词秒上第 1 位，过时临时词随时间自然衰减让位', on: true },
+        { id: 'appctx',   title: '应用上下文中/英状态自动记忆', desc: '切入终端/IDE 自动切 En，切回聊天/文档自动恢复中文双拼', on: true },
+        { id: 'fixword',  title: '候选词一键固顶与手滑错词秒删', desc: '手机长按候选词 / 桌面 Ctrl+Del 即可永久抹除误造词', on: true },
+        { id: 'pairpunc', title: '成对标点智能闭合 + 空格横滑移光标', desc: '引号括号自动配对居中，短滑空格精准微调光标位置', on: true }
+      ]
+    };
+
+    function gTheme() {
+      const d = st.dark;
+      return {
+        stageBg: d ? '#0b0e15' : '#e5ebf4',
+        panelBg: d ? 'rgba(24, 29, 42, 0.72)' : 'rgba(255, 255, 255, 0.76)',
+        border: d ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.88)',
+        cardBg: d ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.88)',
+        subBg: d ? 'rgba(255,255,255,0.04)' : 'rgba(15,23,42,0.05)',
+        accent: d ? '#0ea5e9' : '#0284c7',
+        accentSoft: d ? 'rgba(14,165,233,0.18)' : 'rgba(2,132,199,0.13)',
+        accentText: d ? '#7dd3fc' : '#0369a1',
+        text: d ? '#f8fafc' : '#0f172a',
+        muted: d ? '#94a3b8' : '#64748b',
+        shadow: d ? '0 16px 36px rgba(0,0,0,0.48)' : '0 12px 28px rgba(15,23,42,0.09)'
+      };
+    }
+
+    function render() {
+      const g = gTheme();
+      const stage = document.getElementById('stage');
+      stage.style.background = g.stageBg;
+      stage.style.border = `1px solid ${g.border}`;
+      document.getElementById('btn-theme').textContent = st.dark ? '深色晶透' : '浅色冰晶';
+
+      renderVerify(g);
+      renderCloud(g);
+      renderHabit(g);
+    }
+
+    function styleGlassPanel(el, g) {
+      el.style.background = g.panelBg;
+      el.style.border = `1px solid ${g.border}`;
+      el.style.boxShadow = g.shadow;
+      el.style.backdropFilter = 'blur(18px)';
+      el.style.color = g.text;
+    }
+
+    function renderVerify(g) {
+      styleGlassPanel(document.getElementById('ksb-card'), g);
+      styleGlassPanel(document.getElementById('multidev-card'), g);
+
+      ['ksb','ssh'].forEach(c => {
+        const b = document.getElementById('try-' + c);
+        const on = st.activeCode === c;
+        b.style.background = on ? g.accent : g.subBg;
+        b.style.color = on ? '#fff' : g.accentText;
+      });
+
+      document.getElementById('pinned-Demo-list').innerHTML = PIN_DATA.map(p => `
+        <div onclick="tryCode('${p.code}')" class="rounded-xl px-2.5 py-1.5 flex items-center justify-between cursor-pointer ime-anim" style="background:${g.cardBg}; border:1px solid ${st.activeCode === p.code ? g.accent : g.border};">
+          <div class="truncate pr-2">
+            <div class="text-[10px]" style="color:${g.muted};">📌 置顶保留 · ${p.label}</div>
+            <div class="font-mono truncate">${p.text}</div>
+          </div>
+          <span class="px-2 py-0.5 rounded-full font-mono font-semibold shrink-0" style="background:${g.accentSoft}; color:${g.accentText};">${p.code}</span>
+        </div>
+      `).join('');
+
+      const hit = PIN_DATA.find(x => x.code === st.activeCode);
+      const cprev = document.getElementById('ksb-cand-preview');
+      cprev.style.background = g.subBg;
+      cprev.style.border = `1px solid ${g.border}`;
+      cprev.innerHTML = `
+        <div class="flex items-center gap-2 truncate">
+          <span class="font-mono px-1.5 py-0.5 rounded" style="background:${g.accentSoft}; color:${g.accentText};">${hit.code}</span>
+          <span class="px-2.5 py-0.5 rounded-full font-medium truncate" style="background:${g.accent}; color:#fff;">1 📌 ${hit.text}</span>
+          <span class="opacity-65 shrink-0">2 ${st.activeCode === 'ksb' ? '看书吧' : '实时化'}</span>
+        </div>
+        <span class="text-[11px] shrink-0 ml-2" style="color:${g.accentText};">空格直出固定项</span>
+      `;
+
+      // Multi-device strip
+      const fInput = document.getElementById('dev-filter');
+      fInput.style.background = g.subBg;
+      fInput.style.border = `1px solid ${g.border}`;
+      fInput.style.color = g.text;
+      ['btn-scr-l','btn-scr-r'].forEach(id => {
+        const b = document.getElementById(id);
+        b.style.background = g.cardBg;
+        b.style.color = g.text;
+      });
+
+      const q = (fInput.value || '').trim().toLowerCase();
+      const filtered = DEVS.filter(d => !q || d.name.toLowerCase().includes(q));
+      document.getElementById('dev-strip').innerHTML = filtered.map(dv => {
+        const dotCol = dv.online === 'lan' ? '#10b981' : (dv.online === 'wan' ? '#f59e0b' : '#64748b');
+        return `<button onclick="sendToDev(${dv.id})" class="shrink-0 w-36 rounded-xl p-2 text-left tap-s ime-anim" style="background:${g.cardBg}; border:1px solid ${g.border};">
+          <div class="flex items-center justify-between mb-0.5">
+            <span class="font-medium truncate pr-1">${dv.name}</span>
+            <span class="w-2 h-2 rounded-full shrink-0" style="background:${dotCol};"></span>
+          </div>
+          <div class="text-[10px] truncate" style="color:${g.muted};">${dv.tag}</div>
+        </button>`;
+      }).join('');
+    }
+
+    function renderCloud(g) {
+      styleGlassPanel(document.getElementById('cloud-studio'), g);
+      document.getElementById('cloud-hdr').style.borderBottom = `1px solid ${g.border}`;
+
+      const badge = document.getElementById('conn-badge');
+      badge.style.background = st.offline ? 'rgba(245,158,11,0.18)' : 'rgba(16,185,129,0.18)';
+      badge.style.color = st.offline ? '#fbbf24' : '#34d399';
+      badge.textContent = st.offline ? '纯单机断网模式 (物理阻断一切请求)' : 'Koofr WebDAV 已加密连通 · 38ms';
+
+      const bOff = document.getElementById('btn-offline');
+      bOff.style.background = st.offline ? '#f59e0b' : g.subBg;
+      bOff.style.color = st.offline ? '#fff' : g.text;
+      bOff.style.border = `1px solid ${g.border}`;
+      bOff.textContent = st.offline ? '关闭单机模式 (恢复云协同)' : '一键开启纯单机模式';
+
+      ['dav-form','dav-stats'].forEach(id => {
+        const el = document.getElementById(id);
+        el.style.background = g.subBg;
+        el.style.border = `1px solid ${g.border}`;
+      });
+      ['dav-url','dav-auth'].forEach(id => {
+        document.getElementById(id).style.background = g.cardBg;
+      });
+
+      const bMig = document.getElementById('btn-migrate');
+      bMig.style.background = g.accent;
+      bMig.style.color = '#fff';
+    }
+
+    function renderHabit(g) {
+      styleGlassPanel(document.getElementById('lex-card'), g);
+      styleGlassPanel(document.getElementById('habit-card'), g);
+
+      const dz = document.getElementById('drop-zone');
+      dz.style.background = g.accentSoft;
+      dz.style.border = `1px dashed ${g.accent}`;
+      dz.style.color = g.accentText;
+
+      document.getElementById('lex-items').innerHTML = st.dicts.map((d, i) => `
+        <div onclick="toggleDict(${i})" class="rounded-xl px-2.5 py-1.5 flex items-center justify-between cursor-pointer ime-anim" style="background:${g.subBg}; border:1px solid ${d.on ? g.border : 'transparent'}; opacity:${d.on ? '1' : '0.5'};">
+          <span class="truncate pr-2">${d.name}</span>
+          <span class="text-[11px] font-mono shrink-0" style="color:${d.on ? g.accentText : g.muted};">${d.count}</span>
+        </div>
+      `).join('');
+
+      document.getElementById('habit-toggles').innerHTML = st.habits.map((h, i) => `
+        <div onclick="toggleHabit(${i})" class="rounded-xl px-2.5 py-1.5 flex items-center justify-between cursor-pointer ime-anim" style="background:${g.subBg}; border:1px solid ${h.on ? g.border : 'transparent'};">
+          <div class="pr-2">
+            <div class="font-medium">${h.title}</div>
+            <div class="text-[10px]" style="color:${g.muted};">${h.desc}</div>
+          </div>
+          <span class="px-2 py-0.5 rounded-full text-[10px] font-semibold shrink-0" style="background:${h.on ? g.accent : g.cardBg}; color:${h.on ? '#fff' : g.muted};">${h.on ? '已启用' : '关闭'}</span>
+        </div>
+      `).join('');
+
+      const sp = document.getElementById('size-preview-box');
+      sp.style.background = g.subBg;
+      sp.style.border = `1px solid ${g.border}`;
+    }
+
+    function setTab(t) {
+      st.tab = t;
+      ['verify','cloud','habit'].forEach(k => {
+        document.getElementById('pane-' + k).classList.toggle('hidden', k !== t);
+        document.getElementById('tbtn-' + k).className = k === t
+          ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+          : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      });
+    }
+
+    function toggleTheme() { st.dark = !st.dark; render(); }
+    function tryCode(c) { st.activeCode = c; renderVerify(gTheme()); }
+
+    function scrollDevs(dx) {
+      document.getElementById('dev-strip').scrollBy({ left: dx, behavior: 'smooth' });
+    }
+    function wheelHorizontal(e) {
+      if (e.deltaY !== 0) {
+        e.currentTarget.scrollLeft += e.deltaY;
+        e.preventDefault();
+      }
+    }
+    function sendToDev(id) {
+      const idx = DEVS.findIndex(x => x.id === id);
+      if (idx < 0) return;
+      const dv = DEVS[idx];
+      dv.count += 10;
+      // Re-sort MRU within online tier to demonstrate "越用越顺手" auto-prioritization!
+      DEVS.sort((a, b) => {
+        const tier = x => x.online === 'lan' ? 0 : (x.online === 'wan' ? 1 : 2);
+        return (tier(a) - tier(b)) || (b.count - a.count);
+      });
+      document.getElementById('multidev-status').textContent = `⚡ 已向「${dv.name}」发起加密传输（传完即焚），并自动提升其常用顺位！`;
+      renderVerify(gTheme());
+    }
+
+    function toggleOfflineMode() { st.offline = !st.offline; renderCloud(gTheme()); }
+    function updateCapN(v) {
+      st.capN = parseInt(v, 10);
+      document.getElementById('cap-n-val').textContent = v + ' 条';
+    }
+    function simRestore() {
+      document.getElementById('cloud-foot').textContent = '✓ 已从 Koofr WebDAV 拉取个人词库快照、3 个外部词库包、置顶简码与工具栏布局！';
+    }
+
+    function simAddScel() {
+      if (st.dicts.length >= 4) return;
+      st.dicts.push({ name: '新增导入_医学专业词汇.scel', count: '2.1万', on: true });
+      document.getElementById('lex-foot').textContent = '✓ 已解析 .scel 并增量挂载至小鹤双拼与全拼，同步上传至 Koofr！';
+      renderHabit(gTheme());
+    }
+    function toggleDict(i) { st.dicts[i].on = !st.dicts[i].on; renderHabit(gTheme()); }
+    function toggleHabit(i) { st.habits[i].on = !st.habits[i].on; renderHabit(gTheme()); }
+    function updPreviewFont(v) { document.getElementById('live-font-cand').style.fontSize = v + 'px'; }
+
+    render();
+  </script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+# Rime dictionary
+# encoding: utf-8
+# Vitral deterministic test lexicon (unsorted weights to verify sort: by_weight)
+---
+name: sample_terms
+version: "1.0"
+sort: by_weight
+use_preset_vocabulary: false
+columns:
+  - text
+  - code
+  - weight
+...
+# Hotwords and domain terms
+爆光	bao guang	500
+老登	lao deng	1200
+爆金币	bao jin bi	300
+老登金币	lao deng jin bi	950
+晶透	jing tou	420
+毛玻璃	mao bo li	880
+雾面玻璃	wu mian bo li	150
+小鹤双拼	xiao he shuang pin	760
+全拼解码	quan pin jie ma	610
+连续手写	lian xu shou xie	1100
+语义重排	yu yi chong pai	540
+端到端测试	duan dao duan ce shi	830

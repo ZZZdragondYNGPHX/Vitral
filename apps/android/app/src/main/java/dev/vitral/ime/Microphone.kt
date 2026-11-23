@@ -28,9 +28,8 @@ internal class Microphone {
         if (current != null) return
         val capturing = AtomicBoolean(true)
         current = capturing
-        Core.run(
+        Core.runVoice(
             context,
-            true,
             { handle ->
                 val size =
                     AudioRecord.getMinBufferSize(

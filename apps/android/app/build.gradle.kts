@@ -1,3 +1,6 @@
+import java.io.File
+import java.security.MessageDigest
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -15,6 +18,28 @@ val bundledModels = tasks.register<Sync>("bundleModels") {
     from(rootProject.files("../../LICENSE-MIT", "../../LICENSE-APACHE")) { into("licenses") }
     from(rootProject.files("../../scripts/assets-manifest.json", "../../scripts/models-catalog.json"))
     into(layout.buildDirectory.dir("generated/assets/models"))
+    doLast {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val root = destinationDir
+        root.walkTopDown()
+            .filter { it.isFile && it.name != "fingerprint.txt" }
+            .sortedBy { it.relativeTo(root).invariantSeparatorsPath }
+            .forEach { file ->
+                digest.update(file.relativeTo(root).invariantSeparatorsPath.toByteArray(Charsets.UTF_8))
+                digest.update(0)
+                file.inputStream().use { input ->
+                    val buf = ByteArray(16384)
+                    while (true) {
+                        val n = input.read(buf)
+                        if (n <= 0) break
+                        digest.update(buf, 0, n)
+                    }
+                }
+                digest.update(0)
+            }
+        val hex = digest.digest().take(8).joinToString("") { b -> "%02x".format(b) }
+        File(root, "fingerprint.txt").writeText(hex)
+    }
 }
 
 android {
@@ -25,8 +50,8 @@ android {
         applicationId = "dev.vitral.ime"
         minSdk = 29
         targetSdk = 35
-        versionCode = 13
-        versionName = "0.4.10"
+        versionCode = 14
+        versionName = "0.4.11"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
     buildFeatures { compose = true }

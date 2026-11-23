@@ -247,17 +247,19 @@ impl ClipboardManager {
 
     fn refresh_quick_paste(&mut self) {
         self.last_seen_copy_id = self.current.current_copy.as_ref().map(|e| e.id.clone());
-        self.quick_paste = self.current.current_copy.clone().filter(|e|
-            self.current.dismissed_copy_id.as_deref() != Some(e.id.as_str()));
+        self.quick_paste = self.current.current_copy.as_ref().filter(|e|
+            self.current.dismissed_copy_id.as_deref() != Some(e.id.as_str())).cloned();
     }
 
-    pub fn observe_current(&mut self, mut entry: ClipboardEntry) {
+    pub fn observe_current(&mut self, mut entry: ClipboardEntry) -> bool {
         entry.shortcut_code = normalize_shortcut(entry.shortcut_code.as_deref()).ok().flatten();
         if self.current.current_copy.as_ref().is_none_or(|old| copy_order(&entry) > copy_order(old)) {
             self.current.current_copy = Some(entry);
             self.current.dismissed_copy_id = None;
             self.refresh_quick_paste();
+            return true;
         }
+        false
     }
 
     pub fn push(&mut self, payload: ClipboardPayload) -> ClipboardState {
@@ -277,12 +279,20 @@ impl ClipboardManager {
     pub fn quick_paste_state(&self) -> QuickPasteState {
         QuickPasteState {
             current_copy: self.current.current_copy.clone(),
-            candidate_visible: self.ime_open && !self.hidden_for_session && self.quick_paste.is_some(),
+            candidate_visible: self.visible_quick_paste().is_some(),
             quick_paste: self.quick_paste.clone(),
             seen_while_ime_open: self.seen_while_ime_open,
             ime_open: self.ime_open,
             last_seen_copy_id: self.last_seen_copy_id.clone(),
         }
+    }
+
+    pub(crate) fn visible_quick_paste(&self) -> Option<&ClipboardEntry> {
+        self.quick_paste.as_ref().filter(|_| self.ime_open && !self.hidden_for_session)
+    }
+
+    pub(crate) fn quick_paste_id(&self) -> Option<&str> {
+        self.quick_paste.as_ref().map(|entry| entry.id.as_str())
     }
 
     pub fn consume_quick_paste(&mut self) -> QuickPasteConsumeResult {
@@ -371,6 +381,10 @@ impl ClipboardManager {
         self.ring.iter().cloned().collect()
     }
 
+    pub(crate) fn ring_matches(&self, entries: &[ClipboardEntry]) -> bool {
+        self.ring.iter().eq(entries)
+    }
+
     pub fn capacity(&self) -> usize {
         self.capacity
     }
@@ -387,12 +401,12 @@ impl ClipboardManager {
     }
 
     /// History edits never consume or replace the separately persisted current copy.
-    pub fn observe_cloud_ring(&mut self, entries: Vec<ClipboardEntry>, _first_read: bool) {
-        if let Some(newest) = entries.iter().max_by_key(|e| copy_order(e)) {
-            self.observe_current(newest.clone());
-        }
+    pub fn observe_cloud_ring(&mut self, entries: Vec<ClipboardEntry>, _first_read: bool) -> bool {
+        let current_changed = entries.iter().max_by_key(|e| copy_order(e))
+            .is_some_and(|newest| self.observe_current(newest.clone()));
         self.ring.clear();
         for entry in entries.into_iter().rev() { self.push_ring_entry(entry); }
+        current_changed
     }
 
     pub fn restore_ring_cold_boot(&mut self, entries: Vec<ClipboardEntry>) {

@@ -2,6 +2,8 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use vitral_tokens::TOKENS;
 
@@ -270,6 +272,58 @@ pub struct RetentionCrdtDelta {
     pub semantic_memories: Vec<SemanticMemoryEntry>,
 }
 
+/// A persisted collection with a lazily built index. Even direct mutations through
+/// the public collection fields invalidate the index before exposing the data.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct IndexedRetentionData<T, I> {
+    data: T,
+    #[serde(skip)]
+    index: OnceLock<I>,
+}
+
+impl<T, I> From<T> for IndexedRetentionData<T, I> {
+    fn from(data: T) -> Self {
+        Self {
+            data,
+            index: OnceLock::new(),
+        }
+    }
+}
+
+impl<T: Default, I> Default for IndexedRetentionData<T, I> {
+    fn default() -> Self {
+        T::default().into()
+    }
+}
+
+impl<T: Clone, I> Clone for IndexedRetentionData<T, I> {
+    fn clone(&self) -> Self {
+        self.data.clone().into()
+    }
+}
+
+impl<T, I> Deref for IndexedRetentionData<T, I> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.data
+    }
+}
+
+impl<T, I> DerefMut for IndexedRetentionData<T, I> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.index.take();
+        &mut self.data
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UserPhraseIndex {
+    by_reading: HashMap<String, Vec<String>>,
+    by_length: Vec<(usize, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionEngine {
     pub frecency: HashMap<String, f64>,
@@ -288,7 +342,7 @@ pub struct RetentionEngine {
     #[serde(default)]
     pub code_preferences: HashMap<String, HashMap<String, f64>>,
     #[serde(default)]
-    pub user_phrases: HashMap<String, UserPhrase>,
+    pub user_phrases: IndexedRetentionData<HashMap<String, UserPhrase>, UserPhraseIndex>,
     #[serde(default)]
     pub user_english: HashMap<String, String>,
     // Per-bucket clocks preserve corrections, including removed code preferences.
@@ -299,7 +353,8 @@ pub struct RetentionEngine {
     #[serde(default)]
     pub reranker: PersonalReranker,
     #[serde(default)]
-    pub semantic_memories: Vec<SemanticMemoryEntry>,
+    pub semantic_memories:
+        IndexedRetentionData<Vec<SemanticMemoryEntry>, HashMap<String, Vec<usize>>>,
     #[serde(skip, default)]
     pub pending_phrase_pairs: HashMap<String, u32>,
     #[serde(skip, default)]
@@ -318,13 +373,13 @@ impl Default for RetentionEngine {
             context_bigrams: HashMap::new(),
             app_frecency: HashMap::new(),
             code_preferences: HashMap::new(),
-            user_phrases: HashMap::new(),
+            user_phrases: IndexedRetentionData::default(),
             user_english: HashMap::new(),
             pending_phrase_pairs: HashMap::new(),
             habit_updated_ms: HashMap::new(),
             learned_reset_ms: 0,
             reranker: PersonalReranker::default(),
-            semantic_memories: Vec::new(),
+            semantic_memories: IndexedRetentionData::default(),
             session_cache: VecDeque::with_capacity(32),
         }
     }
@@ -558,14 +613,16 @@ impl RetentionEngine {
                 .unwrap_or(now_ms);
             weight * (-self.lambda() * (now_ms.saturating_sub(last_ms) as f64 / 1000.0)).exp()
         };
-        let app_key = normalize(app_id.unwrap_or_default());
+        let app_key = normalize_borrowed(app_id.unwrap_or_default());
         let topic_half_life = self.half_life_sec.min(600.0);
         let resonance = self
             .session_cache
             .iter()
             .filter_map(|(app, cached, timestamp)| {
                 let dt_ms = now_ms.saturating_sub(*timestamp);
-                (app == &app_key && cached == word && dt_ms as f64 <= topic_half_life * 1500.0)
+                (app == app_key.as_ref()
+                    && cached == word
+                    && dt_ms as f64 <= topic_half_life * 1500.0)
                     .then(|| {
                         1.8 * (-std::f64::consts::LN_2 * dt_ms as f64 / (topic_half_life * 1000.0))
                             .exp()
@@ -577,12 +634,12 @@ impl RetentionEngine {
         feats[2] = lookup(
             &self.context_bigrams,
             "b:",
-            &normalize(prev_context.unwrap_or_default()),
+            &normalize_borrowed(prev_context.unwrap_or_default()),
         );
         feats[3] = lookup(&self.app_frecency, "a:", &app_key);
-        let code = normalize(code);
+        let code = normalize_borrowed(code);
         feats[4] = self.code_preference_at(word, &code, now_ms);
-        feats[5] = query_vec.map_or(0.0, |v| self.query_knn_semantic(v, word, app_id, now_ms));
+        feats[5] = query_vec.map_or(0.0, |v| self.semantic_score(v, word, &app_key, now_ms));
         feats[6] = word
             .chars()
             .next()
@@ -674,13 +731,36 @@ impl RetentionEngine {
         app_id: Option<&str>,
         now_ms: u64,
     ) -> f64 {
-        if self.erased_words.contains(word) || *query_vec == [0; 32] {
+        if self.erased_words.contains(word) {
             return 0.0;
         }
-        let app = normalize(app_id.unwrap_or_default());
-        self.semantic_memories
+        self.semantic_score(
+            query_vec,
+            word,
+            &normalize_borrowed(app_id.unwrap_or_default()),
+            now_ms,
+        )
+    }
+
+    fn semantic_score(&self, query_vec: &[i8; 32], word: &str, app: &str, now_ms: u64) -> f64 {
+        if *query_vec == [0; 32] {
+            return 0.0;
+        }
+        let index = self.semantic_memories.index.get_or_init(|| {
+            let mut by_word: HashMap<String, Vec<usize>> = HashMap::new();
+            for (i, entry) in self.semantic_memories.iter().enumerate() {
+                if entry.vec_i8.len() == 32 {
+                    by_word.entry(entry.word.clone()).or_default().push(i);
+                }
+            }
+            by_word
+        });
+        let Some(indices) = index.get(word) else {
+            return 0.0;
+        };
+        indices
             .iter()
-            .filter(|e| e.word == word && e.vec_i8.len() == 32)
+            .map(|&i| &self.semantic_memories[i])
             .map(|e| {
                 let cos = cosine(query_vec, &e.vec_i8);
                 if cos <= 0.35 {
@@ -902,13 +982,52 @@ impl RetentionEngine {
         self.enforce_bounds();
     }
 
+    fn user_phrase_index(&self) -> &UserPhraseIndex {
+        self.user_phrases.index.get_or_init(|| {
+            let mut index = UserPhraseIndex::default();
+            for (key, phrase) in self.user_phrases.iter() {
+                index
+                    .by_length
+                    .push((phrase.word.chars().count(), phrase.word.clone()));
+                if let Some(code) = phrase.spaced_quanpin() {
+                    index
+                        .by_reading
+                        .entry(code.into_owned())
+                        .or_default()
+                        .push(key.clone());
+                }
+            }
+            index.by_length.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+            for keys in index.by_reading.values_mut() {
+                keys.sort_by(|a, b| {
+                    let a = &self.user_phrases[a];
+                    let b = &self.user_phrases[b];
+                    b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word))
+                });
+            }
+            index
+        })
+    }
+
     pub(crate) fn max_user_phrase_syllables(&self) -> usize {
-        self.user_phrases
-            .values()
-            .filter(|p| !self.erased_words.contains(&p.word))
-            .map(|p| p.word.chars().count())
-            .max()
+        self.user_phrase_index()
+            .by_length
+            .iter()
+            .find_map(|(len, word)| (!self.erased_words.contains(word)).then_some(*len))
             .unwrap_or(0)
+    }
+
+    pub(crate) fn user_phrases_by_reading(
+        &self,
+        reading: &str,
+    ) -> impl Iterator<Item = &UserPhrase> {
+        self.user_phrase_index()
+            .by_reading
+            .get(reading)
+            .into_iter()
+            .flatten()
+            .map(|key| &self.user_phrases[key])
+            .filter(|phrase| !self.erased_words.contains(&phrase.word))
     }
 
     pub fn query_user_phrases(&self, compact_code: &str, is_flypy: bool) -> Vec<&UserPhrase> {
@@ -1205,24 +1324,28 @@ impl RetentionEngine {
     }
 
     pub fn export_crdt_delta(&self, device_id: &str) -> RetentionCrdtDelta {
+        self.clone().into_crdt_delta(device_id.to_string(), Self::now_epoch_ms())
+    }
+
+    pub(crate) fn into_crdt_delta(self, device_id: String, timestamp_ms: u64) -> RetentionCrdtDelta {
         RetentionCrdtDelta {
             schema_version: 1,
-            device_id: device_id.to_string(),
+            device_id,
             seq: self.crdt_seq,
-            timestamp_ms: Self::now_epoch_ms(),
-            frecency: self.frecency.clone(),
-            frecency_updated_ms: self.frecency_updated_ms.clone(),
-            pinned_words: self.pinned_words.iter().cloned().collect(),
-            erased_words: self.erased_words.iter().cloned().collect(),
-            context_bigrams: self.context_bigrams.clone(),
-            app_frecency: self.app_frecency.clone(),
-            code_preferences: self.code_preferences.clone(),
-            user_phrases: self.user_phrases.clone(),
-            user_english: self.user_english.clone(),
-            habit_updated_ms: self.habit_updated_ms.clone(),
+            timestamp_ms,
+            frecency: self.frecency,
+            frecency_updated_ms: self.frecency_updated_ms,
+            pinned_words: self.pinned_words.into_iter().collect(),
+            erased_words: self.erased_words.into_iter().collect(),
+            context_bigrams: self.context_bigrams,
+            app_frecency: self.app_frecency,
+            code_preferences: self.code_preferences,
+            user_phrases: self.user_phrases.data,
+            user_english: self.user_english,
+            habit_updated_ms: self.habit_updated_ms,
             learned_reset_ms: self.learned_reset_ms,
-            reranker: Some(self.reranker.clone()),
-            semantic_memories: self.semantic_memories.clone(),
+            reranker: Some(self.reranker),
+            semantic_memories: self.semantic_memories.data,
         }
     }
 
@@ -1338,7 +1461,7 @@ impl RetentionEngine {
                 self.reranker = remote.clone();
             }
         }
-        let mut memories = self.semantic_memories.clone();
+        let mut memories = self.semantic_memories.data.clone();
         memories.extend(
             delta
                 .semantic_memories
@@ -1384,6 +1507,15 @@ impl RetentionEngine {
 
 fn normalize(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+fn normalize_borrowed(value: &str) -> Cow<'_, str> {
+    let value = value.trim();
+    if value.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(value.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(value)
+    }
 }
 
 pub(crate) fn is_cjk(ch: char) -> bool {
@@ -1512,6 +1644,154 @@ pub fn is_voice_hold_triggered(hold_ms: u32) -> bool {
 #[cfg(test)]
 mod personalization_tests {
     use super::*;
+
+    fn assert_derived_indices(retention: &RetentionEngine) {
+        let phrases = retention
+            .user_phrases
+            .values()
+            .filter(|p| !retention.erased_words.contains(&p.word));
+        let max_len = phrases
+            .clone()
+            .map(|p| p.word.chars().count())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(retention.max_user_phrase_syllables(), max_len);
+        let mut readings: HashMap<_, Vec<_>> = HashMap::new();
+        for phrase in phrases {
+            if let Some(reading) = phrase.spaced_quanpin() {
+                readings.entry(reading).or_default().push(phrase);
+            }
+        }
+        for reading in retention.user_phrase_index().by_reading.keys() {
+            let mut expected = readings.remove(reading.as_str()).unwrap_or_default();
+            expected.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word)));
+            assert_eq!(
+                retention
+                    .user_phrases_by_reading(reading)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(readings.is_empty());
+
+        let query = [4; 32];
+        let now_ms = 5_000_u64;
+        let words: HashSet<_> = retention
+            .semantic_memories
+            .iter()
+            .map(|e| e.word.as_str())
+            .chain(["不存在"])
+            .collect();
+        for word in words {
+            let expected = if retention.erased_words.contains(word) {
+                0.0
+            } else {
+                retention
+                    .semantic_memories
+                    .iter()
+                    .filter(|e| e.word == word && e.vec_i8.len() == 32)
+                    .map(|entry| {
+                        let similarity = cosine(&query, &entry.vec_i8);
+                        if similarity <= 0.35 {
+                            return 0.0;
+                        }
+                        let decay = (-retention.lambda()
+                            * (now_ms.saturating_sub(entry.updated_ms) as f64 / 1000.0))
+                            .exp();
+                        let app_weight = if entry.app_id == "editor" { 1.2 } else { 0.85 };
+                        ((similarity - 0.35) / 0.65)
+                            * (1.0 + f64::from(entry.count).ln())
+                            * decay
+                            * app_weight
+                    })
+                    .sum::<f64>()
+                    .clamp(0.0, 2.0)
+            };
+            assert_eq!(
+                retention.query_knn_semantic(&query, word, Some(" EDITOR "), now_ms),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn derived_indices_follow_learning_erasure_pruning_sync_and_snapshot_load() {
+        let mut local = RetentionEngine::default();
+        assert_derived_indices(&local);
+        for word in ["你好", "拟好", "理发店"] {
+            let (pinyin, xiaohe) = if word == "理发店" {
+                ("li fa dian", "lifadm")
+            } else {
+                ("ni hao", "nihc")
+            };
+            local.register_typed_phrase(word, pinyin, xiaohe, 100);
+            local.record_semantic_memory([4; 32], word, Some("editor"), 100);
+        }
+        local.record_semantic_memory([4; 32], "你好", Some("other"), 200);
+        assert_derived_indices(&local);
+
+        // Public mutation must invalidate a warm index even when collection lengths stay fixed.
+        local.user_phrases.get_mut("拟好").unwrap().count = 7;
+        local.user_phrases.get_mut("理发店").unwrap().quanpin = "li fa tan".into();
+        local.semantic_memories.swap(0, 1);
+        local.semantic_memories[0].word = "你好".into();
+        assert_derived_indices(&local);
+        local.erase_word("理发店");
+        assert_derived_indices(&local);
+        local.pin_word("理发店");
+        assert_derived_indices(&local);
+
+        let mut remote = local.clone();
+        assert_derived_indices(&remote);
+        remote.register_typed_phrase("理发店", "li fa dian", "lifadm", 300);
+        remote.record_semantic_memory([4; 32], "新词", None, 300);
+        local.merge_crdt_delta(&remote.export_crdt_delta("remote"));
+        assert_derived_indices(&local);
+        assert_eq!(local.user_phrases["理发店"].updated_ms, 300);
+        assert!(local.query_knn_semantic(&[4; 32], "新词", None, 300) > 0.0);
+
+        let mut template = local.user_phrases["你好"].clone();
+        template.count = 1;
+        template.updated_ms = 1;
+        local.user_phrases.extend((0..1024).map(|i| {
+            let word = format!("词{}", char::from_u32(0x4e00 + i).unwrap());
+            (
+                word.clone(),
+                UserPhrase {
+                    word,
+                    ..template.clone()
+                },
+            )
+        }));
+        local
+            .semantic_memories
+            .extend((0..512).map(|i| SemanticMemoryEntry {
+                word: format!("词{i}"),
+                vec_i8: vec![4; 32],
+                app_id: "editor".into(),
+                count: 1,
+                updated_ms: 1,
+            }));
+        assert_derived_indices(&local);
+        local.enforce_bounds();
+        assert_eq!(local.user_phrases.len(), 1024);
+        assert_eq!(local.semantic_memories.len(), 512);
+        assert_derived_indices(&local);
+
+        let snapshot = serde_json::to_value(&local).unwrap();
+        let delta = serde_json::to_value(local.export_crdt_delta("local")).unwrap();
+        for field in ["user_phrases", "semantic_memories"] {
+            assert_eq!(snapshot[field], delta[field]);
+        }
+        let mut restored: RetentionEngine = serde_json::from_value(snapshot.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&restored).unwrap(), snapshot);
+        assert_derived_indices(&restored);
+        restored.clear_learned_habits();
+        assert_derived_indices(&restored);
+        local.merge_crdt_delta(&restored.export_crdt_delta("reset"));
+        assert_derived_indices(&local);
+        assert!(local.user_phrases.is_empty() && local.semantic_memories.is_empty());
+    }
 
     #[test]
     fn single_character_history_is_isolated_by_reading() {

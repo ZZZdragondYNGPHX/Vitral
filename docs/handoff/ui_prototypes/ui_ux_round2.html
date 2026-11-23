@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-anim { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .tap-s:active { transform: scale(0.94); }
+    .tabular { font-variant-numeric: tabular-nums; }
+    @keyframes wavePulse {
+      0%, 100% { transform: scaleY(0.35); opacity: 0.6; }
+      50% { transform: scaleY(1); opacity: 1; }
+    }
+    .wave-bar { animation: wavePulse 750ms ease-in-out infinite; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-1.5 space-y-2">
+    <!-- Top Round 2 Workbench Controls -->
+    <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="setPane('ergo')" id="pbtn-ergo" class="px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]">1. 手机 1/4 停靠 & 键帽微交互</button>
+        <button onclick="setPane('float')" id="pbtn-float" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">2. 小窗悬浮 (可拖拽 & 自由拉伸)</button>
+        <button onclick="setPane('toolbar')" id="pbtn-toolbar" class="px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]">3. 胶囊工具栏编排 & 贴边隐身</button>
+      </div>
+
+      <button onclick="toggleTheme()" id="btn-theme" class="px-2.5 py-1 rounded-lg border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-anim">晶透毛玻璃: 深色</button>
+    </div>
+
+    <!-- Frosted Glass Stage (Fixed 362px height, zero scrollbars) -->
+    <div id="stage" class="rounded-xl relative overflow-hidden ime-anim" style="height:362px;">
+      <!-- Luminous wallpaper blobs behind glass so translucency & blur truly shine -->
+      <div class="pointer-events-none absolute -top-12 left-10 w-56 h-56 rounded-full" style="background:radial-gradient(circle, rgba(14,165,233,0.32) 0%, transparent 70%); filter:blur(22px);"></div>
+      <div class="pointer-events-none absolute bottom-0 right-12 w-64 h-64 rounded-full" style="background:radial-gradient(circle, rgba(99,102,241,0.26) 0%, rgba(16,185,129,0.12) 60%, transparent 75%); filter:blur(26px);"></div>
+
+      <!-- ================= PANE 1: MOBILE 1/4 DOCKED & KEYCAP ERGONOMICS ================= -->
+      <div id="pane-ergo" class="h-full flex flex-col justify-between px-4 py-2.5 relative z-10">
+        <!-- Interactive Knobs for Round 2 Decisions -->
+        <div class="flex flex-wrap items-center justify-between gap-1.5 text-xs" id="ergo-ctrl">
+          <div class="flex items-center gap-1">
+            <button onclick="cycleSubMode()" id="btn-submode" class="px-2 py-0.5 rounded-full ime-anim"></button>
+            <button onclick="togglePressStyle()" id="btn-press" class="px-2 py-0.5 rounded-full ime-anim"></button>
+          </div>
+          <div class="flex items-center gap-1">
+            <button onclick="adjustKbHeight(-8)" class="px-1.5 py-0.5 rounded-full ime-anim" title="调低高度">高度 −</button>
+            <button onclick="resetKbHeight()" id="btn-h-readout" class="px-2 py-0.5 rounded-full tabular ime-anim" title="点击一键重置高度">1/4 标准高 (重置)</button>
+            <button onclick="adjustKbHeight(8)" class="px-1.5 py-0.5 rounded-full ime-anim" title="调高高度">高度 +</button>
+          </div>
+        </div>
+
+        <!-- Simulated Phone Viewport Bottom Area -->
+        <div class="w-full max-w-md mx-auto flex flex-col justify-end flex-1 pt-1.5">
+          <!-- Simulated App Input Field Focus -->
+          <div id="mob-app-input" class="mb-2 px-3 py-1.5 rounded-xl text-xs flex items-center justify-between ime-anim">
+            <div class="flex items-center gap-1">
+              <span id="mob-committed">点击输入框已弹出 1/4 双层常驻键盘</span>
+              <span class="inline-block w-0.5 h-3.5 bg-sky-400 animate-pulse"></span>
+            </div>
+            <span class="opacity-50 tabular text-[11px]">26% 屏高</span>
+          </div>
+
+          <!-- FROSTED GLASS DOCKED KEYBOARD -->
+          <div id="docked-kb" class="rounded-2xl px-2 py-1.5 space-y-1 relative ime-anim">
+            <!-- Floating Key Bubble Preview (Only visible when 'bubble' mode active & key pressed) -->
+            <div id="key-bubble" class="hidden pointer-events-none absolute -top-9 px-3 py-1 rounded-xl text-sm font-semibold z-30 ime-anim">Q</div>
+
+            <!-- Row 1: Always-On Pure SVG Icon Toolbar -->
+            <div id="ergo-toolbar" class="flex items-center justify-between px-1 pb-1"></div>
+
+            <!-- Row 2: Horizontal 5-Candidate Bar -->
+            <div id="ergo-candbar" class="flex items-center justify-between px-1.5 py-0.5 text-xs"></div>
+
+            <!-- Row 3: Either 26-Key Grid OR 9-Grid Numpad -->
+            <div id="ergo-keys"></div>
+
+            <!-- Row 4: Bottom Bar (123 toggle + Spacebar with Hold-to-Voice Wave + Enter) -->
+            <div id="ergo-bottom" class="grid grid-cols-12 gap-1 pt-0.5 items-center"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= PANE 2: FLOATING FREE-DRAG & FREE-RESIZE MINI WINDOW ================= -->
+      <div id="pane-float" class="hidden h-full relative z-10 p-3">
+        <div class="flex items-center justify-between text-xs mb-1" id="float-hint">
+          <span>按住小窗顶部「胶囊横条」任意拖拽位置 · 按住右下角「微光弧标 ◢」无级自由拉伸宽高</span>
+          <div class="flex items-center gap-1.5">
+            <button onclick="resetFloatRect()" class="px-2 py-0.5 rounded-full ime-anim" id="btn-float-reset">重置小窗尺寸</button>
+            <button onclick="setPane('ergo')" class="px-2 py-0.5 rounded-full ime-anim" id="btn-float-dock">切回底部 1/4 停靠</button>
+          </div>
+        </div>
+
+        <!-- Background Simulated App Content behind Floating Keyboard -->
+        <div id="float-bg-card" class="rounded-xl p-3 text-xs space-y-1.5 opacity-65 pointer-events-none">
+          <div class="font-medium">底层应用窗口（小窗模式不遮挡底部视野，可任意悬停）</div>
+          <div class="opacity-75">无论在平板分屏、竖屏阅读还是单手握持场景下，晶透毛玻璃小窗均可自由缩放至最趁手的比例。</div>
+        </div>
+
+        <!-- DRAGGABLE & RESIZABLE FROSTED GLASS MINI KEYBOARD -->
+        <div id="float-win" class="absolute rounded-2xl p-2 flex flex-col justify-between shadow-2xl" style="left:110px; top:76px; width:310px; height:236px;">
+          <!-- Top Drag Handle Pill + Quick Dock Icon -->
+          <div id="float-drag-handle" class="flex items-center justify-between px-1 pb-0.5 cursor-move">
+            <span class="w-4"></span>
+            <div class="w-10 h-1 rounded-full bg-current opacity-35 hover:opacity-75 ime-anim" title="按住拖拽移动小窗"></div>
+            <button onclick="setPane('ergo')" class="opacity-65 hover:opacity-100 text-[11px]" title="停靠回底部">⤓</button>
+          </div>
+
+          <!-- Compact Pure Icon Toolbar + Candidate Row -->
+          <div id="float-top-bars" class="space-y-0.5"></div>
+
+          <!-- Scalable Mini Keys -->
+          <div id="float-keys" class="flex-1 flex flex-col justify-center gap-1 py-0.5"></div>
+
+          <!-- Bottom-Right Free Resize Corner Handle -->
+          <div id="float-resize-handle" class="absolute right-1 bottom-1 w-5 h-5 flex items-end justify-end cursor-nwse-resize opacity-70 hover:opacity-100" title="按住自由拉伸大小">
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M10 3v7H3"/><path d="M10 7v3H7"/></svg>
+          </div>
+        </div>
+      </div>
+
+      <!-- ================= PANE 3: CAPSULE TOOLBAR EDITOR & AUTO-FADE / EDGE-HIDE ================= -->
+      <div id="pane-toolbar" class="hidden h-full flex flex-col justify-between p-4 relative z-10">
+        <div class="flex flex-wrap items-center justify-between gap-2 text-xs" id="tb-ctrl">
+          <div class="flex items-center gap-1.5">
+            <button onclick="toggleEditBar()" id="btn-edit-bar" class="px-2.5 py-0.5 rounded-full font-medium ime-anim"></button>
+            <button onclick="setIdleDemo('active')" id="btn-idle-0" class="px-2 py-0.5 rounded-full ime-anim">活跃晶透态</button>
+            <button onclick="setIdleDemo('fade')" id="btn-idle-1" class="px-2 py-0.5 rounded-full ime-anim">闲置半透明淡化</button>
+            <button onclick="setIdleDemo('edge')" id="btn-idle-2" class="px-2 py-0.5 rounded-full ime-anim">贴边半隐态</button>
+          </div>
+          <span id="tb-status-msg" class="opacity-80">编辑态：点「−」移除图标，点下方组件库「+」添加，点「✓」保存</span>
+        </div>
+
+        <!-- Component Pool Drawer (Frosted Card) -->
+        <div id="tb-pool-card" class="rounded-2xl p-3 space-y-2 ime-anim max-w-xl mx-auto w-full">
+          <div class="flex items-center justify-between text-xs opacity-80">
+            <span>可扩展纯图标组件库（仅在编排抽屉内展示文字说明，工具栏本体保持 100% 纯图标）</span>
+            <span class="tabular" id="tb-count-badge"></span>
+          </div>
+          <div id="tb-pool-grid" class="grid grid-cols-4 gap-2 text-xs"></div>
+        </div>
+
+        <!-- Simulated Desktop Bottom-Right Corner with Full-Capsule Pill -->
+        <div class="flex items-center justify-between pt-1 relative overflow-hidden">
+          <span class="text-xs opacity-60">桌面右下角预览（横排 5 候选与圆润胶囊风格统一）：</span>
+          <div id="tb-capsule-preview" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full ime-anim"></div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const SVG = {
+      logo: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 9l8 12 8-12-8-6Z"/><path d="M4 9h16"/></svg>`,
+      clipboard: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg>`,
+      phrases: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M8 9h8"/><path d="M8 13h5"/></svg>`,
+      transfer: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4 20-7z"/></svg>`,
+      mic: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 10a7 7 0 0 0 14 0"/><path d="M12 17v4"/></svg>`,
+      translate: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>`,
+      floatWin: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><rect x="9" y="10" width="9" height="8" rx="1.5"/></svg>`,
+      recorder: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor"/></svg>`,
+      lexicon: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`,
+      collapse: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>`,
+      shift: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4 4 13h5v7h6v-7h5L12 4z"/></svg>`,
+      bs: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/><path d="m18 9-6 6"/><path d="m12 9 6 6"/></svg>`,
+      enter: `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 10l-5 5 5 5"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>`,
+      check: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>`
+    };
+
+    // Key rows: [Letter, SwipeUpSymbol, XiaoheFlypy]
+    const ROWS = [
+      [['Q','1','iu'],['W','2','ei'],['E','3','e'],['R','4','uan'],['T','5','ue'],['Y','6','un'],['U','7','sh'],['I','8','ch'],['O','9','uo'],['P','0','ie']],
+      [['A','@','a'],['S','#','ong'],['D','¥','ai'],['F','%','en'],['G','&','eng'],['H','*','ang'],['J','-','an'],['K','+','ing'],['L','/','uang']],
+      [['SHIFT','',''],['Z','(','ou'],['X',')','ia'],['C','!','ao'],['V','?','zh'],['B',':','in'],['N','"','iao'],['M',';','ian'],['BS','','']]
+    ];
+
+    const ALL_TOOLS = [
+      { id: 'clipboard', label: '剪贴板 (N条)' },
+      { id: 'transfer',  label: '隔空闪传' },
+      { id: 'mic',       label: '离线语音' },
+      { id: 'translate', label: '边写边译' },
+      { id: 'phrases',   label: '常用语' },
+      { id: 'floatWin',  label: '小窗悬浮' },
+      { id: 'lexicon',   label: '词库直导' },
+      { id: 'recorder',  label: 'AI 录音笔' }
+    ];
+
+    let st = {
+      pane: 'ergo',
+      dark: true,
+      subMode: 0,      // 0 = 仅上滑符号(推荐), 1 = 对角双副标(上滑+小鹤), 2 = 纯字母禅意
+      pressGlow: true, // true = 原位流光点亮, false = 晶透悬浮气泡
+      numpad: false,
+      voiceActive: false,
+      keyH: 34,        // default compact 1/4 height per key row (px)
+      activeKey: null,
+      editingBar: true,
+      pinnedTools: ['clipboard', 'transfer', 'mic'],
+      idleState: 'active' // 'active' | 'fade' | 'edge'
+    };
+
+    function glassTheme() {
+      const d = st.dark;
+      return {
+        stageBg: d ? '#0b0e15' : '#e4eaf3',
+        shellBg: d ? 'rgba(24, 29, 42, 0.68)' : 'rgba(255, 255, 255, 0.72)',
+        shellBorder: d ? 'rgba(255,255,255,0.16)' : 'rgba(255,255,255,0.88)',
+        keyBg: d ? 'rgba(255,255,255,0.08)' : 'rgba(255,255,255,0.86)',
+        keyGlowBg: d ? 'rgba(56,189,248,0.34)' : 'rgba(14,165,233,0.26)',
+        fnBg: d ? 'rgba(255,255,255,0.04)' : 'rgba(15,23,42,0.06)',
+        accent: d ? '#0ea5e9' : '#0284c7',
+        accentSoft: d ? 'rgba(14,165,233,0.20)' : 'rgba(2,132,199,0.14)',
+        accentText: d ? '#7dd3fc' : '#0369a1',
+        text: d ? '#f8fafc' : '#0f172a',
+        muted: d ? '#94a3b8' : '#64748b',
+        shadow: d ? '0 16px 38px rgba(0,0,0,0.50)' : '0 12px 30px rgba(15,23,42,0.10)'
+      };
+    }
+
+    function render() {
+      const g = glassTheme();
+      const stage = document.getElementById('stage');
+      stage.style.background = g.stageBg;
+      stage.style.border = `1px solid ${g.shellBorder}`;
+      document.getElementById('btn-theme').textContent = '晶透毛玻璃: ' + (st.dark ? '深色' : '浅色冰晶');
+
+      renderErgo(g);
+      renderFloat(g);
+      renderToolbarEditor(g);
+    }
+
+    function renderErgo(g) {
+      const subNames = ['副标: 仅上滑数字/符号 (清爽推荐)', '副标: 对角双副标 (上滑+小鹤)', '副标: 无副标纯字母禅意'];
+      const bSub = document.getElementById('btn-submode');
+      bSub.textContent = subNames[st.subMode];
+      bSub.style.background = g.accentSoft;
+      bSub.style.color = g.accentText;
+
+      const bPress = document.getElementById('btn-press');
+      bPress.textContent = st.pressGlow ? '按压反馈: 键帽原位流光' : '按压反馈: 晶透上浮气泡';
+      bPress.style.background = g.fnBg;
+      bPress.style.color = g.text;
+
+      ['btn-h-readout'].forEach(id => {
+        const el = document.getElementById(id);
+        el.style.background = g.fnBg;
+        el.style.color = g.muted;
+        el.textContent = st.keyH === 34 ? '1/4 标准高 (点此重置)' : `自定义行高 ${st.keyH}px (重置)`;
+      });
+
+      const appIn = document.getElementById('mob-app-input');
+      appIn.style.background = g.shellBg;
+      appIn.style.border = `1px solid ${g.shellBorder}`;
+      appIn.style.color = g.text;
+      appIn.style.backdropFilter = 'blur(14px)';
+
+      const kb = document.getElementById('docked-kb');
+      kb.style.background = g.shellBg;
+      kb.style.border = `1px solid ${g.shellBorder}`;
+      kb.style.boxShadow = g.shadow;
+      kb.style.backdropFilter = 'blur(18px)';
+
+      // Always-on Top Pure SVG Icon Toolbar (with Float-Window shortcut!)
+      const tbar = document.getElementById('ergo-toolbar');
+      tbar.style.borderBottom = `1px solid ${g.shellBorder}`;
+      const barIcons = [
+        { id: 'clipboard', fn: '' },
+        { id: 'phrases', fn: '' },
+        { id: 'mic', fn: 'toggleVoice()' },
+        { id: 'transfer', fn: '' },
+        { id: 'floatWin', fn: "setPane('float')" },
+        { id: 'recorder', fn: '' }
+      ];
+      tbar.innerHTML = `
+        <button class="w-7 h-6 flex items-center justify-center tap-s" style="color:${g.accentText};">${SVG.logo}</button>
+        <div class="flex items-center gap-3.5">
+          ${barIcons.map(it => `<button onclick="${it.fn}" class="w-7 h-6 flex items-center justify-center opacity-85 hover:opacity-100 tap-s" style="color:${it.id === 'floatWin' ? g.accentText : g.text};" title="${it.id === 'floatWin' ? '切换小窗显示' : ''}">${SVG[it.id]}</button>`).join('')}
+        </div>
+        <button class="w-7 h-6 flex items-center justify-center opacity-70 tap-s" style="color:${g.muted};">${SVG.collapse}</button>
+      `;
+
+      // Fixed 5-Candidate Horizontal Strip
+      const cbar = document.getElementById('ergo-candbar');
+      const fiveCands = ['小鹤双拼', '晶透质感', '喜欢', '信号', '学会'];
+      cbar.innerHTML = `
+        <div class="flex items-center gap-1.5 overflow-hidden">
+          <span class="font-mono text-[11px] px-1.5 py-0.5 rounded-full" style="background:${g.fnBg}; color:${g.accentText};">xh'sp</span>
+          ${fiveCands.map((w, idx) => idx === 0
+            ? `<span class="px-2.5 py-0.5 rounded-full font-medium" style="background:${g.accent}; color:#fff;">${w}</span>`
+            : `<span class="px-1.5 py-0.5" style="color:${idx < 2 ? g.text : g.muted};">${w}</span>`
+          ).join('')}
+        </div>
+      `;
+
+      const keysBox = document.getElementById('ergo-keys');
+      if (st.numpad) {
+        // Frosted Glass 9-Grid Number Pad
+        const syms = ['+', '-', '×', '÷'];
+        const nums = [['1','2','3'],['4','5','6'],['7','8','9']];
+        keysBox.innerHTML = `<div class="grid grid-cols-12 gap-1 pt-0.5">
+          <div class="col-span-3 flex flex-col gap-1">
+            ${syms.map(s => `<button class="rounded-xl text-xs font-medium tap-s flex items-center justify-center" style="height:${Math.round(st.keyH*0.73)}px; background:${g.fnBg}; color:${g.muted};">${s}</button>`).join('')}
+          </div>
+          <div class="col-span-6 grid grid-cols-3 gap-1">
+            ${nums.flat().map(n => `<button class="rounded-xl text-sm font-semibold tabular tap-s flex items-center justify-center" style="height:${st.keyH}px; background:${g.keyBg}; color:${g.text};">${n}</button>`).join('')}
+          </div>
+          <div class="col-span-3 flex flex-col gap-1">
+            <button class="rounded-xl flex-1 tap-s flex items-center justify-center" style="background:${g.fnBg}; color:${g.text};">${SVG.bs}</button>
+            <button class="rounded-xl flex-1 text-sm font-semibold tap-s flex items-center justify-center" style="background:${g.keyBg}; color:${g.text};">0</button>
+            <button onclick="toggleNumpad()" class="rounded-xl flex-1 text-xs font-medium tap-s flex items-center justify-center" style="background:${g.accentSoft}; color:${g.accentText};">返回拼音</button>
+          </div>
+        </div>`;
+      } else {
+        keysBox.innerHTML = `<div class="space-y-1">` + ROWS.map((row, rIdx) => {
+          const pad = rIdx === 1 ? 'px-3.5' : '';
+          return `<div class="flex justify-center gap-1 ${pad}">` + row.map(([k, up, fly]) => {
+            const isFn = k === 'SHIFT' || k === 'BS';
+            const wCls = isFn ? 'w-10' : 'flex-1';
+            const isPressed = st.activeKey === k && st.pressGlow;
+            const bg = isPressed ? g.keyGlowBg : (isFn ? g.fnBg : g.keyBg);
+            const border = isPressed ? `1px solid ${g.accent}` : '1px solid transparent';
+
+            if (isFn) {
+              return `<button class="${wCls} rounded-xl tap-s flex items-center justify-center ime-anim" style="height:${st.keyH}px; background:${bg}; color:${g.text};">${k === 'SHIFT' ? SVG.shift : SVG.bs}</button>`;
+            }
+
+            let subTop = '';
+            let subBot = '';
+            if (st.subMode === 0) {
+              subTop = `<span class="absolute top-0.5 right-1 text-[9px] leading-none opacity-65 tabular" style="color:${g.muted};">${up}</span>`;
+            } else if (st.subMode === 1) {
+              subTop = `<span class="absolute top-0.5 left-1 text-[8px] leading-none opacity-55 tabular" style="color:${g.muted};">${up}</span>`;
+              subBot = `<span class="absolute bottom-0.5 right-1 text-[8px] leading-none opacity-80" style="color:${g.accentText};">${fly}</span>`;
+            }
+
+            return `<button onmousedown="pressKey(event, '${k}')" onmouseup="releaseKey()" onmouseleave="releaseKey()" class="${wCls} relative rounded-xl tap-s flex items-center justify-center ime-anim" style="height:${st.keyH}px; background:${bg}; color:${g.text}; border:${border};">
+              ${subTop}
+              <span class="text-xs font-medium">${k}</span>
+              ${subBot}
+            </button>`;
+          }).join('') + `</div>`;
+        }).join('') + `</div>`;
+      }
+
+      // Bottom Row with In-Place Voice Waveform on Spacebar
+      const bot = document.getElementById('ergo-bottom');
+      const spaceInner = st.voiceActive
+        ? `<div class="flex items-center gap-1" style="color:${g.accentText};">
+            <span class="w-0.5 h-3 bg-sky-400 wave-bar"></span>
+            <span class="w-0.5 h-4 bg-sky-400 wave-bar" style="animation-delay:120ms"></span>
+            <span class="w-0.5 h-2.5 bg-sky-400 wave-bar" style="animation-delay:240ms"></span>
+            <span class="text-xs font-medium ml-1">离线语音聆听中 (点此结束)</span>
+           </div>`
+        : `<span class="text-xs font-medium" style="color:${g.text};">鹤</span><span class="text-[11px] opacity-60" style="color:${g.muted};">· 点此体验语音声波</span>`;
+
+      bot.innerHTML = `
+        <button onclick="toggleNumpad()" class="col-span-2 h-8 rounded-xl text-xs font-medium tap-s flex items-center justify-center" style="background:${st.numpad ? g.accentSoft : g.fnBg}; color:${st.numpad ? g.accentText : g.muted};">123</button>
+        <button class="col-span-1 h-8 rounded-xl text-xs tap-s flex items-center justify-center" style="background:${g.fnBg}; color:${g.muted};">，</button>
+        <button onclick="toggleVoice()" class="col-span-6 h-8 rounded-xl tap-s flex items-center justify-center gap-1 ime-anim" style="background:${st.voiceActive ? g.accentSoft : g.keyBg}; border:1px solid ${st.voiceActive ? g.accent : 'transparent'};">
+          ${spaceInner}
+        </button>
+        <button class="col-span-1 h-8 rounded-xl text-xs tap-s flex items-center justify-center" style="background:${g.fnBg}; color:${g.muted};">。</button>
+        <button class="col-span-2 h-8 rounded-xl tap-s flex items-center justify-center" style="background:${g.accent}; color:#fff;">${SVG.enter}</button>
+      `;
+    }
+
+    function renderFloat(g) {
+      document.getElementById('float-hint').style.color = g.muted;
+      ['btn-float-reset', 'btn-float-dock'].forEach(id => {
+        const el = document.getElementById(id);
+        el.style.background = g.shellBg;
+        el.style.border = `1px solid ${g.shellBorder}`;
+        el.style.color = g.text;
+      });
+
+      const bgCard = document.getElementById('float-bg-card');
+      bgCard.style.background = g.fnBg;
+      bgCard.style.border = `1px solid ${g.shellBorder}`;
+      bgCard.style.color = g.text;
+
+      const win = document.getElementById('float-win');
+      win.style.background = g.shellBg;
+      win.style.border = `1px solid ${g.shellBorder}`;
+      win.style.boxShadow = g.shadow;
+      win.style.backdropFilter = 'blur(20px)';
+      win.style.color = g.text;
+
+      document.getElementById('float-top-bars').innerHTML = `
+        <div class="flex items-center justify-between px-1 py-0.5" style="border-bottom:1px solid ${g.shellBorder};">
+          <span style="color:${g.accentText};">${SVG.logo}</span>
+          <div class="flex items-center gap-2.5 opacity-85">${['clipboard','mic','transfer','translate'].map(k => SVG[k]).join('')}</div>
+          <span class="opacity-60">${SVG.collapse}</span>
+        </div>
+        <div class="flex items-center gap-1.5 px-1 py-0.5 text-[11px] overflow-hidden">
+          <span class="px-2 py-0.5 rounded-full font-medium" style="background:${g.accent}; color:#fff;">小鹤</span>
+          <span>晶透</span><span class="opacity-70">悬浮</span><span class="opacity-70">自由</span><span class="opacity-70">拉伸</span>
+        </div>
+      `;
+
+      const fk = document.getElementById('float-keys');
+      fk.innerHTML = ROWS.map((row, rIdx) => {
+        const pad = rIdx === 1 ? 'px-2.5' : '';
+        return `<div class="flex flex-1 gap-1 ${pad}">` + row.map(([k]) => {
+          const isFn = k === 'SHIFT' || k === 'BS';
+          const lbl = k === 'SHIFT' ? '⇧' : (k === 'BS' ? '⌫' : k);
+          return `<div class="${isFn ? 'w-7' : 'flex-1'} rounded-lg flex items-center justify-center text-[11px] font-medium" style="background:${isFn ? g.fnBg : g.keyBg}; color:${g.text};">${lbl}</div>`;
+        }).join('') + `</div>`;
+      }).join('');
+    }
+
+    function renderToolbarEditor(g) {
+      const bEdit = document.getElementById('btn-edit-bar');
+      bEdit.textContent = st.editingBar ? '✓ 完成保存胶囊' : '✎ 进入编辑态';
+      bEdit.style.background = st.editingBar ? g.accent : g.accentSoft;
+      bEdit.style.color = st.editingBar ? '#ffffff' : g.accentText;
+
+      [['active','btn-idle-0'],['fade','btn-idle-1'],['edge','btn-idle-2']].forEach(([mode, id]) => {
+        const el = document.getElementById(id);
+        const on = st.idleState === mode;
+        el.style.background = on ? g.accentSoft : g.fnBg;
+        el.style.color = on ? g.accentText : g.muted;
+      });
+
+      const poolCard = document.getElementById('tb-pool-card');
+      poolCard.style.background = g.shellBg;
+      poolCard.style.border = `1px solid ${g.shellBorder}`;
+      poolCard.style.backdropFilter = 'blur(18px)';
+      poolCard.style.color = g.text;
+
+      document.getElementById('tb-count-badge').textContent = `已固定 ${st.pinnedTools.length} 个扩展图标`;
+
+      document.getElementById('tb-pool-grid').innerHTML = ALL_TOOLS.map(t => {
+        const added = st.pinnedTools.includes(t.id);
+        return `<button onclick="togglePinTool('${t.id}')" class="px-2.5 py-2 rounded-xl flex items-center justify-between ime-anim tap-s" style="background:${added ? g.accentSoft : g.keyBg}; border:1px solid ${added ? g.accent : 'transparent'}; color:${g.text};">
+          <span class="flex items-center gap-1.5">${SVG[t.id]}<span>${t.label}</span></span>
+          <span class="font-bold text-xs" style="color:${added ? g.accentText : g.muted};">${added ? '−' : '+'}</span>
+        </button>`;
+      }).join('');
+
+      const cap = document.getElementById('tb-capsule-preview');
+      cap.style.background = g.shellBg;
+      cap.style.border = `1px solid ${g.shellBorder}`;
+      cap.style.boxShadow = g.shadow;
+      cap.style.backdropFilter = 'blur(18px)';
+      cap.style.color = g.text;
+      cap.style.opacity = st.idleState === 'fade' ? '0.32' : '1';
+      cap.style.transform = st.idleState === 'edge' ? 'translateX(72%)' : 'translateX(0)';
+
+      const pinnedHtml = st.pinnedTools.map(id => `
+        <div class="relative w-7 h-7 flex items-center justify-center rounded-full" style="background:${g.fnBg};">
+          ${SVG[id]}
+          ${st.editingBar ? `<button onclick="togglePinTool('${id}')" class="absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full flex items-center justify-center text-[10px] leading-none font-bold" style="background:#ef4444; color:#fff;" title="移除">−</button>` : ''}
+        </div>
+      `).join('');
+
+      const confirmHtml = st.editingBar
+        ? `<button onclick="toggleEditBar()" class="w-7 h-7 rounded-full flex items-center justify-center tap-s" style="background:${g.accent}; color:#fff;" title="确认保存">${SVG.check}</button>`
+        : '';
+
+      cap.innerHTML = `
+        <span class="w-7 h-7 flex items-center justify-center" style="color:${g.accentText};">${SVG.logo}</span>
+        <span class="w-7 h-7 rounded-full flex items-center justify-center text-xs font-semibold" style="background:${g.keyBg};">中</span>
+        ${st.pinnedTools.length ? `<span class="w-px h-3.5" style="background:${g.shellBorder};"></span>` : ''}
+        ${pinnedHtml}
+        ${confirmHtml}
+      `;
+    }
+
+    function setPane(p) {
+      st.pane = p;
+      ['ergo','float','toolbar'].forEach(k => {
+        document.getElementById('pane-' + k).classList.toggle('hidden', k !== p);
+        document.getElementById('pbtn-' + k).className = k === p
+          ? 'px-2.5 py-1 rounded-md font-medium ime-anim bg-[var(--primary)] text-[var(--primary-foreground)]'
+          : 'px-2.5 py-1 rounded-md font-medium ime-anim text-[var(--muted-foreground)]';
+      });
+    }
+
+    function toggleTheme() { st.dark = !st.dark; render(); }
+    function cycleSubMode() { st.subMode = (st.subMode + 1) % 3; render(); }
+    function togglePressStyle() { st.pressGlow = !st.pressGlow; render(); }
+    function toggleNumpad() { st.numpad = !st.numpad; render(); }
+    function toggleVoice() { st.voiceActive = !st.voiceActive; render(); }
+    function adjustKbHeight(delta) { st.keyH = Math.max(28, Math.min(42, st.keyH + delta)); render(); }
+    function resetKbHeight() { st.keyH = 34; render(); }
+
+    function pressKey(ev, k) {
+      st.activeKey = k;
+      if (!st.pressGlow) {
+        const g = glassTheme();
+        const bub = document.getElementById('key-bubble');
+        const kbRect = document.getElementById('docked-kb').getBoundingClientRect();
+        const btnRect = ev.currentTarget.getBoundingClientRect();
+        bub.textContent = k;
+        bub.style.left = (btnRect.left - kbRect.left + btnRect.width / 2 - 18) + 'px';
+        bub.style.top = (btnRect.top - kbRect.top - 36) + 'px';
+        bub.style.background = g.shellBg;
+        bub.style.border = `1px solid ${g.accent}`;
+        bub.style.color = g.text;
+        bub.style.backdropFilter = 'blur(16px)';
+        bub.classList.remove('hidden');
+      } else {
+        renderErgo(glassTheme());
+      }
+    }
+    function releaseKey() {
+      st.activeKey = null;
+      document.getElementById('key-bubble').classList.add('hidden');
+      renderErgo(glassTheme());
+    }
+
+    function toggleEditBar() {
+      st.editingBar = !st.editingBar;
+      if (st.editingBar) st.idleState = 'active';
+      render();
+    }
+    function togglePinTool(id) {
+      const idx = st.pinnedTools.indexOf(id);
+      if (idx >= 0) st.pinnedTools.splice(idx, 1);
+      else st.pinnedTools.push(id);
+      render();
+    }
+    function setIdleDemo(m) {
+      st.idleState = m;
+      if (m !== 'active') st.editingBar = false;
+      render();
+    }
+
+    // Real Pointer Drag & Resize for Floating Mini Window
+    (function initFloatInteractions() {
+      const win = document.getElementById('float-win');
+      const dragH = document.getElementById('float-drag-handle');
+      const resH = document.getElementById('float-resize-handle');
+      let mode = null, sx = 0, sy = 0, sl = 0, stTop = 0, sw = 0, sh = 0;
+
+      dragH.addEventListener('mousedown', e => {
+        mode = 'drag'; sx = e.clientX; sy = e.clientY;
+        sl = win.offsetLeft; stTop = win.offsetTop;
+        e.preventDefault();
+      });
+      resH.addEventListener('mousedown', e => {
+        mode = 'resize'; sx = e.clientX; sy = e.clientY;
+        sw = win.offsetWidth; sh = win.offsetHeight;
+        e.preventDefault(); e.stopPropagation();
+      });
+      window.addEventListener('mousemove', e => {
+        if (!mode) return;
+        const stage = document.getElementById('stage');
+        if (mode === 'drag') {
+          const nl = Math.max(8, Math.min(stage.clientWidth - win.offsetWidth - 8, sl + e.clientX - sx));
+          const nt = Math.max(36, Math.min(stage.clientHeight - win.offsetHeight - 8, stTop + e.clientY - sy));
+          win.style.left = nl + 'px';
+          win.style.top = nt + 'px';
+        } else if (mode === 'resize') {
+          const nw = Math.max(230, Math.min(430, sw + e.clientX - sx));
+          const nh = Math.max(175, Math.min(270, sh + e.clientY - sy));
+          win.style.width = nw + 'px';
+          win.style.height = nh + 'px';
+        }
+      });
+      window.addEventListener('mouseup', () => { mode = null; });
+    })();
+
+    function resetFloatRect() {
+      const win = document.getElementById('float-win');
+      win.style.left = '110px';
+      win.style.top = '76px';
+      win.style.width = '310px';
+      win.style.height = '236px';
+    }
+
+    render();
+  </script>
+</body>
+</html>

@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://www.gstatic.com/antigravity/web/dev/tailwindcss.min.js"></script>
+  <style>
+    .ime-transition { transition: all 180ms cubic-bezier(0.22, 1, 0.36, 1); }
+    .key-press:active { transform: scale(0.95); }
+    .tabular { font-variant-numeric: tabular-nums; }
+  </style>
+</head>
+<body class="bg-transparent text-[var(--foreground)] antialiased p-0 m-0 select-none">
+  <div class="py-2 space-y-2.5">
+    <!-- Top Interactive Control Bar -->
+    <div class="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-[var(--card-border)] text-xs">
+      <div class="flex items-center gap-1 bg-[var(--card)] p-0.5 rounded-lg border border-[var(--border)]">
+        <button onclick="setTab('desktop')" id="tab-desktop" class="px-2.5 py-1 rounded-md font-medium ime-transition bg-[var(--primary)] text-[var(--primary-foreground)]">桌面候选栏</button>
+        <button onclick="setTab('android')" id="tab-android" class="px-2.5 py-1 rounded-md font-medium ime-transition text-[var(--muted-foreground)]">Android 小鹤键盘</button>
+        <button onclick="setTab('studio')" id="tab-studio" class="px-2.5 py-1 rounded-md font-medium ime-transition text-[var(--muted-foreground)]">Koofr 协同与词库</button>
+      </div>
+
+      <div class="flex flex-wrap items-center gap-3">
+        <label class="flex items-center gap-1.5 text-[var(--muted-foreground)]">
+          <span>字号</span>
+          <input id="font-slider" type="range" min="14" max="20" value="16" oninput="updateFontSize(this.value)" class="w-16 accent-[var(--primary)] cursor-pointer" />
+          <span id="font-val" class="tabular font-mono text-[var(--foreground)]">16px</span>
+        </label>
+        <button onclick="togglePreeditPos()" id="btn-preedit" class="px-2 py-1 rounded-md border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-transition">拼音: 候选上方</button>
+        <button onclick="toggleSurfaceTheme()" id="btn-theme" class="px-2 py-1 rounded-md border border-[var(--border)] bg-[var(--card)] text-[var(--foreground)] ime-transition">预览底色: 曜石黑</button>
+      </div>
+    </div>
+
+    <!-- Stage Container (Compact Fixed Height Budget ~325px) -->
+    <div id="stage" class="rounded-xl p-4 ime-transition relative overflow-hidden" style="background:#131417; border:1px solid rgba(255,255,255,0.08); min-height:315px;">
+
+      <!-- TAB 1: Desktop Candidate Window & Micro Toolbar -->
+      <div id="view-desktop" class="space-y-4">
+        <div class="flex items-center justify-between text-xs" style="color:#8b909a;">
+          <div class="flex items-center gap-1.5">
+            <span>试打样例（小鹤双拼）：</span>
+            <button onclick="setDesktopSample(0)" id="smp-0" class="px-2 py-0.5 rounded text-xs ime-transition" style="background:rgba(99,102,241,0.2); color:#a5b4fc;">xhsp (小鹤双拼)</button>
+            <button onclick="setDesktopSample(1)" id="smp-1" class="px-2 py-0.5 rounded text-xs ime-transition" style="background:rgba(255,255,255,0.06); color:#9ca3af;">cclx (纯粹理想)</button>
+            <button onclick="setDesktopSample(2)" id="smp-2" class="px-2 py-0.5 rounded text-xs ime-transition" style="background:rgba(255,255,255,0.06); color:#9ca3af;">scel 导入术语</button>
+          </div>
+          <span class="tabular">Linux Wayland / Win11 Acrylic 同源渲染</span>
+        </div>
+
+        <!-- Simulated Target App Input Line -->
+        <div id="editor-box" class="rounded-lg px-3.5 py-2.5 text-sm flex items-center gap-1 ime-transition" style="background:#1c1d22; border:1px solid rgba(255,255,255,0.07); color:#e5e7eb;">
+          <span id="committed-text">正在体验极简输入：</span>
+          <span id="inline-preedit" class="hidden px-1 rounded underline decoration-indigo-400 underline-offset-4" style="color:#a5b4fc;">xh'sp</span>
+          <span class="inline-block w-0.5 h-4 bg-indigo-400 animate-pulse"></span>
+        </div>
+
+        <!-- Floating Candidate Capsule -->
+        <div class="pl-12 space-y-2.5">
+          <div id="cand-window" class="inline-flex flex-col rounded-xl px-3 py-2 ime-transition" style="background:rgba(30,32,38,0.92); border:1px solid rgba(255,255,255,0.10); box-shadow:0 14px 34px rgba(0,0,0,0.42);">
+            <!-- Top Preedit & Quick Paste Chip -->
+            <div id="top-preedit-row" class="flex items-center justify-between gap-6 pb-1.5 mb-1.5" style="border-bottom:1px solid rgba(255,255,255,0.06);">
+              <div class="flex items-center gap-2">
+                <span id="top-preedit-text" class="text-xs font-mono tracking-wide" style="color:#a5b4fc;">xh'sp</span>
+                <span class="text-xs px-1.5 py-0.5 rounded" style="background:rgba(99,102,241,0.14); color:#818cf8;">鹤</span>
+              </div>
+              <button onclick="pasteLiveSlot()" class="flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ime-transition hover:opacity-90" style="background:rgba(16,185,129,0.13); color:#6ee7b7;" title="来自 Koofr 单槽位瞬态复制，点击直接上屏">
+                <span>刚复制: app.koofr.net/dav</span>
+              </button>
+            </div>
+
+            <!-- Candidates Horizontal Strip -->
+            <div id="cand-list" class="flex items-center gap-1.5 tabular" style="font-size:16px;"></div>
+          </div>
+
+          <!-- Detachable Minimalist Micro Toolbar -->
+          <div class="flex items-center gap-1">
+            <div id="micro-bar" class="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-xs ime-transition" style="background:rgba(30,32,38,0.85); border:1px solid rgba(255,255,255,0.08); color:#d1d5db;">
+              <span class="px-1.5 py-0.5 rounded font-medium" style="background:#4f46e5; color:#ffffff;">鹤 · 中</span>
+              <span class="px-1.5 py-0.5 rounded opacity-80">简</span>
+              <button onclick="setTab('studio')" class="px-1.5 py-0.5 rounded hover:opacity-100 opacity-80">剪贴板(N)</button>
+              <button onclick="setTab('studio')" class="px-1.5 py-0.5 rounded hover:opacity-100 opacity-80">词库</button>
+              <span class="px-1.5 py-0.5 rounded opacity-80">闪传</span>
+              <span class="px-1.5 py-0.5 rounded" style="color:#a5b4fc;">边写边译</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 2: Android Minimalist Borderless Xiaohe Shuangpin Keyboard -->
+      <div id="view-android" class="hidden">
+        <div class="max-w-md mx-auto rounded-2xl p-2.5 space-y-1.5 ime-transition" id="mobile-shell" style="background:#18191d; border:1px solid rgba(255,255,255,0.08);">
+          <!-- Mobile Top Candidate + Toolbar Strip -->
+          <div class="flex items-center justify-between px-1.5 py-1 text-xs" style="border-bottom:1px solid rgba(255,255,255,0.06);">
+            <div id="mob-cands" class="flex items-center gap-2 overflow-hidden">
+              <span id="mob-preedit" class="font-mono px-1.5 py-0.5 rounded" style="background:rgba(99,102,241,0.18); color:#a5b4fc;">xh</span>
+              <span class="px-2 py-0.5 rounded-md font-medium" style="background:#4f46e5; color:#fff;">小鹤</span>
+              <span class="opacity-85" style="color:#e5e7eb;">喜欢</span>
+              <span class="opacity-70" style="color:#9ca3af;">信号</span>
+              <span class="opacity-70" style="color:#9ca3af;">学会</span>
+            </div>
+            <div class="flex items-center gap-1.5">
+              <button onclick="toggleFlypyHints()" id="btn-flypy-hint" class="px-1.5 py-0.5 rounded text-xs" style="background:rgba(99,102,241,0.16); color:#a5b4fc;">双拼角标: 开</button>
+              <span class="opacity-60 text-xs" style="color:#9ca3af;">收起 ⌄</span>
+            </div>
+          </div>
+
+          <!-- 26-Key Authentic Xiaohe Shuangpin Grid -->
+          <div id="kb-rows" class="space-y-1.5 pt-0.5"></div>
+
+          <!-- Bottom Ergonomic Row -->
+          <div class="grid grid-cols-12 gap-1.5 pt-0.5 text-xs">
+            <button onclick="toggleLeftKey()" id="btn-left-key" class="col-span-2 py-2 rounded-lg font-medium key-press ime-transition" style="background:#22242a; color:#9ca3af;">分词 '</button>
+            <button class="col-span-2 py-2 rounded-lg font-medium key-press" style="background:#22242a; color:#9ca3af;">123</button>
+            <button onclick="triggerVoiceSim()" id="btn-space" class="col-span-5 py-2 rounded-lg font-medium key-press ime-transition flex items-center justify-center gap-1.5" style="background:#272930; color:#e5e7eb;">
+              <span id="space-label">小鹤双拼 · 长按离线语音</span>
+            </button>
+            <button class="col-span-1 py-2 rounded-lg font-medium key-press" style="background:#22242a; color:#9ca3af;">，</button>
+            <button class="col-span-2 py-2 rounded-lg font-medium key-press" style="background:#4f46e5; color:#ffffff;">回车</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- TAB 3: Koofr 3-Tier Lifecycle & .scel Dictionary Importer -->
+      <div id="view-studio" class="hidden grid grid-cols-12 gap-3 text-xs">
+        <!-- Left: Clipboard Dual-Layer + Burn-after-send -->
+        <div id="studio-left" class="col-span-7 rounded-xl p-3 space-y-2.5" style="background:#1c1e24; border:1px solid rgba(255,255,255,0.07); color:#e5e7eb;">
+          <div class="flex items-center justify-between">
+            <span class="font-medium">剪贴板协同 · Koofr WebDAV</span>
+            <span class="px-2 py-0.5 rounded-full text-xs" style="background:rgba(16,185,129,0.15); color:#6ee7b7;">上限 N = 50 条</span>
+          </div>
+
+          <div class="rounded-lg p-2 space-y-1" style="background:rgba(99,102,241,0.10); border:1px solid rgba(99,102,241,0.25);">
+            <div class="flex items-center justify-between" style="color:#a5b4fc;">
+              <span>⚡ 日常 Ctrl+C 实时瞬态槽（下次复制即覆盖）</span>
+              <span class="font-mono">刚刚 · CachyOS</span>
+            </div>
+            <div class="truncate font-mono opacity-90">cargo build --release --package ime-core</div>
+          </div>
+
+          <div class="space-y-1">
+            <div class="flex items-center justify-between opacity-65">
+              <span>持久化环形历史库（已存 3 / 50 条 · 满额淘汰最旧）</span>
+              <span>端到端加密</span>
+            </div>
+            <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between" style="background:rgba(255,255,255,0.04);">
+              <span class="truncate">📌 Koofr WebDAV: https://app.koofr.net/dav/Koofr</span>
+              <span style="color:#fbbf24;">已置顶</span>
+            </div>
+            <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between" style="background:rgba(255,255,255,0.04);">
+              <span class="truncate">会议纪要：跨端架构采用 librime + OpenDAL</span>
+              <span class="opacity-50">12 分钟前</span>
+            </div>
+          </div>
+
+          <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between" style="background:rgba(245,158,11,0.10); color:#fcd34d;">
+            <span>🔥 跨网互传：architecture.pdf (4.2MB)</span>
+            <span>Android 已签收 → 云端已销毁</span>
+          </div>
+        </div>
+
+        <!-- Right: Multi-Format Lexicon Importer -->
+        <div id="studio-right" class="col-span-5 rounded-xl p-3 space-y-2.5 flex flex-col justify-between" style="background:#1c1e24; border:1px solid rgba(255,255,255,0.07); color:#e5e7eb;">
+          <div class="space-y-2">
+            <div class="flex items-center justify-between">
+              <span class="font-medium">词库中心（小鹤双拼自动映射）</span>
+              <span class="opacity-60">Koofr 持久同步</span>
+            </div>
+            <div onclick="simImportDict()" class="rounded-lg p-2.5 text-center cursor-pointer ime-transition hover:opacity-90" style="border:1px dashed rgba(129,140,248,0.45); background:rgba(99,102,241,0.06); color:#a5b4fc;">
+              <div class="font-medium">+ 点击演示导入词库</div>
+              <div class="opacity-75 mt-0.5">直读搜狗 .scel / .dict.yaml / 纯文本自动注音</div>
+            </div>
+            <div id="dict-list" class="space-y-1.5">
+              <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between" style="background:rgba(255,255,255,0.04);">
+                <span>雾凇拼音精校词库 + 万象语法</span>
+                <span style="color:#6ee7b7;">82.4万词</span>
+              </div>
+              <div class="rounded-lg px-2.5 py-1.5 flex items-center justify-between" style="background:rgba(255,255,255,0.04);">
+                <span>计算机与AI术语精选.scel</span>
+                <span style="color:#6ee7b7;">3.6万词</span>
+              </div>
+            </div>
+          </div>
+          <div id="import-toast" class="text-xs opacity-70 tabular" style="color:#9ca3af;">个人自学习增量日志：今日新增 18 词 · 已同步</div>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <script>
+    const samples = [
+      { code: "xh'sp", cands: ["小鹤双拼", "细化水平", "喜欢视频", "现货商品", "循环赛跑"], commit: "正在体验极简输入：" },
+      { code: "cc'lx", cands: ["纯粹理想", "存储类型", "层次联系", "从此留下", "出差旅行"], commit: "为输入而生，追寻" },
+      { code: "sf'jd", cands: ["算法架构", "缩放精度", "司法鉴定", "双方决定", "释放节点"], commit: "已挂载 .scel 专业词库：" }
+    ];
+
+    const flypyRows = [
+      [['Q','iu'],['W','ei'],['E','e'],['R','uan'],['T','ue'],['Y','un'],['U','sh'],['I','ch'],['O','uo'],['P','ie']],
+      [['A','a'],['S','ong'],['D','ai'],['F','en'],['G','eng'],['H','ang'],['J','an'],['K','ing'],['L','uang']],
+      [['⇧',''],['Z','ou'],['X','ia'],['C','ao'],['V','zh'],['B','in'],['N','iao'],['M','ian'],['⌫','']]
+    ];
+
+    let state = {
+      tab: 'desktop',
+      dark: true,
+      fontSize: 16,
+      inlinePreedit: false,
+      sampleIdx: 0,
+      showFlypyHints: true,
+      leftKeyMode: 0,
+      importedExtra: false
+    };
+
+    function renderDesktop() {
+      const s = samples[state.sampleIdx];
+      document.getElementById('committed-text').textContent = s.commit;
+      document.getElementById('top-preedit-text').textContent = s.code;
+      document.getElementById('inline-preedit').textContent = s.code;
+      document.getElementById('inline-preedit').classList.toggle('hidden', !state.inlinePreedit);
+      document.getElementById('top-preedit-row').classList.toggle('hidden', state.inlinePreedit);
+
+      const list = document.getElementById('cand-list');
+      list.style.fontSize = state.fontSize + 'px';
+      list.innerHTML = s.cands.map((w, idx) => {
+        if (idx === 0) {
+          return `<button onclick="commitWord('${w}')" class="px-2.5 py-1 rounded-lg font-medium ime-transition flex items-center gap-1" style="background:#4f46e5; color:#ffffff;">
+            <span class="text-xs opacity-80">1</span><span>${w}</span>
+          </button>`;
+        }
+        const textCol = state.dark ? '#d1d5db' : '#374151';
+        const numCol = state.dark ? '#6b7280' : '#9ca3af';
+        return `<button onclick="commitWord('${w}')" class="px-2 py-1 rounded-lg ime-transition hover:opacity-80 flex items-center gap-1" style="color:${textCol};">
+          <span class="text-xs" style="color:${numCol};">${idx + 1}</span><span>${w}</span>
+        </button>`;
+      }).join('');
+
+      [0,1,2].forEach(i => {
+        const btn = document.getElementById('smp-' + i);
+        const active = i === state.sampleIdx;
+        btn.style.background = active ? 'rgba(99,102,241,0.22)' : (state.dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)');
+        btn.style.color = active ? (state.dark ? '#a5b4fc' : '#4f46e5') : (state.dark ? '#9ca3af' : '#6b7280');
+      });
+    }
+
+    function renderKeyboard() {
+      const container = document.getElementById('kb-rows');
+      const keyBg = state.dark ? '#262830' : '#ffffff';
+      const fnBg = state.dark ? '#1f2128' : '#e5e7eb';
+      const keyText = state.dark ? '#f3f4f6' : '#111827';
+      const subText = state.dark ? '#818cf8' : '#6366f1';
+      const keyShadow = state.dark ? 'inset 0 1px 0 rgba(255,255,255,0.06)' : '0 1px 2px rgba(0,0,0,0.06)';
+
+      container.innerHTML = flypyRows.map((row, rIdx) => {
+        const pad = rIdx === 1 ? 'px-4' : '';
+        return `<div class="flex justify-center gap-1.5 ${pad}">` + row.map(([k, sub]) => {
+          const isFn = k === '⇧' || k === '⌫';
+          const widthCls = isFn ? 'w-11' : 'flex-1';
+          const hintHtml = (sub && state.showFlypyHints)
+            ? `<span class="text-[10px] leading-none opacity-75" style="color:${subText};">${sub}</span>`
+            : `<span class="text-[10px] leading-none opacity-0">.</span>`;
+          return `<button onclick="tapMobileKey('${k}')" class="${widthCls} py-1.5 rounded-lg key-press ime-transition flex flex-col items-center justify-center" style="background:${isFn ? fnBg : keyBg}; color:${keyText}; box-shadow:${keyShadow};">
+            ${hintHtml}
+            <span class="text-sm font-medium leading-tight">${k}</span>
+          </button>`;
+        }).join('') + `</div>`;
+      }).join('');
+    }
+
+    function applyThemeColors() {
+      const d = state.dark;
+      const stage = document.getElementById('stage');
+      stage.style.background = d ? '#131417' : '#f3f4f6';
+      stage.style.borderColor = d ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+
+      const editor = document.getElementById('editor-box');
+      editor.style.background = d ? '#1c1d22' : '#ffffff';
+      editor.style.borderColor = d ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.08)';
+      editor.style.color = d ? '#e5e7eb' : '#1f2937';
+
+      const cw = document.getElementById('cand-window');
+      cw.style.background = d ? 'rgba(30,32,38,0.94)' : 'rgba(255,255,255,0.95)';
+      cw.style.borderColor = d ? 'rgba(255,255,255,0.10)' : 'rgba(0,0,0,0.08)';
+      cw.style.boxShadow = d ? '0 14px 34px rgba(0,0,0,0.42)' : '0 12px 28px rgba(0,0,0,0.10)';
+
+      const mb = document.getElementById('micro-bar');
+      mb.style.background = d ? 'rgba(30,32,38,0.88)' : 'rgba(255,255,255,0.92)';
+      mb.style.borderColor = d ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+      mb.style.color = d ? '#d1d5db' : '#374151';
+
+      const ms = document.getElementById('mobile-shell');
+      ms.style.background = d ? '#18191d' : '#ebedf0';
+      ms.style.borderColor = d ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+
+      ['studio-left', 'studio-right'].forEach(id => {
+        const el = document.getElementById(id);
+        el.style.background = d ? '#1c1e24' : '#ffffff';
+        el.style.borderColor = d ? 'rgba(255,255,255,0.07)' : 'rgba(0,0,0,0.08)';
+        el.style.color = d ? '#e5e7eb' : '#1f2937';
+      });
+
+      document.getElementById('btn-theme').textContent = '预览底色: ' + (d ? '曜石黑' : '宣纸白');
+      renderDesktop();
+      renderKeyboard();
+    }
+
+    function setTab(t) {
+      state.tab = t;
+      ['desktop', 'android', 'studio'].forEach(k => {
+        document.getElementById('view-' + k).classList.toggle('hidden', k !== t);
+        const btn = document.getElementById('tab-' + k);
+        if (k === t) {
+          btn.className = 'px-2.5 py-1 rounded-md font-medium ime-transition bg-[var(--primary)] text-[var(--primary-foreground)]';
+        } else {
+          btn.className = 'px-2.5 py-1 rounded-md font-medium ime-transition text-[var(--muted-foreground)]';
+        }
+      });
+    }
+
+    function updateFontSize(v) {
+      state.fontSize = parseInt(v, 10);
+      document.getElementById('font-val').textContent = v + 'px';
+      renderDesktop();
+    }
+
+    function togglePreeditPos() {
+      state.inlinePreedit = !state.inlinePreedit;
+      document.getElementById('btn-preedit').textContent = '拼音: ' + (state.inlinePreedit ? '输入框行内' : '候选上方');
+      renderDesktop();
+    }
+
+    function toggleSurfaceTheme() {
+      state.dark = !state.dark;
+      applyThemeColors();
+    }
+
+    function setDesktopSample(i) {
+      state.sampleIdx = i;
+      renderDesktop();
+    }
+
+    function commitWord(w) {
+      document.getElementById('committed-text').textContent = samples[state.sampleIdx].commit + w;
+    }
+
+    function pasteLiveSlot() {
+      document.getElementById('committed-text').textContent = '已从 Koofr 瞬态槽粘贴：https://app.koofr.net/dav';
+    }
+
+    function toggleFlypyHints() {
+      state.showFlypyHints = !state.showFlypyHints;
+      document.getElementById('btn-flypy-hint').textContent = '双拼角标: ' + (state.showFlypyHints ? '开' : '关');
+      renderKeyboard();
+    }
+
+    function tapMobileKey(k) {
+      if (k === '⌫') {
+        document.getElementById('mob-preedit').textContent = 'x';
+      } else if (k !== '⇧') {
+        const cur = document.getElementById('mob-preedit').textContent;
+        document.getElementById('mob-preedit').textContent = (cur.length >= 4 ? '' : cur) + k.toLowerCase();
+      }
+    }
+
+    function toggleLeftKey() {
+      state.leftKeyMode = 1 - state.leftKeyMode;
+      document.getElementById('btn-left-key').textContent = state.leftKeyMode === 0 ? "分词 '" : "大写 ⇧";
+    }
+
+    function triggerVoiceSim() {
+      const lbl = document.getElementById('space-label');
+      lbl.textContent = '🎙 正在本地 SenseVoice 离线聆听...';
+      setTimeout(() => { lbl.textContent = '小鹤双拼 · 长按离线语音'; }, 1400);
+    }
+
+    function simImportDict() {
+      if (state.importedExtra) return;
+      state.importedExtra = true;
+      const item = document.createElement('div');
+      item.className = 'rounded-lg px-2.5 py-1.5 flex items-center justify-between ime-transition';
+      item.style.background = 'rgba(99,102,241,0.14)';
+      item.innerHTML = '<span>✨ 自定义专业词表.txt（已自动注音）</span><span style="color:#a5b4fc;">+1,280词</span>';
+      document.getElementById('dict-list').appendChild(item);
+      document.getElementById('import-toast').textContent = '已编译挂载至小鹤双拼，并加密上传至 Koofr /lexicon/imports/';
+    }
+
+    applyThemeColors();
+  </script>
+</body>
+</html>

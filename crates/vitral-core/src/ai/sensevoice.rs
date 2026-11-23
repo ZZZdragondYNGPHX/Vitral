@@ -1,9 +1,9 @@
+use super::SpeechModelCache;
 use crate::eng::gram::RimeGramDb;
 use std::sync::Arc;
 use crate::{error::VitralError, onnx_env::get_ort_env};
 use kaldi_fbank::{compute_fbank, FbankOptions, WindowType};
 use ort::{session::Session, value::TensorRef};
-use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 
 const MEL_BINS: usize = 80;
@@ -193,7 +193,7 @@ fn hanzi(token:&str)->bool {
 }
 
 type ModelLocation = (PathBuf, Option<PathBuf>);
-static MODEL: Mutex<Option<(ModelLocation, Model)>> = Mutex::new(None);
+static MODEL: SpeechModelCache<ModelLocation, Model> = SpeechModelCache::new();
 
 pub(super) fn transcribe(
     samples: &[i16],
@@ -201,13 +201,12 @@ pub(super) fn transcribe(
     grammar: Option<&Path>,
 ) -> Result<(String, String), VitralError> {
     let dir=dir.ok_or_else(|| model_error("尚未下载或已禁用离线语音识别模型，请在模型中心下载并启用"))?;
-    let mut cache = MODEL.lock();
-    let key = (dir.to_path_buf(), grammar.map(Path::to_path_buf));
-    if cache.as_ref().is_none_or(|(p, _)| p != &key) {
-        let model = Model::load(dir, grammar)?;
-        *cache = Some((key, model));
+    let handle = MODEL.model((dir.to_path_buf(), grammar.map(Path::to_path_buf)));
+    let mut model = handle.lock();
+    if model.is_none() {
+        *model = Some(Model::load(dir, grammar)?);
     }
-    let model=&mut cache.as_mut().unwrap().1;
+    let model = model.as_mut().unwrap();
     let mut best=model.decode(samples)?;
     // Low-confidence utterances benefit from a second acoustic view. Speed
     // perturbation changes speaker/formant scale. Compare normalized token
@@ -232,4 +231,11 @@ pub(super) fn transcribe(
     Ok((best.0,best.1))
 }
 
-pub(super) fn clear_cache() { *MODEL.lock() = None; }
+pub(super) fn clear_cache() {
+    MODEL.clear();
+}
+
+#[cfg(all(test, target_os = "linux", feature = "native-onnx"))]
+pub(super) fn cache_is_empty() -> bool {
+    MODEL.is_empty()
+}

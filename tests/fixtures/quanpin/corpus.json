@@ -1,0 +1,971 @@
+{
+  "version": "1.1.0",
+  "description": "Multi-length progressive Quanpin ambiguity & segmentation benchmark corpus for Vitral vitral-core",
+  "schema_id": "rime_ice",
+  "buckets": {
+    "short": 6,
+    "medium": 6,
+    "long": 6
+  },
+  "total_cases": 18,
+  "cases": [
+    {
+      "id": "qp_short_01",
+      "length_bucket": "short",
+      "char_count": 2,
+      "pinyin": "fangan",
+      "syllable_segments": [
+        "fang",
+        "an"
+      ],
+      "expected_text": "方案",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an"
+      ],
+      "progression": [
+        {
+          "prefix": "fan",
+          "competing_interpretations": [
+            "反",
+            "饭",
+            "翻"
+          ],
+          "resolved": "反"
+        },
+        {
+          "prefix": "fangan",
+          "competing_interpretations": [
+            "方案 (fang'an)",
+            "反感 (fan'gan)"
+          ],
+          "resolved": "方案",
+          "notes": "N-gram & bigram frequency of 方案 (fang'an) resolves boundary against fan'gan."
+        }
+      ]
+    },
+    {
+      "id": "qp_short_02",
+      "length_bucket": "short",
+      "char_count": 2,
+      "pinyin": "changan",
+      "syllable_segments": [
+        "chang",
+        "an"
+      ],
+      "expected_text": "长安",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an"
+      ],
+      "progression": [
+        {
+          "prefix": "chan",
+          "competing_interpretations": [
+            "产",
+            "禅",
+            "单"
+          ],
+          "resolved": "产"
+        },
+        {
+          "prefix": "changan",
+          "competing_interpretations": [
+            "长安 (chang'an)",
+            "产干 (chan'gan)"
+          ],
+          "resolved": "长安",
+          "notes": "Trailing 'an' shifts boundary from chan+g to chang+an."
+        }
+      ]
+    },
+    {
+      "id": "qp_short_03",
+      "length_bucket": "short",
+      "char_count": 2,
+      "pinyin": "pingan",
+      "syllable_segments": [
+        "ping",
+        "an"
+      ],
+      "expected_text": "平安",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an"
+      ],
+      "progression": [
+        {
+          "prefix": "pin",
+          "competing_interpretations": [
+            "品",
+            "拼",
+            "频"
+          ],
+          "resolved": "品"
+        },
+        {
+          "prefix": "pingan",
+          "competing_interpretations": [
+            "平安 (ping'an)",
+            "品感 (pin'gan)"
+          ],
+          "resolved": "平安",
+          "notes": "Lattice path ping'an beats pin'gan via high lexical prior."
+        }
+      ]
+    },
+    {
+      "id": "qp_short_04",
+      "length_bucket": "short",
+      "char_count": 3,
+      "pinyin": "jinanshi",
+      "syllable_segments": [
+        "ji",
+        "nan",
+        "shi"
+      ],
+      "expected_text": "济南市",
+      "ambiguity_type": [
+        "segmentation",
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "jin",
+          "competing_interpretations": [
+            "进",
+            "金",
+            "今"
+          ],
+          "resolved": "进"
+        },
+        {
+          "prefix": "jinan",
+          "competing_interpretations": [
+            "济南 (ji'nan)",
+            "金安 (jin'an)",
+            "暨南 (ji'nan)"
+          ],
+          "resolved": "济南"
+        },
+        {
+          "prefix": "jinanshi",
+          "competing_interpretations": [
+            "济南市 (ji'nan'shi)",
+            "金安市 (jin'an'shi)"
+          ],
+          "resolved": "济南市",
+          "notes": "Trailing 'shi' (市) locks municipal proper noun 济南市."
+        }
+      ]
+    },
+    {
+      "id": "qp_short_05",
+      "length_bucket": "short",
+      "char_count": 3,
+      "pinyin": "xiaoqie",
+      "syllable_segments": [
+        "xiao",
+        "qi",
+        "e"
+      ],
+      "expected_text": "小企鹅",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_e"
+      ],
+      "progression": [
+        {
+          "prefix": "xiao",
+          "competing_interpretations": [
+            "小",
+            "笑",
+            "校"
+          ],
+          "resolved": "小"
+        },
+        {
+          "prefix": "xiaoqi",
+          "competing_interpretations": [
+            "小气",
+            "小琪",
+            "晓琪"
+          ],
+          "resolved": "小气"
+        },
+        {
+          "prefix": "xiaoqie",
+          "competing_interpretations": [
+            "小企鹅 (xiao'qi'e)",
+            "小妾 (xiao'qie)"
+          ],
+          "resolved": "小企鹅",
+          "notes": "Trailing 'e' splits 'qie' into qi+e and retroactively flips 小气 -> 小企鹅."
+        }
+      ]
+    },
+    {
+      "id": "qp_short_06",
+      "length_bucket": "short",
+      "char_count": 3,
+      "pinyin": "shanganle",
+      "syllable_segments": [
+        "shang",
+        "an",
+        "le"
+      ],
+      "expected_text": "上岸了",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an"
+      ],
+      "progression": [
+        {
+          "prefix": "shan",
+          "competing_interpretations": [
+            "山",
+            "删",
+            "善"
+          ],
+          "resolved": "山"
+        },
+        {
+          "prefix": "shangan",
+          "competing_interpretations": [
+            "上岸 (shang'an)",
+            "善感 (shan'gan)"
+          ],
+          "resolved": "上岸"
+        },
+        {
+          "prefix": "shanganle",
+          "competing_interpretations": [
+            "上岸了 (shang'an'le)",
+            "善感了 (shan'gan'le)"
+          ],
+          "resolved": "上岸了",
+          "notes": "Aspect marker 'le' confirms verb-object 上岸了 over adjective 善感了."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_01",
+      "length_bucket": "medium",
+      "char_count": 5,
+      "pinyin": "xianbingmayong",
+      "syllable_segments": [
+        "xi",
+        "an",
+        "bing",
+        "ma",
+        "yong"
+      ],
+      "expected_text": "西安兵马俑",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an",
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "xian",
+          "competing_interpretations": [
+            "先",
+            "现",
+            "西安"
+          ],
+          "resolved": "先"
+        },
+        {
+          "prefix": "xianbing",
+          "competing_interpretations": [
+            "馅饼 (xian'bing)",
+            "显兵"
+          ],
+          "resolved": "馅饼"
+        },
+        {
+          "prefix": "xianbingma",
+          "competing_interpretations": [
+            "馅饼吗 (xian'bing'ma)",
+            "西安兵马 (xi'an'bing'ma)"
+          ],
+          "resolved": "馅饼吗"
+        },
+        {
+          "prefix": "xianbingmayong",
+          "competing_interpretations": [
+            "西安兵马俑 (xi'an'bing'ma'yong)"
+          ],
+          "resolved": "西安兵马俑",
+          "notes": "Trailing 'yong' disambiguates both xian->xi'an boundary and 馅饼 -> 西安兵马俑."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_02",
+      "length_bucket": "medium",
+      "char_count": 5,
+      "pinyin": "jisuanjixueyuan",
+      "syllable_segments": [
+        "ji",
+        "suan",
+        "ji",
+        "xue",
+        "yuan"
+      ],
+      "expected_text": "计算机学院",
+      "ambiguity_type": [
+        "homophone",
+        "phrase_boundary"
+      ],
+      "progression": [
+        {
+          "prefix": "ji",
+          "competing_interpretations": [
+            "几",
+            "机",
+            "及",
+            "记"
+          ],
+          "resolved": "几"
+        },
+        {
+          "prefix": "jisuan",
+          "competing_interpretations": [
+            "计算",
+            "积算"
+          ],
+          "resolved": "计算"
+        },
+        {
+          "prefix": "jisuanji",
+          "competing_interpretations": [
+            "计算机",
+            "计算及"
+          ],
+          "resolved": "计算机"
+        },
+        {
+          "prefix": "jisuanjixueyuan",
+          "competing_interpretations": [
+            "计算机学院",
+            "计算机学苑"
+          ],
+          "resolved": "计算机学院",
+          "notes": "Compound trigram+bigram locks 计算机学院."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_03",
+      "length_bucket": "medium",
+      "char_count": 5,
+      "pinyin": "nanjingshizhengfu",
+      "syllable_segments": [
+        "nan",
+        "jing",
+        "shi",
+        "zheng",
+        "fu"
+      ],
+      "expected_text": "南京市政府",
+      "ambiguity_type": [
+        "homophone",
+        "segmentation"
+      ],
+      "progression": [
+        {
+          "prefix": "nan",
+          "competing_interpretations": [
+            "难",
+            "男",
+            "南"
+          ],
+          "resolved": "难"
+        },
+        {
+          "prefix": "nanjing",
+          "competing_interpretations": [
+            "南京",
+            "难经"
+          ],
+          "resolved": "南京"
+        },
+        {
+          "prefix": "nanjingshi",
+          "competing_interpretations": [
+            "南京市",
+            "南京是"
+          ],
+          "resolved": "南京市"
+        },
+        {
+          "prefix": "nanjingshizhengfu",
+          "competing_interpretations": [
+            "南京市政府"
+          ],
+          "resolved": "南京市政府",
+          "notes": "Trailing 'zhengfu' confirms 市 over 是/世/事."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_04",
+      "length_bucket": "medium",
+      "char_count": 6,
+      "pinyin": "shanghaichengshijianshe",
+      "syllable_segments": [
+        "shang",
+        "hai",
+        "cheng",
+        "shi",
+        "jian",
+        "she"
+      ],
+      "expected_text": "上海城市建设",
+      "ambiguity_type": [
+        "homophone",
+        "phrase_boundary"
+      ],
+      "progression": [
+        {
+          "prefix": "shanghai",
+          "competing_interpretations": [
+            "上海",
+            "伤害"
+          ],
+          "resolved": "上海"
+        },
+        {
+          "prefix": "shanghaicheng",
+          "competing_interpretations": [
+            "上海城",
+            "伤害成"
+          ],
+          "resolved": "上海城"
+        },
+        {
+          "prefix": "shanghaichengshi",
+          "competing_interpretations": [
+            "上海城市",
+            "伤害诚实"
+          ],
+          "resolved": "上海城市"
+        },
+        {
+          "prefix": "shanghaichengshijianshe",
+          "competing_interpretations": [
+            "上海城市建设"
+          ],
+          "resolved": "上海城市建设",
+          "notes": "Trailing 建设 resolves both 城市 and 上海 over 伤害."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_05",
+      "length_bucket": "medium",
+      "char_count": 7,
+      "pinyin": "beijingdaxuetushuguan",
+      "syllable_segments": [
+        "bei",
+        "jing",
+        "da",
+        "xue",
+        "tu",
+        "shu",
+        "guan"
+      ],
+      "expected_text": "北京大学图书馆",
+      "ambiguity_type": [
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "bei",
+          "competing_interpretations": [
+            "被",
+            "北",
+            "背"
+          ],
+          "resolved": "被"
+        },
+        {
+          "prefix": "beijing",
+          "competing_interpretations": [
+            "北京",
+            "背景"
+          ],
+          "resolved": "背景"
+        },
+        {
+          "prefix": "beijingdaxue",
+          "competing_interpretations": [
+            "北京大学"
+          ],
+          "resolved": "北京大学"
+        },
+        {
+          "prefix": "beijingdaxuetushuguan",
+          "competing_interpretations": [
+            "北京大学图书馆"
+          ],
+          "resolved": "北京大学图书馆",
+          "notes": "Prefix 背景/被 flips to 北京大学 and full 图书馆."
+        }
+      ]
+    },
+    {
+      "id": "qp_med_06",
+      "length_bucket": "medium",
+      "char_count": 8,
+      "pinyin": "xianjiaotongdaxuexiaoyuan",
+      "syllable_segments": [
+        "xi",
+        "an",
+        "jiao",
+        "tong",
+        "da",
+        "xue",
+        "xiao",
+        "yuan"
+      ],
+      "expected_text": "西安交通大学校园",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an",
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "xian",
+          "competing_interpretations": [
+            "先",
+            "现",
+            "西安"
+          ],
+          "resolved": "先"
+        },
+        {
+          "prefix": "xianjiao",
+          "competing_interpretations": [
+            "先交",
+            "显教",
+            "仙教"
+          ],
+          "resolved": "先交"
+        },
+        {
+          "prefix": "xianjiaotong",
+          "competing_interpretations": [
+            "西安交通",
+            "先交通"
+          ],
+          "resolved": "西安交通"
+        },
+        {
+          "prefix": "xianjiaotongdaxuexiaoyuan",
+          "competing_interpretations": [
+            "西安交通大学校园"
+          ],
+          "resolved": "西安交通大学校园",
+          "notes": "Full institution name locks xi'an boundary and 校园."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_01",
+      "length_bucket": "long",
+      "char_count": 10,
+      "pinyin": "xianshizhengfufabuxingonggao",
+      "syllable_segments": [
+        "xi",
+        "an",
+        "shi",
+        "zheng",
+        "fu",
+        "fa",
+        "bu",
+        "xin",
+        "gong",
+        "gao"
+      ],
+      "expected_text": "西安市政府发布新公告",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an",
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "xian",
+          "competing_interpretations": [
+            "先",
+            "现"
+          ],
+          "resolved": "先"
+        },
+        {
+          "prefix": "xianshi",
+          "competing_interpretations": [
+            "显示",
+            "现实",
+            "县市",
+            "西安市"
+          ],
+          "resolved": "显示"
+        },
+        {
+          "prefix": "xianshizhengfu",
+          "competing_interpretations": [
+            "西安市政府 (xi'an'shi'zheng'fu)"
+          ],
+          "resolved": "西安市政府"
+        },
+        {
+          "prefix": "xianshizhengfufabuxingonggao",
+          "competing_interpretations": [
+            "西安市政府发布新公告"
+          ],
+          "resolved": "西安市政府发布新公告",
+          "notes": "Trailing 政府发布新公告 forces early xianshi (显示) to split into xi'an'shi (西安市)."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_02",
+      "length_bucket": "long",
+      "char_count": 12,
+      "pinyin": "guojiazhongdianyanfajihuazhengshiqidong",
+      "syllable_segments": [
+        "guo",
+        "jia",
+        "zhong",
+        "dian",
+        "yan",
+        "fa",
+        "ji",
+        "hua",
+        "zheng",
+        "shi",
+        "qi",
+        "dong"
+      ],
+      "expected_text": "国家重点研发计划正式启动",
+      "ambiguity_type": [
+        "homophone",
+        "long_context_collocation"
+      ],
+      "progression": [
+        {
+          "prefix": "guo",
+          "competing_interpretations": [
+            "过",
+            "国",
+            "果"
+          ],
+          "resolved": "过"
+        },
+        {
+          "prefix": "guojia",
+          "competing_interpretations": [
+            "国家",
+            "过家"
+          ],
+          "resolved": "国家"
+        },
+        {
+          "prefix": "guojiazhongdian",
+          "competing_interpretations": [
+            "国家重点",
+            "国家中点"
+          ],
+          "resolved": "国家重点"
+        },
+        {
+          "prefix": "guojiazhongdianyanfajihuazhengshi",
+          "competing_interpretations": [
+            "国家重点研发计划正式",
+            "国家重点研发计划正是"
+          ],
+          "resolved": "国家重点研发计划正式"
+        },
+        {
+          "prefix": "guojiazhongdianyanfajihuazhengshiqidong",
+          "competing_interpretations": [
+            "国家重点研发计划正式启动"
+          ],
+          "resolved": "国家重点研发计划正式启动",
+          "notes": "Trailing 启动 disambiguates 正式 over 正是."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_03",
+      "length_bucket": "long",
+      "char_count": 14,
+      "pinyin": "zhonghuarenmingongheguochengliqishiwuzhounian",
+      "syllable_segments": [
+        "zhong",
+        "hua",
+        "ren",
+        "min",
+        "gong",
+        "he",
+        "guo",
+        "cheng",
+        "li",
+        "qi",
+        "shi",
+        "wu",
+        "zhou",
+        "nian"
+      ],
+      "expected_text": "中华人民共和国成立七十五周年",
+      "ambiguity_type": [
+        "homophone",
+        "long_context_collocation"
+      ],
+      "progression": [
+        {
+          "prefix": "zhonghua",
+          "competing_interpretations": [
+            "中华",
+            "种花"
+          ],
+          "resolved": "中华"
+        },
+        {
+          "prefix": "zhonghuarenmingongheguo",
+          "competing_interpretations": [
+            "中华人民共和国"
+          ],
+          "resolved": "中华人民共和国"
+        },
+        {
+          "prefix": "zhonghuarenmingongheguochengliqishi",
+          "competing_interpretations": [
+            "中华人民共和国成立其实",
+            "中华人民共和国成立七十"
+          ],
+          "resolved": "中华人民共和国成立七十"
+        },
+        {
+          "prefix": "zhonghuarenmingongheguochengliqishiwuzhounian",
+          "competing_interpretations": [
+            "中华人民共和国成立七十五周年"
+          ],
+          "resolved": "中华人民共和国成立七十五周年",
+          "notes": "Trailing 周年 locks 七十五 over 其实/启示."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_04",
+      "length_bucket": "long",
+      "char_count": 16,
+      "pinyin": "changanqichezuixinyanfafanganshunlitongguopingshen",
+      "syllable_segments": [
+        "chang",
+        "an",
+        "qi",
+        "che",
+        "zui",
+        "xin",
+        "yan",
+        "fa",
+        "fang",
+        "an",
+        "shun",
+        "li",
+        "tong",
+        "guo",
+        "ping",
+        "shen"
+      ],
+      "expected_text": "长安汽车最新研发方案顺利通过评审",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an",
+        "homophone"
+      ],
+      "progression": [
+        {
+          "prefix": "changan",
+          "competing_interpretations": [
+            "长安 (chang'an)",
+            "产干 (chan'gan)"
+          ],
+          "resolved": "长安"
+        },
+        {
+          "prefix": "changanqiche",
+          "competing_interpretations": [
+            "长安汽车"
+          ],
+          "resolved": "长安汽车"
+        },
+        {
+          "prefix": "changanqichezuixinyanfafangan",
+          "competing_interpretations": [
+            "长安汽车最新研发方案",
+            "长安汽车最新研发反感"
+          ],
+          "resolved": "长安汽车最新研发方案"
+        },
+        {
+          "prefix": "changanqichezuixinyanfafanganshunlitongguopingshen",
+          "competing_interpretations": [
+            "长安汽车最新研发方案顺利通过评审"
+          ],
+          "resolved": "长安汽车最新研发方案顺利通过评审",
+          "notes": "Two zero-initial 'an' boundaries (changan, fangan) plus 评审 resolved globally."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_05",
+      "length_bucket": "long",
+      "char_count": 18,
+      "pinyin": "qinghuadaxuejisuanjixiyanjiushengfabiaogaoshuipinglunwen",
+      "syllable_segments": [
+        "qing",
+        "hua",
+        "da",
+        "xue",
+        "ji",
+        "suan",
+        "ji",
+        "xi",
+        "yan",
+        "jiu",
+        "sheng",
+        "fa",
+        "biao",
+        "gao",
+        "shui",
+        "ping",
+        "lun",
+        "wen"
+      ],
+      "expected_text": "清华大学计算机系研究生发表高水平论文",
+      "ambiguity_type": [
+        "homophone",
+        "long_context_collocation"
+      ],
+      "progression": [
+        {
+          "prefix": "qinghua",
+          "competing_interpretations": [
+            "清华",
+            "情话"
+          ],
+          "resolved": "清华"
+        },
+        {
+          "prefix": "qinghuadaxuejisuanjixi",
+          "competing_interpretations": [
+            "清华大学计算机系",
+            "清华大学计算机细"
+          ],
+          "resolved": "清华大学计算机系"
+        },
+        {
+          "prefix": "qinghuadaxuejisuanjixiyanjiusheng",
+          "competing_interpretations": [
+            "清华大学计算机系研究生"
+          ],
+          "resolved": "清华大学计算机系研究生"
+        },
+        {
+          "prefix": "qinghuadaxuejisuanjixiyanjiushengfabiaogaoshuipinglunwen",
+          "competing_interpretations": [
+            "清华大学计算机系研究生发表高水平论文"
+          ],
+          "resolved": "清华大学计算机系研究生发表高水平论文",
+          "notes": "Long academic context locks 系, 发表, 高水平, and 论文."
+        }
+      ]
+    },
+    {
+      "id": "qp_long_06",
+      "length_bucket": "long",
+      "char_count": 21,
+      "pinyin": "tamenzaijinanpingandadaoshangcanguanlehaierzhinengjiajuzhanting",
+      "syllable_segments": [
+        "ta",
+        "men",
+        "zai",
+        "ji",
+        "nan",
+        "ping",
+        "an",
+        "da",
+        "dao",
+        "shang",
+        "can",
+        "guan",
+        "le",
+        "hai",
+        "er",
+        "zhi",
+        "neng",
+        "jia",
+        "ju",
+        "zhan",
+        "ting"
+      ],
+      "expected_text": "他们在济南平安大道上参观了海尔智能家居展厅",
+      "ambiguity_type": [
+        "segmentation",
+        "zero_initial_an",
+        "zero_initial_er",
+        "homophone",
+        "long_context_collocation"
+      ],
+      "progression": [
+        {
+          "prefix": "tamen",
+          "competing_interpretations": [
+            "他们",
+            "她们",
+            "它们"
+          ],
+          "resolved": "他们"
+        },
+        {
+          "prefix": "tamenzaijinan",
+          "competing_interpretations": [
+            "他们在济南 (ji'nan)",
+            "他们在金安 (jin'an)"
+          ],
+          "resolved": "他们在济南"
+        },
+        {
+          "prefix": "tamenzaijinanpingandadaoshang",
+          "competing_interpretations": [
+            "他们在济南平安大道上"
+          ],
+          "resolved": "他们在济南平安大道上"
+        },
+        {
+          "prefix": "tamenzaijinanpingandadaoshangcanguanlehaierzhinengjiaju",
+          "competing_interpretations": [
+            "...海尔只能加剧",
+            "...海尔智能家居"
+          ],
+          "resolved": "他们在济南平安大道上参观了海尔智能家居"
+        },
+        {
+          "prefix": "tamenzaijinanpingandadaoshangcanguanlehaierzhinengjiajuzhanting",
+          "competing_interpretations": [
+            "他们在济南平安大道上参观了海尔智能家居展厅"
+          ],
+          "resolved": "他们在济南平安大道上参观了海尔智能家居展厅",
+          "notes": "Trailing 展厅 decisively favors 智能家居 over 只能加剧, while 海尔/济南/平安 test three segmentation boundaries."
+        }
+      ]
+    }
+  ]
+}

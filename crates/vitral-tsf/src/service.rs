@@ -11,6 +11,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
+use vitral_core::windows_host::PipeClient;
 use windows::{
     core::*,
     Win32::{
@@ -39,6 +40,20 @@ impl Drop for Live {
         OBJECTS.fetch_sub(1, Ordering::Release);
     }
 }
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct PanelText {
+    data: *const u8,
+    len: usize,
+}
+impl From<&str> for PanelText {
+    fn from(text: &str) -> Self {
+        Self {
+            data: text.as_ptr(),
+            len: text.len(),
+        }
+    }
+}
 extern "C" {
     fn vitral_register(install: bool) -> HRESULT;
     fn vitral_module_path(path: *mut u16, size: u32) -> u32;
@@ -52,8 +67,10 @@ extern "C" {
         active: bool,
         english: bool,
         mode: i32,
+        preedit: PanelText,
+        page: u64,
         caret: *const RECT,
-        words: *const *const u16,
+        words: *const PanelText,
         count: i32,
         selected: i32,
         glow: bool,
@@ -127,11 +144,12 @@ impl IClassFactory_Impl for Factory_Impl {
 struct View {
     active: bool,
     english: bool,
-    paste_id: String,
     prediction_id: u64,
     prediction_text: String,
     context_before: String,
     mode: i32,
+    preedit: String,
+    page: u64,
     caret: RECT,
     selected: usize,
     words: Vec<String>,
@@ -141,6 +159,7 @@ struct View {
 struct Editor {
     id: String,
     host: PathBuf,
+    pipe: RefCell<PipeClient>,
     mgr: RefCell<Option<ITfThreadMgr>>,
     tid: Cell<u32>,
     cookie: Cell<Option<u32>>,
@@ -180,42 +199,37 @@ impl Drop for Editor {
 }
 impl Editor {
     fn call(&self, name: &str, v: Value) -> Result<Value> {
-        vitral_core::windows_host::request_with_timeout(
-            &self.host,
-            &self.id,
-            name,
-            &v,
-            Duration::from_millis(1500),
-        )
-        .map_err(|e| {
-            self.ipc_failed.set(true);
-            Error::new(E_FAIL, e.to_string())
-        })
+        self.pipe
+            .borrow_mut()
+            .request_with_timeout(&self.host, &self.id, name, &v, Duration::from_millis(1500))
+            .map_err(|e| {
+                self.ipc_failed.set(true);
+                Error::new(E_FAIL, e.to_string())
+            })
     }
     fn draw(&self, glow: bool, activity: bool) {
         let v = self.view.borrow();
-        let words = if !v.prediction_text.is_empty()
-            && self.composition.borrow().is_none()
-            && v.mode == 0
-        {
-            vec![format!("Tab 补全：{}", v.prediction_text)]
-        } else {
-            v.words.clone()
-        };
-        let strings: Vec<Vec<u16>> = words
-            .iter()
-            .map(|s| s.encode_utf16().chain(Some(0)).collect())
-            .collect();
-        let pointers: Vec<_> = strings.iter().map(|s| s.as_ptr()).collect();
+        let prediction =
+            (!v.prediction_text.is_empty() && self.composition.borrow().is_none() && v.mode == 0)
+                .then(|| format!("Tab 补全：{}", v.prediction_text));
+        let words = prediction
+            .as_ref()
+            .map_or(v.words.as_slice(), std::slice::from_ref);
+        let mut text = [PanelText::from(""); 5];
+        for (dest, word) in text.iter_mut().zip(words) {
+            *dest = PanelText::from(word.as_str());
+        }
         unsafe {
             vitral_panel_update(
                 self.panel.get(),
                 v.active,
                 v.english,
                 v.mode,
+                PanelText::from(v.preedit.as_str()),
+                v.page,
                 &v.caret,
-                pointers.as_ptr(),
-                pointers.len() as _,
+                text.as_ptr(),
+                words.len().min(text.len()) as _,
                 v.selected as _,
                 glow,
                 activity,
@@ -258,6 +272,7 @@ impl Editor {
     }
     fn reset_local(&self) {
         self.clear_prediction();
+        self.pipe.take();
         self.shift_held.set(false);
         self.view.replace(View::default());
         self.shortcuts.borrow_mut().clear();
@@ -443,20 +458,14 @@ impl Editor {
             let mut v = self.view.borrow_mut();
             v.active = opened.is_ok();
             if let Ok(r) = opened {
-                v.paste_id = r["quick_paste"]["id"].as_str().unwrap_or("").into();
                 if let Ok(action) = self.call("candidate-state", json!({})) {
+                    v.preedit = action["preedit"]["text"].as_str().unwrap_or("").into();
+                    v.page = action["page"]["page_index"].as_u64().unwrap_or(0);
                     v.words = action["candidates"]
                         .as_array()
                         .into_iter()
                         .flatten()
-                        .map(|c| {
-                            let text = c["text"].as_str().unwrap_or("");
-                            if c["quick_paste_id"].is_string() {
-                                format!("粘贴 {text}")
-                            } else {
-                                text.into()
-                            }
-                        })
+                        .map(|c| c["text"].as_str().unwrap_or("").into())
                         .collect();
                 }
                 v.english = r["lang_mode"] == "en";
@@ -605,6 +614,7 @@ impl Service {
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ),
                 host,
+                pipe: Default::default(),
                 mgr: Default::default(),
                 tid: Cell::new(0),
                 cookie: Cell::new(None),
@@ -710,7 +720,11 @@ impl ITfCompositionSink_Impl for Service_Impl {
                 self.editor.reset_local();
                 return Ok(());
             }
-            self.editor.view.borrow_mut().words.clear();
+            let mut view = self.editor.view.borrow_mut();
+            view.preedit.clear();
+            view.page = 0;
+            view.words.clear();
+            drop(view);
             self.editor.draw(false, true);
         }
         Ok(())
@@ -1166,6 +1180,9 @@ impl ITfEditSession_Impl for Edit_Impl {
         if a.cmd == "hw-confirm" {
             v.mode = 0;
         }
+        v.preedit.clear();
+        v.preedit.push_str(pre);
+        v.page = r["page"]["page_index"].as_u64().unwrap_or(0);
         v.selected = 0;
         v.words.clear();
         v.values.clear();
@@ -1174,9 +1191,7 @@ impl ITfEditSession_Impl for Edit_Impl {
             for c in candidates.iter().take(5) {
                 let text = c["text"].as_str().or(c["char"].as_str()).unwrap_or("");
                 v.values.push(text.into());
-                v.words.push(if c["quick_paste_id"].is_string() {
-                    format!("粘贴 {text}")
-                } else if let Some(py) = c["toned_pinyin"].as_str() {
+                v.words.push(if let Some(py) = c["toned_pinyin"].as_str() {
                     format!(
                         "{} {} {}",
                         text,
@@ -1309,20 +1324,6 @@ unsafe extern "C" fn panel_event(
             drop(view);
             ed.draw(false, false);
             return;
-        }
-        8 => {
-            let Ok(r) = ed.call("quick-paste-state", json!({})) else {
-                ed.reset_local();
-                return;
-            };
-            let id = r["quick_paste"]["id"].as_str().unwrap_or("");
-            let mut view = ed.view.borrow_mut();
-            if view.paste_id == id || view.mode != 0 {
-                return;
-            }
-            view.paste_id = id.into();
-            drop(view);
-            Action::new("candidate-state", json!({}))
         }
         _ => return,
     };

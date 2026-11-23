@@ -2,14 +2,13 @@
 use super::{
     qwen_bpe::QwenBpe,
     qwen_onnx::{self, error},
-    SpeechContext,
+    SpeechContext, SpeechModelCache,
 };
 use crate::error::VitralError;
 use ort::{
     session::Session,
     value::{DynTensorValueType, Tensor},
 };
-use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 
 fn mel_features(samples: &[i16]) -> Vec<f32> {
@@ -81,7 +80,6 @@ fn parse_transcript(text: &str) -> (String, String) {
     )
 }
 struct Model {
-    dir: PathBuf,
     conv: Session,
     encoder: Session,
     decoder: Session,
@@ -90,7 +88,6 @@ struct Model {
 impl Model {
     fn load(dir: &Path) -> Result<Self, VitralError> {
         Ok(Self {
-            dir: dir.into(),
             conv: qwen_onnx::session(&dir.join("conv_frontend.onnx"))?,
             encoder: qwen_onnx::session(&dir.join("encoder.int8.onnx"))?,
             decoder: qwen_onnx::session(&dir.join("decoder.int8.onnx"))?,
@@ -250,21 +247,21 @@ impl Model {
         Ok(parse_transcript(&self.tokenizer.decode(&generated, false)))
     }
 }
-static MODEL: Mutex<Option<Model>> = Mutex::new(None);
+static MODEL: SpeechModelCache<PathBuf, Model> = SpeechModelCache::new();
 pub(super) fn transcribe(
     samples: &[i16],
     dir: &Path,
     ctx: &SpeechContext,
 ) -> Result<(String, String), VitralError> {
-    let mut model = MODEL.lock();
-    if model.as_ref().is_none_or(|m| m.dir != dir) {
-        *model = None;
+    let handle = MODEL.model(dir.to_path_buf());
+    let mut model = handle.lock();
+    if model.is_none() {
         *model = Some(Model::load(dir)?);
     }
     model.as_mut().unwrap().decode(samples, ctx)
 }
 pub(super) fn clear_cache() {
-    *MODEL.lock() = None;
+    MODEL.clear();
 }
 #[cfg(test)]
 mod tests {
@@ -348,6 +345,6 @@ mod tests {
         assert!(text.contains("天气") || text.contains("你好"));
         assert!(!text.contains("<asr_text>"));
         clear_cache();
-        assert!(MODEL.lock().is_none());
+        assert!(MODEL.is_empty());
     }
 }

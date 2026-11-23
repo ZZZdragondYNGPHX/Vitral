@@ -214,7 +214,10 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             json!({"sample_count":samples.len()})
         }
         "voice-stop" => to_value(core.voice_stop()?)?,
-        "llm-unload" => { core.predict_cancel(); crate::ai::unload_local_llm(); json!({"ok":true}) },
+        "llm-unload" => {
+            core.unload_idle_models();
+            json!({"ok":true})
+        }
         "ai-inline" => to_value(core.ai_inline(
             arg(v, "mode")?,
             string(v, "text")?,

@@ -17,6 +17,41 @@ pub struct SpeechContext {
     pub context_before: String,
 }
 
+#[cfg(feature = "native-voice")]
+type SpeechModel<M> = std::sync::Arc<parking_lot::Mutex<Option<M>>>;
+
+#[cfg(feature = "native-voice")]
+struct SpeechModelCache<K, M>(parking_lot::Mutex<Option<(K, SpeechModel<M>)>>);
+
+#[cfg(feature = "native-voice")]
+impl<K: PartialEq, M> SpeechModelCache<K, M> {
+    const fn new() -> Self {
+        Self(parking_lot::Mutex::new(None))
+    }
+
+    fn model(&self, key: K) -> SpeechModel<M> {
+        let mut cache = self.0.lock();
+        if let Some((_, model)) = cache.as_ref().filter(|(cached, _)| *cached == key) {
+            return std::sync::Arc::clone(model);
+        }
+        let model = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let previous = cache.replace((key, std::sync::Arc::clone(&model)));
+        drop(cache);
+        drop(previous);
+        model
+    }
+
+    fn clear(&self) {
+        let removed = self.0.lock().take();
+        drop(removed);
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.0.lock().is_none()
+    }
+}
+
 pub struct SpeechRecognizer;
 impl SpeechRecognizer {
     pub fn transcribe(
@@ -498,6 +533,64 @@ pub fn phonetic_correct_transcript(
 #[cfg(test)]
 mod qwen_tests {
     use super::*;
+    #[cfg(feature = "native-voice")]
+    #[test]
+    fn speech_cache_clear_keeps_active_handle_alive() {
+        let cache = SpeechModelCache::new();
+        let old = cache.model("model");
+        *old.lock() = Some(String::from("loaded"));
+        let ref_to_old = std::sync::Arc::downgrade(&old);
+        cache.clear();
+        assert!(cache.is_empty());
+        let new = cache.model("model");
+        assert!(new.lock().is_none());
+        assert_eq!(old.lock().as_deref(), Some("loaded"));
+        drop(old);
+        assert!(ref_to_old.upgrade().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-voice", feature = "native-onnx"))]
+    #[test]
+    fn llm_unload_drops_cached_handwriting_and_voice_and_allows_reload() {
+        use crate::hw::onnx_models::HwOnnxBundle;
+        use crate::models::ModelPaths;
+        use std::path::Path;
+        use std::sync::Arc;
+
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+        let paths = ModelPaths::bundled(Some(&assets));
+        let core = crate::VitralCore::init(r#"{"pure_offline":true}"#).unwrap();
+        let hw = HwOnnxBundle::load_paths(&paths);
+        assert!(hw.has_hw_onnx());
+        let context = ['你', '好'];
+        let encoded = hw.encode_rbt3_context(&context).unwrap();
+
+        let wav = include_bytes!("../../../tests/fixtures/audio/mandarin_short_16k.wav");
+        let pcm: Vec<i16> = wav[44..].chunks_exact(2)
+            .map(|frame| i16::from_le_bytes([frame[0], frame[1]]))
+            .collect();
+        let transcribe = || SpeechRecognizer::transcribe(&pcm, &paths, &SpeechContext::default()).unwrap();
+        let speech = transcribe();
+        assert_eq!(speech.1, "zh");
+        assert!(!speech.0.is_empty());
+        assert!(!sensevoice::cache_is_empty());
+
+        let old = Arc::downgrade(&hw);
+        let response = crate::commands::execute(&core, "llm-unload", &serde_json::json!({})).unwrap();
+        assert_eq!(response, serde_json::json!({"ok":true}));
+        assert!(sensevoice::cache_is_empty());
+        let reloaded = HwOnnxBundle::load_paths(&paths);
+        assert!(!Arc::ptr_eq(&hw, &reloaded));
+        assert_eq!(hw.encode_rbt3_context(&context).unwrap(), encoded);
+        drop(hw);
+        assert!(old.upgrade().is_none());
+        assert!(reloaded.has_hw_onnx());
+        assert_eq!(reloaded.encode_rbt3_context(&context).unwrap(), encoded);
+        assert_eq!(transcribe(), speech);
+        assert!(!sensevoice::cache_is_empty());
+        crate::commands::execute(&core, "llm-unload", &serde_json::json!({})).unwrap();
+    }
+
     #[test]
     fn asr_keeps_common_words_without_positive_context() {
         let mut r = crate::ret::RetentionEngine::default();

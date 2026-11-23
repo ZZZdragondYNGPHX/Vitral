@@ -243,6 +243,7 @@ impl FlatWordTable {
 
 pub struct ImportedLexiconIndex {
     assets_dir: Option<PathBuf>,
+    corpus_cache_dir: Option<PathBuf>,
     corpus: OnceLock<Arc<RimeDictCorpus>>,
     entries: Vec<ImportedLexiconEntry>,
     by_quanpin: HashMap<String, Vec<ImportedLexiconEntry>>,
@@ -258,12 +259,13 @@ pub struct ImportedLexiconIndex {
 
 impl ImportedLexiconIndex {
     pub fn new(assets_dir: Option<&Path>) -> Self {
-        let resolved = assets_dir
-            .filter(|p| p.join("rime").is_dir())
-            .map(PathBuf::from)
-            .or_else(default_assets_dir_candidates);
+        Self::with_corpus_cache(assets_dir, None)
+    }
+
+    pub(crate) fn with_corpus_cache(assets_dir: Option<&Path>, cache_dir: Option<&Path>) -> Self {
         Self {
-            assets_dir: resolved,
+            assets_dir: Self::resolve_assets(assets_dir),
+            corpus_cache_dir: cache_dir.map(PathBuf::from),
             corpus: OnceLock::new(),
             entries: Vec::new(),
             by_quanpin: HashMap::new(),
@@ -278,9 +280,25 @@ impl ImportedLexiconIndex {
         }
     }
 
+    fn resolve_assets(assets_dir: Option<&Path>) -> Option<PathBuf> {
+        assets_dir
+            .filter(|p| p.join("rime").is_dir())
+            .map(PathBuf::from)
+            .or_else(default_assets_dir_candidates)
+    }
+
+    pub(crate) fn reload_assets(&mut self, assets_dir: Option<&Path>) {
+        self.assets_dir = Self::resolve_assets(assets_dir);
+        self.corpus.take();
+    }
+
     pub fn corpus(&self) -> &Arc<RimeDictCorpus> {
-        self.corpus
-            .get_or_init(|| RimeDictCorpus::load_or_fallback(self.assets_dir.as_deref()))
+        self.corpus.get_or_init(|| {
+            RimeDictCorpus::load_or_fallback_with_cache(
+                self.assets_dir.as_deref(),
+                self.corpus_cache_dir.as_deref(),
+            )
+        })
     }
 
     pub fn export_entries(&self) -> Vec<ImportedLexiconEntry> {
@@ -499,17 +517,19 @@ impl ImportedLexiconIndex {
     }
 
     pub fn query_quanpin(&self, compact_py: &str) -> Vec<ImportedLexiconEntry> {
-        self.by_quanpin
-            .get(compact_py)
-            .cloned()
-            .unwrap_or_default()
+        self.quanpin_entries(compact_py).to_vec()
     }
 
     pub fn query_xiaohe(&self, xiaohe_code: &str) -> Vec<ImportedLexiconEntry> {
-        self.by_xiaohe
-            .get(xiaohe_code)
-            .cloned()
-            .unwrap_or_default()
+        self.xiaohe_entries(xiaohe_code).to_vec()
+    }
+
+    pub(crate) fn quanpin_entries(&self, code: &str) -> &[ImportedLexiconEntry] {
+        self.by_quanpin.get(code).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn xiaohe_entries(&self, code: &str) -> &[ImportedLexiconEntry] {
+        self.by_xiaohe.get(code).map_or(&[], Vec::as_slice)
     }
 
     /// Imported-hotword-only lookup (without falling back to base corpus).
@@ -569,15 +589,13 @@ impl ImportedLexiconIndex {
             return Some(10.0 + ((w as f32).max(1.0)).ln());
         }
         let corpus = self.corpus();
-        if let Some((_, w)) = corpus.word_readings.get(word) {
-            return Some(((*w as f32).max(1.0)).ln());
+        if let Some(w) = corpus.word_weight(word) {
+            return Some(((w as f32).max(1.0)).ln());
         }
         if word.chars().count() == 1 {
             let ch = word.chars().next()?;
-            if let Some(list) = corpus.char_readings.get(&ch) {
-                if let Some((_, w)) = list.first() {
-                    return Some(((*w as f32).max(1.0)).ln() * 0.8);
-                }
+            if let Some((_, w)) = corpus.char_readings(ch).next() {
+                return Some(((w as f32).max(1.0)).ln() * 0.8);
             }
         }
         None

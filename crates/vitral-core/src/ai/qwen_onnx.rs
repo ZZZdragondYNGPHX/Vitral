@@ -58,6 +58,23 @@ pub(super) fn half_to_float(h: u16) -> f32 {
         _ => sign * (1.0 + mant as f32 / 1024.0) * 2f32.powi(i32::from(exp) - 15),
     }
 }
+
+fn greedy_row(scores: impl Iterator<Item = f32>, mut repeated: &[usize], penalty: f32) -> Option<i64> {
+    scores
+        .enumerate()
+        .filter_map(|(id, mut score)| {
+            if repeated.first() == Some(&id) {
+                while repeated.first() == Some(&id) {
+                    repeated = &repeated[1..];
+                }
+                score = if score < 0.0 { score * penalty } else { score / penalty };
+            }
+            score.is_finite().then_some((id, score))
+        })
+        .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
+        .map(|(id, _)| id as i64)
+}
+
 pub(super) fn greedy(value: &DynValue, previous: &[i64], penalty: f32) -> Result<i64, VitralError> {
     let t = value
         .view()
@@ -72,38 +89,32 @@ pub(super) fn greedy(value: &DynValue, previous: &[i64], penalty: f32) -> Result
     if !t.memory_info().is_cpu_accessible() {
         return Err(error("logits must be CPU-accessible"));
     }
-    let mut scores = match t.data_type() {
+    // Sort only the small repetition window to scan the vocabulary in one pass.
+    let mut repeated = [0; 64];
+    let mut count = 0;
+    for id in previous.iter().rev().take(64).filter_map(|&id| usize::try_from(id).ok()) {
+        if id < vocab {
+            repeated[count] = id;
+            count += 1;
+        }
+    }
+    let repeated = &mut repeated[..count];
+    repeated.sort_unstable();
+    let best = match t.data_type() {
         TensorElementType::Float32 => {
-            value.try_extract_tensor::<f32>().map_err(error)?.1[offset..offset + vocab].to_vec()
+            let (_, logits) = value.try_extract_tensor::<f32>().map_err(error)?;
+            greedy_row(logits[offset..offset + vocab].iter().copied(), repeated, penalty)
         }
         TensorElementType::Float16 | TensorElementType::Uint16 => {
             // The shape bounds the slice; the session output is CPU-accessible.
             let row = unsafe {
                 std::slice::from_raw_parts(t.data_ptr().cast::<u16>().add(offset), vocab)
             };
-            row.iter().map(|&h| half_to_float(h)).collect()
+            greedy_row(row.iter().copied().map(half_to_float), repeated, penalty)
         }
         _ => return Err(error("unsupported logits type")),
     };
-    let mut seen = std::collections::HashSet::new();
-    for &id in previous.iter().rev().take(64) {
-        if seen.insert(id) {
-            if let Some(score) = usize::try_from(id).ok().and_then(|id| scores.get_mut(id)) {
-                *score = if *score < 0.0 {
-                    *score * penalty
-                } else {
-                    *score / penalty
-                };
-            }
-        }
-    }
-    scores
-        .iter()
-        .enumerate()
-        .filter(|(_, score)| score.is_finite())
-        .max_by(|(ai, a), (bi, b)| a.total_cmp(b).then_with(|| bi.cmp(ai)))
-        .map(|(id, _)| id as i64)
-        .ok_or_else(|| error("no finite logits"))
+    best.ok_or_else(|| error("no finite logits"))
 }
 /// The ASR export returns only new KV positions, in [B,T,H,D] order.
 #[cfg(feature = "native-voice")]
@@ -157,6 +168,40 @@ pub(super) fn apply_delta(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greedy_fp32_and_fp16_penalties_and_ties_match() {
+        let _env = crate::onnx_env::get_ort_env().unwrap();
+        for (row, half, expected) in [
+            // Repeating token 0 twice still applies a single penalty, giving it a tie with 1.
+            ([4.0, 2.0, 1.0], [0x4400, 0x4000, 0x3c00], 0),
+            ([-1.0, -1.5, -2.0], [0xbc00, 0xbe00, 0xc000], 1),
+            ([f32::INFINITY, f32::NAN, -2.0], [0x7c00, 0x7e00, 0xc000], 2),
+        ] {
+            let f32_logits = Tensor::from_array((
+                [1, 2, 3],
+                vec![100.0, 100.0, 100.0, row[0], row[1], row[2]],
+            )).unwrap().into_dyn();
+            let mut f16 = zeros(TensorElementType::Float16, vec![1, 2, 3])
+                .unwrap()
+                .downcast::<DynTensorValueType>()
+                .unwrap();
+            // Only the last row should determine the result.
+            let raw = [0x5640u16, 0x5640, 0x5640, half[0], half[1], half[2]];
+            unsafe {
+                std::ptr::copy_nonoverlapping(raw.as_ptr(), f16.data_ptr_mut().cast::<u16>(), raw.len());
+            }
+            let f16_logits = f16.into_dyn();
+            for logits in [&f32_logits, &f16_logits] {
+                let mut previous = [-1; 65];
+                previous[0] = 1; // Outside the 64-token window.
+                previous[62] = i64::MAX;
+                previous[63..].fill(0);
+                assert_eq!(greedy(logits, &previous, 2.0).unwrap(), expected);
+            }
+        }
+    }
+
     #[cfg(feature = "native-voice")]
     #[test]
     fn kv_delta_and_fp16_logits() {

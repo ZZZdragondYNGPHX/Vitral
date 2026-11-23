@@ -63,6 +63,8 @@ pub struct InputState {
     pub retention: RetentionEngine,
     pub profile: profile::ProfileEngine,
     pub voice: VoiceSession,
+    #[cfg(feature = "native-onnx")]
+    semantic_worker_running: bool,
 }
 
 pub struct SyncState {
@@ -72,15 +74,41 @@ pub struct SyncState {
     pub device_id: String,
     pub device_name: String,
     cloud_ring_seen: bool,
+    local_tier1_dirty: bool,
     backup_pending: bool,
     backup_generation: u64,
     last_cleanup: Option<std::time::Instant>,
     clipboard_changes: clip::RingChanges,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tier1Sync {
+    Changed,
+    Local,
+    All,
+}
+
+#[derive(Default)]
+struct ClipboardWrites {
+    changes: Option<clip::RingChanges>,
+    history: Option<Vec<clip::ClipboardEntry>>,
+    current: Option<clip::ClipboardCurrent>,
+}
+
+#[derive(Default)]
+struct SyncStateIo {
+    clipboard_history_dirty: bool,
+    clipboard_changes_dirty: bool,
+    clipboard_current_dirty: bool,
+}
+
 pub struct VitralCore {
     local_dir: Option<std::path::PathBuf>,
     clipboard_io: Mutex<()>,
+    // Acquire before sync for local writes, and release sync before saving the snapshot.
+    sync_state_io: Mutex<SyncStateIo>,
+    tier1_io: Mutex<()>,
+    tier1_upload: Mutex<()>,
     lan_session: Mutex<Option<lan::DiscoverySession>>,
     ai: RwLock<Arc<AiClient>>,
     offline_guard: OfflineGuard,
@@ -88,6 +116,8 @@ pub struct VitralCore {
     input: Arc<Mutex<InputState>>,
     models: models::ModelManager,
     prediction: predict::PredictEngine,
+    #[cfg(feature = "native-onnx")]
+    semantic_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     sync: Mutex<SyncState>,
 }
 
@@ -100,7 +130,22 @@ pub struct ContextNextHint {
 }
 
 impl Drop for VitralCore {
-    fn drop(&mut self) { self.prediction.cancel(); }
+    fn drop(&mut self) {
+        self.prediction.cancel();
+        #[cfg(feature = "native-onnx")]
+        {
+            let handle = {
+                let mut worker = self.semantic_worker.lock();
+                self.input.lock().engine.reset_commit_context();
+                worker.take()
+            };
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+        }
+        self.sync_tier1_best_effort(Tier1Sync::Local);
+        let _ = self.flush_dirty_clipboard();
+    }
 }
 
 impl VitralCore {
@@ -139,20 +184,23 @@ impl VitralCore {
 
         let ai = AiClient::from(&config);
         let mut engine = EngineState::new(config);
-        let imported_lexicon = Arc::new(RwLock::new(ImportedLexiconIndex::new(
-            engine.resolved_assets_dir.as_deref(),
-        )));
         let models = models::ModelManager::new(&engine.config, engine.resolved_assets_dir.as_deref())?;
         engine.model_paths = models.paths();
         engine.pure_rust.set_model_paths(&engine.model_paths);
-        // Keep lazy corpus loading outside the realtime hint path.
+        // Keep the grammar and corpus's initial reads outside the keystroke path.
+        engine.pure_rust.get_gram();
+        let local_dir = (!engine.config.data_dir.is_empty())
+            .then(|| std::path::PathBuf::from(&engine.config.data_dir));
+        let imported_lexicon = Arc::new(RwLock::new(ImportedLexiconIndex::with_corpus_cache(
+            engine.resolved_assets_dir.as_deref(),
+            local_dir.as_deref(),
+        )));
         engine.pure_rust.get_corpus();
         crate::imp::xiaohe::canonical_syllable_set();
         let mut hw = HandwritingSession::with_assets_dir(engine.resolved_assets_dir.as_deref());
         hw.set_model_paths(engine.model_paths.clone());
         let voice = VoiceSession { model_paths: engine.model_paths.clone(), ..Default::default() };
 
-        let local_dir = (!engine.config.data_dir.is_empty()).then(|| std::path::PathBuf::from(&engine.config.data_dir));
         let mut retention = RetentionEngine::with_half_life(half_life_sec);
         let mut clipboard = ClipboardManager::with_device(ring_cap, &device_id);
         if let Some(dir) = &local_dir {
@@ -186,7 +234,10 @@ impl VitralCore {
         Ok(Self {
             prediction: predict::PredictEngine::default(),
             local_dir,
-            clipboard_io:Mutex::new(()),
+            clipboard_io: Mutex::new(()),
+            sync_state_io: Mutex::default(),
+            tier1_io: Mutex::new(()),
+            tier1_upload: Mutex::new(()),
             lan_session: Mutex::new(None),
             ai: RwLock::new(Arc::new(ai)),
             offline_guard: OfflineGuard::new(pure_offline),
@@ -198,11 +249,16 @@ impl VitralCore {
                 retention,
                 profile,
                 voice,
+                #[cfg(feature = "native-onnx")]
+                semantic_worker_running: false,
             })),
+            #[cfg(feature = "native-onnx")]
+            semantic_worker: Mutex::new(None),
             sync: Mutex::new(SyncState {
                 clipboard,
                 devices,
                 cloud_ring_seen: false,
+                local_tier1_dirty: false,
                 backup_pending,
                 backup_generation: 0,
                 last_cleanup: None,
@@ -218,23 +274,144 @@ impl VitralCore {
         Arc::clone(&self.imported_lexicon)
     }
 
-    fn save_local(&self, name:&str, value:&impl serde::Serialize) {
-        if let Some(dir)=&self.local_dir {
-            if let Err(e)=local::save(dir,name,value){eprintln!("Vitral: failed to save {name}: {e}");}
+    pub fn unload_idle_models(&self) {
+        self.predict_cancel();
+        #[cfg(feature = "native-onnx")]
+        {
+            let handle = {
+                let mut worker = self.semantic_worker.lock();
+                self.input.lock().engine.cancel_pending_semantic_context();
+                worker.take()
+            };
+            if let Some(handle) = handle {
+                let _ = handle.join();
+            }
+        }
+        crate::hw::onnx_models::HwOnnxBundle::clear_cache();
+        crate::ai::clear_model_cache();
+    }
+
+    fn schedule_semantic_context(&self) {
+        #[cfg(feature = "native-onnx")]
+        {
+            let mut worker = self.semantic_worker.lock();
+            let task = {
+                let mut st = self.input.lock();
+                if st.semantic_worker_running {
+                    return;
+                }
+                let Some(task) = st.engine.take_semantic_context() else { return };
+                st.semantic_worker_running = true;
+                task
+            };
+            let input = Arc::downgrade(&self.input);
+            let result = std::thread::Builder::new()
+                .name("vitral-semantic-context".into())
+                .spawn(move || {
+                    let (mut epoch, mut context, mut paths) = task;
+                    loop {
+                        {
+                            let Some(input) = input.upgrade() else { break };
+                            let mut st = input.lock();
+                            if !st.engine.is_semantic_epoch(epoch) {
+                                if let Some(next) = st.engine.take_semantic_context() {
+                                    (epoch, context, paths) = next;
+                                    continue;
+                                }
+                                st.semantic_worker_running = false;
+                                break;
+                            }
+                        }
+                        let bundle = hw::onnx_models::HwOnnxBundle::load_paths(&paths);
+                        let result = bundle.encode_rbt3_context(&context);
+                        if result.is_none() {
+                            eprintln!("Vitral: semantic context inference failed");
+                        }
+                        let Some(input) = input.upgrade() else { break };
+                        let mut st = input.lock();
+                        if let Some((vector, priors)) = result {
+                            st.engine.apply_semantic_context(epoch, vector, priors);
+                        }
+                        if let Some(next) = st.engine.take_semantic_context() {
+                            (epoch, context, paths) = next;
+                        } else {
+                            st.semantic_worker_running = false;
+                            break;
+                        }
+                    }
+                });
+            match result {
+                Ok(handle) => {
+                    let prev = worker.replace(handle);
+                    drop(worker);
+                    drop(prev);
+                }
+                Err(error) => {
+                    self.input.lock().semantic_worker_running = false;
+                    drop(worker);
+                    eprintln!("Vitral: failed to start semantic context worker: {error}");
+                }
+            }
         }
     }
 
-    fn sync_tier1_best_effort(&self) {
-        let _ = self.sync_tier1(false);
+    fn save_local(&self, name: &str, value: &impl serde::Serialize) -> bool {
+        if let Some(dir) = &self.local_dir {
+            if let Err(error) = local::save(dir, name, value) {
+                eprintln!("Vitral: failed to save {name}: {error}");
+                return false;
+            }
+        }
+        true
     }
 
-    fn sync_tier1(&self, flush: bool) -> Result<(), VitralError> {
-        let (dav_cfg, profile, snapshot, crdt_delta, generation) = {
+    fn mark_tier1_dirty(&self, sync: &mut SyncState, background_sync: bool) {
+        sync.local_tier1_dirty |= self.local_dir.is_some();
+        if background_sync && sync.dav_config.is_some() {
+            sync.backup_pending = true;
+            sync.backup_generation = sync.backup_generation.wrapping_add(1);
+        }
+    }
+
+    fn sync_tier1_best_effort(&self, mode: Tier1Sync) {
+        if let Err(error) = self.sync_tier1(mode) {
+            eprintln!("Vitral: tier 1 sync failed: {error}");
+        }
+    }
+
+    fn sync_tier1(&self, mode: Tier1Sync) -> Result<(), VitralError> {
+        let background_sync = self.input.lock().engine.config.background_sync;
+        let upload = mode == Tier1Sync::All || (mode == Tier1Sync::Changed && !background_sync);
+        let _upload = upload.then(|| self.tier1_upload.lock());
+        // Serializes snapshots and writes while allowing the input thread to mark new changes.
+        let io = self.tier1_io.lock();
+        let (profile, snapshot, local_dirty, backup_pending, remote) = {
             let st = self.input.lock();
-            let mut sync_st = self.sync.lock();
-            if self.local_dir.is_none() && sync_st.dav_config.is_none() { return Ok(()); }
-            if flush && !sync_st.backup_pending { return Ok(()); }
-            let imported = self.imported_lexicon.read();
+            let (local_dirty, backup_pending, remote) = {
+                let mut sync = self.sync.lock();
+                if mode == Tier1Sync::Changed {
+                    self.mark_tier1_dirty(&mut sync, background_sync);
+                }
+                let dav_cfg = sync.dav_config.as_ref().filter(|_| {
+                    !self.is_pure_offline()
+                        && match mode {
+                            Tier1Sync::Changed => !background_sync,
+                            Tier1Sync::Local => false,
+                            Tier1Sync::All => sync.backup_pending,
+                        }
+                });
+                if !sync.local_tier1_dirty && dav_cfg.is_none() {
+                    return Ok(());
+                }
+                let remote = dav_cfg.map(|cfg| {
+                    (cfg.clone(), sync.device_id.clone(), sync.backup_generation)
+                });
+                (
+                    std::mem::take(&mut sync.local_tier1_dirty),
+                    sync.backup_pending,
+                    remote,
+                )
+            };
             let profile = ProfileBackup {
                 shortcuts: st.engine.config.shortcuts.clone(),
                 schema_version: 1,
@@ -247,31 +424,50 @@ impl VitralCore {
             let snapshot = LexiconSnapshotPayload {
                 schema_version: 1,
                 retention: st.retention.clone(),
-                imported_entries: imported.export_entries(),
+                imported_entries: self.imported_lexicon.read().export_entries(),
             };
-            if !flush {
-                self.save_local("lexicon-state.json", &snapshot);
-                self.save_local("app-languages.json", &profile.app_lang_memory);
-                if st.engine.config.background_sync && sync_st.dav_config.is_some() {
-                    sync_st.backup_pending = true;
-                    sync_st.backup_generation = sync_st.backup_generation.wrapping_add(1);
-                    self.save_local("backup-pending.json", &true);
-                    return Ok(());
+            (profile, snapshot, local_dirty, backup_pending, remote)
+        };
+        let captured_ms = RetentionEngine::now_epoch_ms();
+
+        if let Some(dir) = &self.local_dir {
+            if local_dirty {
+                let save = || -> std::io::Result<()> {
+                    local::save(dir, "lexicon-state.json", &snapshot)?;
+                    local::save(dir, "app-languages.json", &profile.app_lang_memory)?;
+                    if backup_pending {
+                        local::save(dir, "backup-pending.json", &true)?;
+                    }
+                    Ok(())
+                };
+                if let Err(error) = save() {
+                    self.sync.lock().local_tier1_dirty = true;
+                    return Err(VitralError::Io(error.to_string()));
                 }
             }
-            if self.is_pure_offline() { return Ok(()); }
-            let Some(ref cfg) = sync_st.dav_config else { return Ok(()) };
-            let crdt_delta = st.retention.export_crdt_delta(&sync_st.device_id);
-            (cfg.clone(), profile, snapshot, crdt_delta, sync_st.backup_generation)
-        };
+        }
+
+        drop(io);
+        let Some((dav_cfg, device_id, generation)) = remote else { return Ok(()) };
         upload_profile_config(&self.offline_guard, &dav_cfg, &profile)?;
         upload_lexicon_snapshot(&self.offline_guard, &dav_cfg, &snapshot)?;
+        let crdt_delta = snapshot.retention.into_crdt_delta(device_id, captured_ms);
         upload_retention_crdt_delta(&self.offline_guard, &dav_cfg, &crdt_delta)?;
-        if flush {
-            let mut s = self.sync.lock();
-            if s.backup_generation == generation && s.dav_config.as_ref() == Some(&dav_cfg) {
-                s.backup_pending = false;
-                self.save_local("backup-pending.json", &false);
+        if mode == Tier1Sync::All {
+            let _io = self.tier1_io.lock();
+            let unchanged = |sync: &SyncState| {
+                sync.backup_generation == generation && sync.dav_config.as_ref() == Some(&dav_cfg)
+            };
+            let still_current = unchanged(&self.sync.lock());
+            if still_current {
+                if let Some(dir) = &self.local_dir {
+                    local::save(dir, "backup-pending.json", &false)
+                        .map_err(|error| VitralError::Io(error.to_string()))?;
+                }
+                let mut sync = self.sync.lock();
+                if unchanged(&sync) {
+                    sync.backup_pending = false;
+                }
             }
         }
         Ok(())
@@ -279,9 +475,10 @@ impl VitralCore {
 
     /// Called on the platform service queue, away from the keystroke path.
     pub fn poll_services(&self) -> Result<QuickPasteState, VitralError> {
+        self.sync_tier1(Tier1Sync::Local)?;
         let clipboard = self.poll_clipboard()?;
         if self.is_pure_offline() { return Ok(clipboard); }
-        self.sync_tier1(true)?;
+        self.sync_tier1(Tier1Sync::All)?;
         let cleanup = {
             let mut s = self.sync.lock();
             let due = s.dav_config.is_some() && s.last_cleanup.is_none_or(|last| last.elapsed().as_secs() >= 3600);
@@ -292,12 +489,40 @@ impl VitralCore {
         Ok(clipboard)
     }
 
+    fn flush_dirty_clipboard(&self) -> QuickPasteState {
+        let mut io = self.sync_state_io.lock();
+        if self.local_dir.is_none()
+            || (!io.clipboard_history_dirty
+                && !io.clipboard_changes_dirty
+                && !io.clipboard_current_dirty)
+        {
+            return self.sync.lock().clipboard.quick_paste_state();
+        }
+        let (state, writes) = {
+            let s = self.sync.lock();
+            let mut writes = ClipboardWrites::default();
+            if io.clipboard_history_dirty {
+                writes.history = Some(s.clipboard.export_ring());
+            }
+            if io.clipboard_changes_dirty {
+                writes.changes = Some(s.clipboard_changes.clone());
+            }
+            if io.clipboard_current_dirty {
+                writes.current = Some(s.clipboard.current().clone());
+            }
+            (s.clipboard.quick_paste_state(), writes)
+        };
+        self.save_clipboard(&mut io, writes);
+        state
+    }
+
     pub fn poll_clipboard(&self) -> Result<QuickPasteState, VitralError> {
         let _io = self.clipboard_io.lock();
+        let flushed = self.flush_dirty_clipboard();
         let (cfg, before, changes, capacity, current) = {
             let s = self.sync.lock();
             let Some(cfg) = s.dav_config.as_ref().filter(|_| !self.is_pure_offline()) else {
-                return Ok(s.clipboard.quick_paste_state());
+                return Ok(flushed);
             };
             (cfg.clone(), s.clipboard.export_ring(), s.clipboard_changes.clone(), s.clipboard.capacity(), s.clipboard.current().current_copy.clone())
         };
@@ -308,35 +533,71 @@ impl VitralCore {
         };
         let latest = current.iter().chain(fetched.iter().flatten()).max_by_key(|e| clip::copy_order(e));
         let current = dav::sync_current_copy(&self.offline_guard, &cfg, latest)?;
-        let mut s = self.sync.lock();
-        if !self.is_pure_offline() && s.dav_config.as_ref() == Some(&cfg) {
-            if let Some(entry) = current { s.clipboard.observe_current(entry); }
-            self.save_local("clipboard-current.json", s.clipboard.current());
-        }
-        if !self.is_pure_offline() && s.dav_config.as_ref() == Some(&cfg)
-            && s.clipboard.export_ring() == before && s.clipboard_changes == changes {
-            let first = !s.cloud_ring_seen;
-            s.cloud_ring_seen = true;
-            if !changes.is_empty() {
-                s.clipboard_changes = Default::default();
-                self.save_local("clipboard-changes.json", &s.clipboard_changes);
+        let mut io = self.sync_state_io.lock();
+        let (state, writes) = {
+            let mut s = self.sync.lock();
+            let mut writes = ClipboardWrites::default();
+            if !self.is_pure_offline() && s.dav_config.as_ref() == Some(&cfg) {
+                let mut current_changed = current.is_some_and(|entry| s.clipboard.observe_current(entry));
+                if s.clipboard.ring_matches(&before) && s.clipboard_changes == changes {
+                    let first = !s.cloud_ring_seen;
+                    s.cloud_ring_seen = true;
+                    if !changes.is_empty() {
+                        s.clipboard_changes = Default::default();
+                        writes.changes = self.local_dir.as_ref().map(|_| s.clipboard_changes.clone());
+                    }
+                    if let Some(entries) = fetched.filter(|entries| entries != &before) {
+                        current_changed |= s.clipboard.observe_cloud_ring(entries, first);
+                        writes.history = self.local_dir.as_ref().map(|_| s.clipboard.export_ring());
+                    }
+                }
+                if self.local_dir.is_some() {
+                    if writes.history.is_none() && io.clipboard_history_dirty {
+                        writes.history = Some(s.clipboard.export_ring());
+                    }
+                    if writes.changes.is_none() && io.clipboard_changes_dirty {
+                        writes.changes = Some(s.clipboard_changes.clone());
+                    }
+                    if current_changed || io.clipboard_current_dirty {
+                        writes.current = Some(s.clipboard.current().clone());
+                    }
+                }
             }
-            if let Some(entries) = fetched.filter(|entries| entries != &before) {
-                s.clipboard.observe_cloud_ring(entries, first);
-                self.save_local("clipboard-history.json", &s.clipboard.export_ring());
-                self.save_local("clipboard-current.json", s.clipboard.current());
-            }
-        }
-        Ok(s.clipboard.quick_paste_state())
+            (s.clipboard.quick_paste_state(), writes)
+        };
+        self.save_clipboard(&mut io, writes);
+        Ok(state)
     }
 
-    fn record_clipboard_change(&self, s: &mut SyncState, before: &[clip::ClipboardEntry]) {
-        let after = s.clipboard.export_ring();
-        if s.dav_config.is_some() {
-            s.clipboard_changes.record(before, &after);
-            self.save_local("clipboard-changes.json", &s.clipboard_changes);
+    fn save_clipboard(&self, io: &mut SyncStateIo, writes: ClipboardWrites) {
+        let mut history_ok = !io.clipboard_history_dirty;
+        if let Some(history) = writes.history {
+            history_ok = self.save_local("clipboard-history.json", &history);
+            io.clipboard_history_dirty = !history_ok;
         }
-        self.save_local("clipboard-history.json", &after);
+        if let Some(changes) = writes.changes {
+            if history_ok {
+                io.clipboard_changes_dirty = !self.save_local("clipboard-changes.json", &changes);
+            } else {
+                io.clipboard_changes_dirty = true;
+            }
+        }
+        if let Some(current) = writes.current {
+            io.clipboard_current_dirty = !self.save_local("clipboard-current.json", &current);
+        }
+    }
+
+    fn record_clipboard_change(&self, s: &mut SyncState, before: &[clip::ClipboardEntry]) -> ClipboardWrites {
+        let mut writes = ClipboardWrites::default();
+        if s.dav_config.is_some() || self.local_dir.is_some() {
+            let after = s.clipboard.export_ring();
+            if s.dav_config.is_some() {
+                s.clipboard_changes.record(before, &after);
+                writes.changes = self.local_dir.as_ref().map(|_| s.clipboard_changes.clone());
+            }
+            writes.history = self.local_dir.as_ref().map(|_| after);
+        }
+        writes
     }
 
     /// Apply settings without replacing composing, clipboard or retention state.
@@ -348,7 +609,9 @@ impl VitralCore {
         if !(20..=200).contains(&cfg.clipboard_ring_capacity) {
             return Err(VitralError::InvalidArgument("clipboard capacity must be 20..200".into()));
         }
+        let _tier1_io = self.tier1_io.lock();
         let mut st = self.input.lock();
+        let mut io = self.sync_state_io.lock();
         let mut sync = self.sync.lock();
         cfg.koofr_endpoint = cfg.koofr_endpoint.map(|s| s.trim().to_string());
         cfg.koofr_username = cfg
@@ -373,50 +636,77 @@ impl VitralCore {
         if let Some(seconds) = cfg.frecency_half_life_sec { st.retention.set_half_life_sec(seconds); }
         sync.clipboard.set_capacity(cfg.clipboard_ring_capacity);
         let next = DavConfig::from_engine_config(&cfg);
-        if sync.dav_config != next {
+        let sync_settings = if sync.dav_config != next {
             sync.cloud_ring_seen = false;
             sync.last_cleanup = None;
             sync.backup_pending = next.is_some();
-            self.save_local("backup-pending.json", &sync.backup_pending);
+            sync.backup_generation = sync.backup_generation.wrapping_add(1);
             sync.clipboard_changes = Default::default();
+            let cur = (next.is_some() || (self.local_dir.is_some() && io.clipboard_history_dirty))
+                .then(|| sync.clipboard.export_ring());
             if next.is_some() {
-                let cur = sync.clipboard.export_ring();
-                sync.clipboard_changes.record(&[], &cur);
+                if let Some(ref entries) = cur {
+                    sync.clipboard_changes.record(&[], entries);
+                }
             }
-            self.save_local("clipboard-changes.json", &sync.clipboard_changes);
             sync.dav_config = next;
-        }
+            self.local_dir.as_ref().map(|_| {
+                (
+                    sync.backup_pending,
+                    ClipboardWrites {
+                        history: io.clipboard_history_dirty.then(|| cur.unwrap_or_else(|| sync.clipboard.export_ring())),
+                        changes: Some(sync.clipboard_changes.clone()),
+                        current: io.clipboard_current_dirty.then(|| sync.clipboard.current().clone()),
+                    },
+                )
+            })
+        } else {
+            None
+        };
         *self.ai.write() = Arc::new(AiClient::from(&cfg));
         if st.engine.config.shortcuts != cfg.shortcuts { st.engine.clear_composition_state(); }
         st.engine.pure_rust.fuzzy_pinyin = cfg.fuzzy_pinyin;
         let split_changed = st.engine.config.syllable_split != cfg.syllable_split;
-        st.engine.set_syllable_split(cfg.syllable_split)?;
-        let active = &mut st.engine.config;
-        active.model_catalog_url = cfg.model_catalog_url.clone();
-        active.shortcuts = cfg.shortcuts;
-        active.linux_english_mode = cfg.linux_english_mode;
-        active.adaptive_learning = cfg.adaptive_learning;
-        active.fuzzy_pinyin = cfg.fuzzy_pinyin;
-        active.prediction_enabled = cfg.prediction_enabled;
-        active.prediction_delay_ms = cfg.prediction_delay_ms;
-        active.profile_distill_enabled = cfg.profile_distill_enabled;
-        active.learn_from_clipboard = cfg.learn_from_clipboard;
-        active.schema = cfg.schema;
-        active.opencc_mode = cfg.opencc_mode;
-        active.clipboard_ring_capacity = cfg.clipboard_ring_capacity;
-        active.koofr_endpoint = cfg.koofr_endpoint;
-        active.koofr_username = cfg.koofr_username;
-        active.koofr_password = cfg.koofr_password;
-        active.koofr_root = cfg.koofr_root;
-        active.sync_key = cfg.sync_key;
-        active.ai_tier3_enabled = cfg.ai_tier3_enabled;
-        active.ai_prefer_local = cfg.ai_prefer_local;
-        if split_changed {
-            let imported = self.imported_lexicon.read();
-            let InputState { engine, retention, .. } = &mut *st;
-            engine.refresh_candidates(&sync.clipboard, &imported, retention)?;
+        let result = (|| {
+            st.engine.set_syllable_split(cfg.syllable_split)?;
+            let active = &mut st.engine.config;
+            active.model_catalog_url = cfg.model_catalog_url.clone();
+            active.shortcuts = cfg.shortcuts;
+            active.linux_english_mode = cfg.linux_english_mode;
+            let adaptive_changed = active.adaptive_learning != cfg.adaptive_learning;
+            active.adaptive_learning = cfg.adaptive_learning;
+            active.fuzzy_pinyin = cfg.fuzzy_pinyin;
+            active.prediction_enabled = cfg.prediction_enabled;
+            active.prediction_delay_ms = cfg.prediction_delay_ms;
+            active.profile_distill_enabled = cfg.profile_distill_enabled;
+            active.learn_from_clipboard = cfg.learn_from_clipboard;
+            active.schema = cfg.schema;
+            active.opencc_mode = cfg.opencc_mode;
+            active.clipboard_ring_capacity = cfg.clipboard_ring_capacity;
+            active.koofr_endpoint = cfg.koofr_endpoint;
+            active.koofr_username = cfg.koofr_username;
+            active.koofr_password = cfg.koofr_password;
+            active.koofr_root = cfg.koofr_root;
+            active.sync_key = cfg.sync_key;
+            active.ai_tier3_enabled = cfg.ai_tier3_enabled;
+            active.ai_prefer_local = cfg.ai_prefer_local;
+            if adaptive_changed {
+                st.engine.refresh_semantic_context();
+            }
+            if split_changed {
+                let imported = self.imported_lexicon.read();
+                let InputState { engine, retention, .. } = &mut *st;
+                engine.refresh_candidates(&sync.clipboard, &imported, retention)?;
+            }
+            Ok(())
+        })();
+        drop(sync);
+        drop(st);
+        if let Some((backup_pending, writes)) = sync_settings {
+            self.save_local("backup-pending.json", &backup_pending);
+            self.save_clipboard(&mut io, writes);
         }
-        Ok(())
+        result
     }
 
     pub fn cloud_usage(&self) -> Result<serde_json::Value, VitralError> {
@@ -451,12 +741,15 @@ impl VitralCore {
 
     pub fn reload_assets(&self) -> Result<ReloadReport, VitralError> {
         self.prediction.clear_cache();
-        let rep = Self::reload_input(&self.input)?;
-        self.sync_tier1_best_effort();
+        let rep = Self::reload_input(&self.input, &self.imported_lexicon)?;
+        self.sync_tier1_best_effort(Tier1Sync::Changed);
         Ok(rep)
     }
 
-    fn reload_input(input: &Mutex<InputState>) -> Result<ReloadReport, VitralError> {
+    fn reload_input(
+        input: &Mutex<InputState>,
+        imported_lexicon: &RwLock<ImportedLexiconIndex>,
+    ) -> Result<ReloadReport, VitralError> {
         let mut st = input.lock();
         crate::eng::gram::RimeGramDb::clear_cache();
         crate::hw::onnx_models::HwOnnxBundle::clear_cache();
@@ -466,6 +759,7 @@ impl VitralCore {
         st.engine.pure_rust.get_corpus();
         let paths = st.engine.model_paths.clone();
         let assets = st.engine.resolved_assets_dir.clone();
+        imported_lexicon.write().reload_assets(assets.as_deref());
         st.hw.set_assets_dir(assets.as_deref());
         st.hw.set_model_paths(paths.clone());
         st.voice.model_paths = paths;
@@ -475,7 +769,10 @@ impl VitralCore {
     pub fn models_state(&self) -> models::ModelsState { self.models.models_state() }
     pub fn models_download(&self, id: &str) -> Result<models::ModelsState, VitralError> {
         let input = Arc::clone(&self.input);
-        self.models.start_download(id, &self.offline_guard, move || Self::reload_input(&input).map(|_| ()))
+        let imported_lexicon = Arc::clone(&self.imported_lexicon);
+        self.models.start_download(id, &self.offline_guard, move || {
+            Self::reload_input(&input, &imported_lexicon).map(|_| ())
+        })
     }
     pub fn models_cancel(&self, id: &str) -> Result<models::ModelsState, VitralError> {
         self.models.cancel_download(id)?; Ok(self.models_state())
@@ -524,15 +821,21 @@ impl VitralCore {
     }
 
     fn select_quick_paste(&self, engine: &mut EngineState, index: usize) -> Option<InputAction> {
-        let id = engine.current_candidates.get(index)?.quick_paste_id.clone()?;
-        let mut sync = self.sync.lock();
-        let current = sync.clipboard.quick_paste_state().quick_paste;
-        // A late click must never consume a newer copy than the one displayed.
-        let committed = if current.as_ref().is_some_and(|c| c.id == id) {
-            let consumed = sync.clipboard.consume_quick_paste().consumed.map(|c| c.content);
-            self.save_local("clipboard-current.json", sync.clipboard.current());
-            consumed
-        } else { None };
+        let id = engine.current_candidates.get(index)?.quick_paste_id.as_deref()?;
+        let mut io = self.sync_state_io.lock();
+        let mut writes = ClipboardWrites::default();
+        let committed = {
+            let mut sync = self.sync.lock();
+            // A late click must never consume a newer copy than the one displayed.
+            if sync.clipboard.quick_paste_id() == Some(id) {
+                let consumed = sync.clipboard.consume_quick_paste().consumed.map(|c| c.content);
+                writes.current = self.local_dir.as_ref().map(|_| sync.clipboard.current().clone());
+                consumed
+            } else {
+                None
+            }
+        };
+        self.save_clipboard(&mut io, writes);
         engine.clear_composition_state();
         Some(engine.empty_action(committed))
     }
@@ -551,6 +854,7 @@ impl VitralCore {
     }
 
     pub fn shortcut_key(&self, key: &str) -> Result<Option<InputAction>, VitralError> {
+        let _tier1_io = self.tier1_io.lock();
         let mut st = self.input.lock();
         let normalized = shortcuts::normalize_key(key).map_err(VitralError::InvalidArgument)?;
         let action = st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == normalized && st.engine.config.shortcut_enabled(b.action)).map(|b| b.action);
@@ -565,16 +869,27 @@ impl VitralCore {
         modifiers: u32,
         swipe_dir: SwipeDir,
     ) -> Result<InputAction, VitralError> {
-        let (act, seq_changed) = {
+        let (act, sync_now) = {
             let mut st = self.input.lock();
             let before_seq = st.retention.crdt_seq;
             if st.engine.config.platform == "android" && modifiers == 0 && swipe_dir == SwipeDir::None {
-                let mut sync = self.sync.lock();
-                if matches!(keycode, 0x08 | 0xff08) && sync.clipboard.quick_paste_state().candidate_visible && st.engine.raw_input.is_empty() {
-                    sync.clipboard.dismiss_quick_paste();
-                    self.save_local("clipboard-current.json", sync.clipboard.current());
+                if matches!(keycode, 0x08 | 0xff08) && st.engine.raw_input.is_empty() {
+                    let visible = self.sync.lock().clipboard.visible_quick_paste().is_some();
+                    if visible {
+                        let mut io = self.sync_state_io.lock();
+                        let current = {
+                            let mut sync = self.sync.lock();
+                            if sync.clipboard.visible_quick_paste().is_some() {
+                                sync.clipboard.dismiss_quick_paste();
+                                self.local_dir.as_ref().map(|_| sync.clipboard.current().clone())
+                            } else {
+                                None
+                            }
+                        };
+                        self.save_clipboard(&mut io, ClipboardWrites { current, ..Default::default() });
+                    }
                 } else if (0x20..=0x7e).contains(&keycode) {
-                    sync.clipboard.hide_for_input();
+                    self.sync.lock().clipboard.hide_for_input();
                 }
             }
             if modifiers == 0 && swipe_dir == SwipeDir::None {
@@ -598,7 +913,7 @@ impl VitralCore {
                 ref mut retention,
                 ..
             } = *st;
-            let sync_st = self.sync.lock();
+            let mut sync_st = self.sync.lock();
             let imported = self.imported_lexicon.read();
             let act = engine.process_key(
                 keycode,
@@ -608,13 +923,20 @@ impl VitralCore {
                 &imported,
                 retention,
             )?;
-            if modifiers & eng::MOD_LANG_TOGGLE != 0 { self.save_local("app-languages.json",&engine.app_lang_memory); }
-            (act, retention.crdt_seq != before_seq || modifiers & eng::MOD_LANG_TOGGLE != 0)
+            let changed = retention.crdt_seq != before_seq || modifiers & eng::MOD_LANG_TOGGLE != 0;
+            let background_sync = engine.config.background_sync;
+            if changed && background_sync {
+                self.mark_tier1_dirty(&mut sync_st, true);
+            }
+            (act, changed && !background_sync)
         };
-        if seq_changed {
-            self.sync_tier1_best_effort();
+        if sync_now {
+            self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
-        if let Some(text) = act.commit_text.as_deref() { self.record_profile_commit(text); }
+        if let Some(text) = act.commit_text.as_deref() {
+            self.schedule_semantic_context();
+            self.record_profile_commit(text);
+        }
         Ok(act)
     }
 
@@ -623,13 +945,13 @@ impl VitralCore {
     }
 
     pub fn select_candidate(&self, index: usize) -> Result<InputAction, VitralError> {
-        let (act, seq_changed) = {
+        let (act, sync_now) = {
             let mut st = self.input.lock();
             if let Some(action) = Self::select_function(&mut st.engine, index).or_else(|| self.select_quick_paste(&mut st.engine, index)) {
                 return Ok(action);
             }
             let before_seq = st.retention.crdt_seq;
-            let sync_st = self.sync.lock();
+            let mut sync_st = self.sync.lock();
             let imported = self.imported_lexicon.read();
             let InputState {
                 ref mut engine,
@@ -642,15 +964,20 @@ impl VitralCore {
                 &imported,
                 retention,
             )?;
-            (
-                engine.empty_action(committed),
-                retention.crdt_seq != before_seq,
-            )
+            let changed = retention.crdt_seq != before_seq;
+            let background_sync = engine.config.background_sync;
+            if changed && background_sync {
+                self.mark_tier1_dirty(&mut sync_st, true);
+            }
+            (engine.empty_action(committed), changed && !background_sync)
         };
-        if seq_changed {
-            self.sync_tier1_best_effort();
+        if sync_now {
+            self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
-        if let Some(text) = act.commit_text.as_deref() { self.record_profile_commit(text); }
+        if let Some(text) = act.commit_text.as_deref() {
+            self.schedule_semantic_context();
+            self.record_profile_commit(text);
+        }
         Ok(act)
     }
 
@@ -668,7 +995,7 @@ impl VitralCore {
             engine.pin_candidate_in_state(index, retention)?;
             engine.empty_action(None)
         };
-        self.sync_tier1_best_effort();
+        self.sync_tier1_best_effort(Tier1Sync::Changed);
         Ok(act)
     }
 
@@ -686,7 +1013,7 @@ impl VitralCore {
             engine.erase_candidate_in_state(index, retention)?;
             engine.empty_action(None)
         };
-        self.sync_tier1_best_effort();
+        self.sync_tier1_best_effort(Tier1Sync::Changed);
         Ok(act)
     }
 
@@ -795,8 +1122,9 @@ impl VitralCore {
             (snapshot, newly_confirmed && committed.is_some())
         };
         if confirmed {
+            self.schedule_semantic_context();
             if let HandwritingPayload::Mode2(result) = &payload { self.record_profile_commit(&result.composing_text); }
-            self.sync_tier1_best_effort();
+            self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
         Ok(payload)
     }
@@ -866,7 +1194,8 @@ impl VitralCore {
             Self::confirm_handwriting(hw, engine, retention, &imported)
                 .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))?
         };
-        self.sync_tier1_best_effort();
+        self.schedule_semantic_context();
+        self.sync_tier1_best_effort(Tier1Sync::Changed);
         self.record_profile_commit(&committed);
         Ok(committed)
     }
@@ -908,7 +1237,7 @@ impl VitralCore {
             }),
         );
         if rep.imported_count > 0 {
-            self.sync_tier1_best_effort();
+            self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
         Ok(rep)
     }
@@ -921,18 +1250,25 @@ impl VitralCore {
 
     fn clipboard_push_local(&self, mut payload: ClipboardPayload) -> ClipboardState {
         let harvest = payload.clone();
-        let mut sync = self.sync.lock();
-        if payload.source_device.is_empty() {
-            payload.source_device.clone_from(&sync.device_id);
-        }
         if payload.timestamp_ms == 0 {
             payload.timestamp_ms = RetentionEngine::now_epoch_ms();
         }
-        let before = sync.clipboard.export_ring();
-        let state = sync.clipboard.push(payload);
-        self.record_clipboard_change(&mut sync, &before);
-        self.save_local("clipboard-current.json", sync.clipboard.current());
-        drop(sync);
+        let state = {
+            let mut io = self.sync_state_io.lock();
+            let (state, writes) = {
+                let mut sync = self.sync.lock();
+                if payload.source_device.is_empty() {
+                    payload.source_device.clone_from(&sync.device_id);
+                }
+                let before = sync.clipboard.export_ring();
+                let state = sync.clipboard.push(payload);
+                let mut writes = self.record_clipboard_change(&mut sync, &before);
+                writes.current = self.local_dir.as_ref().map(|_| sync.clipboard.current().clone());
+                (state, writes)
+            };
+            self.save_clipboard(&mut io, writes);
+            state
+        };
         self.harvest_clipboard_payload(&harvest);
         state
     }
@@ -943,11 +1279,21 @@ impl VitralCore {
         is_cold_boot: bool,
     ) -> QuickPasteState {
         let harvest = payload.clone();
-        let mut sync_st = self.sync.lock();
-        let state=sync_st.clipboard.ingest_remote(payload, is_cold_boot);
-        self.save_local("clipboard-history.json",&sync_st.clipboard.export_ring());
-        self.save_local("clipboard-current.json", sync_st.clipboard.current());
-        drop(sync_st);
+        let state = {
+            let mut io = self.sync_state_io.lock();
+            let (state, writes) = {
+                let mut sync = self.sync.lock();
+                let state = sync.clipboard.ingest_remote(payload, is_cold_boot);
+                let writes = ClipboardWrites {
+                    changes: None,
+                    history: self.local_dir.as_ref().map(|_| sync.clipboard.export_ring()),
+                    current: self.local_dir.as_ref().map(|_| sync.clipboard.current().clone()),
+                };
+                (state, writes)
+            };
+            self.save_clipboard(&mut io, writes);
+            state
+        };
         self.harvest_clipboard_payload(&harvest);
         state
     }
@@ -996,7 +1342,7 @@ impl VitralCore {
             st.retention.crdt_seq != before
         };
         if changed {
-            self.sync_tier1_best_effort();
+            self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
     }
 
@@ -1064,13 +1410,7 @@ impl VitralCore {
         let hint = |word: &str, reading: Option<&str>, source| {
             let ch = word.chars().next().filter(|ch| ret::is_cjk(*ch))?;
             let syllable = reading
-                .or_else(|| {
-                    corpus
-                        .char_readings
-                        .get(&ch)?
-                        .first()
-                        .map(|(s, _)| s.as_str())
-                })
+                .or_else(|| corpus.char_readings(ch).next().map(|(s, _)| s))
                 .or_else(|| ch.to_pinyin().map(|p| p.plain()))?;
             if !canonical.contains(syllable) {
                 return None;
@@ -1145,16 +1485,14 @@ impl VitralCore {
                         continue;
                     }
                     let reading = corpus
-                        .word_readings
-                        .get(word)
-                        .and_then(|(syllables, _)| syllables.first())
-                        .map(String::as_str);
+                        .word_reading(word)
+                        .and_then(|(mut syllables, _)| syllables.next());
                     if let Some(hint) = hint(word, reading, "personal") {
                         push(hint, *weight);
                     }
                 }
             }
-            for (word, weight) in corpus.continuations.get(&prefix).into_iter().flatten() {
+            for (word, weight) in corpus.continuations(&prefix) {
                 let phrase = format!("{prefix}{word}");
                 if st.retention.erased_words.contains(word)
                     || st.retention.erased_words.contains(&phrase)
@@ -1162,13 +1500,11 @@ impl VitralCore {
                     continue;
                 }
                 let reading = corpus
-                    .word_readings
-                    .get(&phrase)
-                    .and_then(|(s, _)| s.get(length))
-                    .or_else(|| corpus.word_readings.get(word)?.0.first())
-                    .map(String::as_str);
+                    .word_reading(&phrase)
+                    .and_then(|(mut syllables, _)| syllables.nth(length))
+                    .or_else(|| corpus.word_reading(word)?.0.next());
                 if let Some(hint) = hint(word, reading, "dictionary") {
-                    let score = (*weight as f64).ln_1p()
+                    let score = (weight as f64).ln_1p()
                         + length as f64 * 8.0
                         + gram.and_then(|g| g.lookup(&prefix, word)).unwrap_or(0.0);
                     push(hint, score);
@@ -1179,12 +1515,19 @@ impl VitralCore {
     }
 
     pub fn predict_request(&self, request: predict::PredictRequest) -> predict::PredictResult {
-        let generation = self.prediction.cancel().id;
+        let skipped = self.prediction.cancel();
+        if request.is_password || request.is_composing {
+            return skipped;
+        }
         let st = self.input.lock();
-        let clipboard = self.sync.lock().clipboard.current().current_copy.as_ref().map(|c| c.content.clone()).unwrap_or_default();
         // Host claims cannot bypass the core composition gate.
-        let mut request = request;
-        request.is_composing |= !st.engine.raw_input.is_empty() || !st.engine.composing.is_empty();
+        if !st.engine.config.prediction_enabled
+            || !st.engine.raw_input.is_empty()
+            || !st.engine.composing.is_empty()
+        {
+            return skipped;
+        }
+        let clipboard = self.sync.lock().clipboard.current().current_copy.as_ref().map(|c| c.content.clone()).unwrap_or_default();
         self.prediction.request(
             request.clone(),
             &st.engine.config,
@@ -1194,7 +1537,7 @@ impl VitralCore {
             &st.retention,
             st.engine.model_paths.local_llm.as_ref(),
             ai::local_engine(),
-            Some(generation),
+            Some(skipped.id),
             Some((
                 st.engine.pure_rust.get_corpus(),
                 st.engine.pure_rust.get_gram(),
@@ -1215,7 +1558,7 @@ impl VitralCore {
             }
             st.profile.persist()?; learn
         };
-        if learned { self.sync_tier1_best_effort(); }
+        if learned { self.sync_tier1_best_effort(Tier1Sync::Changed); }
         Ok(true)
     }
     pub fn predict_dismiss(&self, id: u64) -> Result<bool, VitralError> {
@@ -1230,6 +1573,7 @@ impl VitralCore {
     pub fn clear_learned_habits(&self) -> ret::PersonalizationStats {
         self.prediction.clear_cache();
         let stats = {
+            let _tier1_io = self.tier1_io.lock();
             let mut st = self.input.lock();
             st.retention.clear_learned_habits();
             if let Err(e) = st.profile.clear_profile() { st.profile.last_reason = Some(e.to_string()); }
@@ -1245,7 +1589,7 @@ impl VitralCore {
             );
             st.retention.stats()
         };
-        self.sync_tier1_best_effort();
+        self.sync_tier1_best_effort(Tier1Sync::Changed);
         stats
     }
 
@@ -1260,9 +1604,13 @@ impl VitralCore {
     }
 
     pub fn consume_quick_paste(&self) -> QuickPasteConsumeResult {
-        let mut sync_st = self.sync.lock();
-        let result = sync_st.clipboard.consume_quick_paste();
-        self.save_local("clipboard-current.json", sync_st.clipboard.current());
+        let mut io = self.sync_state_io.lock();
+        let (result, current) = {
+            let mut sync = self.sync.lock();
+            let result = sync.clipboard.consume_quick_paste();
+            (result, self.local_dir.as_ref().map(|_| sync.clipboard.current().clone()))
+        };
+        self.save_clipboard(&mut io, ClipboardWrites { current, ..Default::default() });
         result
     }
 
@@ -1275,14 +1623,19 @@ impl VitralCore {
 
     pub fn on_ime_close(&self) -> QuickPasteState {
         self.prediction.cancel();
-        let mut sync_st = self.sync.lock();
-        sync_st.clipboard.on_ime_close()
+        let state = self.sync.lock().clipboard.on_ime_close();
+        self.sync_tier1_best_effort(Tier1Sync::Local);
+        state
     }
 
     pub fn dismiss_quick_paste(&self) -> QuickPasteState {
-        let mut sync_st = self.sync.lock();
-        let result = sync_st.clipboard.dismiss_quick_paste();
-        self.save_local("clipboard-current.json", sync_st.clipboard.current());
+        let mut io = self.sync_state_io.lock();
+        let (result, current) = {
+            let mut sync = self.sync.lock();
+            let result = sync.clipboard.dismiss_quick_paste();
+            (result, self.local_dir.as_ref().map(|_| sync.clipboard.current().clone()))
+        };
+        self.save_clipboard(&mut io, ClipboardWrites { current, ..Default::default() });
         result
     }
 
@@ -1300,16 +1653,18 @@ impl VitralCore {
         shortcut_code: Option<Option<&str>>,
     ) -> Result<ClipboardState, VitralError> {
         let state = {
-            let mut sync_st = self.sync.lock();
-            let before = sync_st.clipboard.export_ring();
-            let existing = before
-                .iter()
-                .find(|e| e.id == item_id)
-                .and_then(|e| e.shortcut_code.as_deref());
-            let state = sync_st
-                .clipboard
-                .pin(item_id, shortcut_code.unwrap_or(existing))?;
-            self.record_clipboard_change(&mut sync_st, &before);
+            let mut io = self.sync_state_io.lock();
+            let (state, writes) = {
+                let mut sync = self.sync.lock();
+                let before = sync.clipboard.export_ring();
+                let existing = before
+                    .iter()
+                    .find(|e| e.id == item_id)
+                    .and_then(|e| e.shortcut_code.as_deref());
+                let state = sync.clipboard.pin(item_id, shortcut_code.unwrap_or(existing))?;
+                (state, self.record_clipboard_change(&mut sync, &before))
+            };
+            self.save_clipboard(&mut io, writes);
             state
         };
         let background_sync = self.input.lock().engine.config.background_sync;
@@ -1321,10 +1676,14 @@ impl VitralCore {
 
     pub fn clipboard_unpin(&self, item_id: &str) -> Result<ClipboardState, VitralError> {
         let state = {
-            let mut sync_st = self.sync.lock();
-            let before = sync_st.clipboard.export_ring();
-            let state = sync_st.clipboard.unpin(item_id)?;
-            self.record_clipboard_change(&mut sync_st, &before);
+            let mut io = self.sync_state_io.lock();
+            let (state, writes) = {
+                let mut sync = self.sync.lock();
+                let before = sync.clipboard.export_ring();
+                let state = sync.clipboard.unpin(item_id)?;
+                (state, self.record_clipboard_change(&mut sync, &before))
+            };
+            self.save_clipboard(&mut io, writes);
             state
         };
         let background_sync = self.input.lock().engine.config.background_sync;
@@ -1334,10 +1693,14 @@ impl VitralCore {
 
     pub fn clipboard_clear_unpinned(&self) -> ClipboardState {
         let state = {
-            let mut sync_st = self.sync.lock();
-            let before = sync_st.clipboard.export_ring();
-            let state = sync_st.clipboard.clear_unpinned();
-            self.record_clipboard_change(&mut sync_st, &before);
+            let mut io = self.sync_state_io.lock();
+            let (state, writes) = {
+                let mut sync = self.sync.lock();
+                let before = sync.clipboard.export_ring();
+                let state = sync.clipboard.clear_unpinned();
+                (state, self.record_clipboard_change(&mut sync, &before))
+            };
+            self.save_clipboard(&mut io, writes);
             state
         };
         let background_sync = self.input.lock().engine.config.background_sync;
@@ -1359,6 +1722,7 @@ impl VitralCore {
         }
         let peers = lan::LocalSendTransport::discover_mdns_peers(&self.offline_guard,
             std::time::Duration::from_millis(1500))?;
+        let _write = self.sync_state_io.lock();
         let mut s = self.sync.lock();
         for d in &mut s.devices {
             if d.lan_online == Some(true) { d.lan_online = Some(false); }
@@ -1371,8 +1735,10 @@ impl VitralCore {
             } else { s.devices.push(peer); }
         }
         sort_devices_mru(&mut s.devices);
-        self.save_local("relay-devices.json", &s.devices);
-        Ok(s.devices.clone())
+        let devices = s.devices.clone();
+        drop(s);
+        self.save_local("relay-devices.json", &devices);
+        Ok(devices)
     }
 
     pub fn stop_discovery(&self) {
@@ -1411,13 +1777,18 @@ impl VitralCore {
             &local_name,
         )?;
         {
+            let _write = self.sync_state_io.lock();
             let mut sync_st = self.sync.lock();
             if let Some(peer) = sync_st.devices.iter_mut().find(|p| p.device_id == device_id) {
                 peer.usage_count = peer.usage_count.saturating_add(1);
                 peer.last_used_ms = RetentionEngine::now_epoch_ms().max(peer.last_used_ms.saturating_add(1));
             }
             sort_devices_mru(&mut sync_st.devices);
-            self.save_local("relay-devices.json", &sync_st.devices);
+            let devices = self.local_dir.as_ref().map(|_| sync_st.devices.clone());
+            drop(sync_st);
+            if let Some(devices) = devices {
+                self.save_local("relay-devices.json", &devices);
+            }
         }
         Ok(res)
     }
@@ -1492,7 +1863,9 @@ impl VitralCore {
         let fetched = fetch_backup_from_koofr(&self.offline_guard, &cfg)?;
 
         {
+            let _tier1_io = self.tier1_io.lock();
             let mut st = self.input.lock();
+            let mut io = self.sync_state_io.lock();
             let mut sync_st = self.sync.lock();
             let mut imported = self.imported_lexicon.write();
 
@@ -1527,20 +1900,36 @@ impl VitralCore {
                 imported.inject_hotwords(&art.entries);
             }
 
+            let mut writes = ClipboardWrites::default();
             if let Some(entries) = fetched.clipboard_ring {
                 sync_st.cloud_ring_seen = true;
                 sync_st.clipboard_changes = Default::default();
-                self.save_local("clipboard-changes.json", &sync_st.clipboard_changes);
+                writes.changes = self.local_dir.as_ref().map(|_| sync_st.clipboard_changes.clone());
                 sync_st.clipboard.restore_ring_cold_boot(entries);
             }
 
             st.engine.config.koofr_endpoint = Some(cfg.endpoint.clone());
             st.engine.config.sync_key = cfg.sync_key.clone();
-            sync_st.dav_config = Some(cfg);
-            self.save_local("lexicon-state.json",&LexiconSnapshotPayload{schema_version:1,retention:st.retention.clone(),imported_entries:imported.export_entries()});
-            self.save_local("app-languages.json",&st.engine.app_lang_memory);
-            self.save_local("clipboard-history.json",&sync_st.clipboard.export_ring());
-            self.save_local("clipboard-current.json", sync_st.clipboard.current());
+            if sync_st.dav_config.as_ref() != Some(&cfg) {
+                sync_st.backup_generation = sync_st.backup_generation.wrapping_add(1);
+                sync_st.dav_config = Some(cfg);
+            }
+            if self.local_dir.is_some() {
+                writes.history = Some(sync_st.clipboard.export_ring());
+                writes.current = Some(sync_st.clipboard.current().clone());
+                drop(sync_st);
+                let snapshot = LexiconSnapshotPayload {
+                    schema_version: 1,
+                    retention: st.retention.clone(),
+                    imported_entries: imported.export_entries(),
+                };
+                let app_lang_memory = st.engine.app_lang_memory.clone();
+                drop(imported);
+                drop(st);
+                self.save_local("lexicon-state.json", &snapshot);
+                self.save_local("app-languages.json", &app_lang_memory);
+                self.save_clipboard(&mut io, writes);
+            }
         }
 
         Ok(RestoreResult {
@@ -5012,12 +5401,13 @@ mod m1c_tests {
         });
         core.poll_services().unwrap();
         let dav_cfg = DavConfig::from_engine_config(&cfg).unwrap();
+        let current_path = dir.join("clipboard-current.json");
+        // History edits and subsequent polls must leave the unchanged current file alone.
+        std::fs::remove_file(&current_path).unwrap();
 
         for operation in ["pin", "unpin", "clear"] {
             let before = core.clipboard_state().ring;
             mock.clear_log();
-            // History edits must not recreate the unchanged current-copy file.
-            std::fs::remove_file(dir.join("clipboard-current.json")).unwrap();
             let state = match operation {
                 "pin" => core.clipboard_pin("saved-copy", Some("saved")).unwrap(),
                 "unpin" => core.clipboard_unpin("saved-copy").unwrap(),
@@ -5025,7 +5415,7 @@ mod m1c_tests {
                 _ => unreachable!(),
             };
             assert!(mock.log().is_empty(), "{operation} must defer WebDAV requests");
-            assert!(!dir.join("clipboard-current.json").exists());
+            assert!(!current_path.exists());
             assert_ne!(state.ring, before);
             assert_eq!(
                 local::load::<Vec<clip::ClipboardEntry>>(&dir, "clipboard-history.json")
@@ -5039,7 +5429,9 @@ mod m1c_tests {
             assert!(!changes.is_empty(), "{operation} must persist pending changes");
             assert_eq!(changes.merge(before, &state.ring, state.capacity), state.ring);
 
-            core.poll_services().unwrap();
+            let state_after_poll = core.poll_services().unwrap();
+            assert_eq!(state_after_poll.current_copy.unwrap().id, "saved-copy");
+            assert!(!current_path.exists(), "{operation} rewrote the current copy");
             assert!(!mock.log().is_empty());
             assert_eq!(
                 dav::download_clipboard_ring(&core.offline_guard, &dav_cfg).unwrap(),
@@ -5052,6 +5444,15 @@ mod m1c_tests {
                     .is_empty()
             );
         }
+        // A failed write stays pending until a later poll can persist the dismissal.
+        std::fs::create_dir(&current_path).unwrap();
+        assert!(core.dismiss_quick_paste().quick_paste.is_none());
+        std::fs::remove_dir(&current_path).unwrap();
+        assert!(core.poll_clipboard().unwrap().quick_paste.is_none());
+        let current: clip::ClipboardCurrent =
+            local::load(&dir, "clipboard-current.json").unwrap().unwrap();
+        assert_eq!(current.dismissed_copy_id.as_deref(), Some("saved-copy"));
+
         drop(core);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -6500,6 +6901,67 @@ mod personalization_tests {
     use super::*;
 
     #[test]
+    fn background_key_commits_flush_on_poll_close_and_drop() {
+        let dir = std::env::temp_dir().join(format!(
+            "vitral-background-key-{}-{}",
+            std::process::id(),
+            RetentionEngine::now_epoch_ms(),
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let cleanup = Cleanup(dir);
+        let cfg = serde_json::json!({
+            "pure_offline": true,
+            "platform": "android",
+            "schema": "rime_ice",
+            "background_sync": true,
+            "data_dir": cleanup.0,
+            "assets_dir": "/nonexistent-vitral-assets",
+            "koofr_endpoint": "http://127.0.0.1:9"
+        });
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        let persisted_seq = || {
+            local::load::<LexiconSnapshotPayload>(&cleanup.0, "lexicon-state.json")
+                .unwrap()
+                .map_or(0, |snapshot| snapshot.retention.crdt_seq)
+        };
+        let mut last_seq = 0;
+        for (index, code) in ["nihao", "zhongguo", "women"].into_iter().enumerate() {
+            for key in code.bytes() {
+                core.process_key(u32::from(key), 0, SwipeDir::None).unwrap();
+            }
+            let action = if index == 0 {
+                core.process_key(0x20, 0, SwipeDir::None).unwrap()
+            } else {
+                core.select_candidate(0).unwrap()
+            };
+            assert!(action.commit_text.is_some());
+            assert_eq!(persisted_seq(), last_seq);
+            assert!(core.sync.lock().backup_pending);
+            if index == 2 {
+                break;
+            }
+            if index == 0 {
+                core.poll_services().unwrap();
+            } else {
+                core.on_ime_close();
+            }
+            assert!(persisted_seq() > last_seq);
+            last_seq = persisted_seq();
+        }
+        drop(core);
+        assert!(persisted_seq() > last_seq);
+        assert_eq!(
+            local::load::<bool>(&cleanup.0, "backup-pending.json").unwrap(),
+            Some(true),
+        );
+    }
+
+    #[test]
     fn phase3_click_feedback_survives_backend_clear_and_context_reset() {
         let core = VitralCore::init(r#"{"schema":"rime_ice","pure_offline":true}"#).unwrap();
         let type_code = |code: &str| {
@@ -6800,6 +7262,47 @@ mod device_regression_tests {
             assert_eq!(st.engine.pure_rust.page_index, 0);
             assert_eq!(st.engine.last_committed_code.as_deref(), Some("wo"));
         }
+    }
+
+    #[test]
+    fn gated_predictions_skip_clipboard_and_lazy_lexicon() {
+        let temp = Temp::new("prediction-gates");
+        let core = temp.core();
+        core.input.lock().engine.pure_rust.reload_assets(None);
+        let sync = core.sync.lock();
+        std::thread::scope(|scope| {
+            let (done, result) = std::sync::mpsc::channel();
+            let core = &core;
+            scope.spawn(move || {
+                for (enabled, raw, composing, password, host_composing) in [
+                    (false, "", "", false, false),
+                    (true, "", "", true, false),
+                    (true, "", "", false, true),
+                    (true, "fa", "", false, false),
+                    (true, "", "法", false, false),
+                ] {
+                    {
+                        let mut st = core.input.lock();
+                        st.engine.config.prediction_enabled = enabled;
+                        st.engine.raw_input = raw.into();
+                        st.engine.composing = composing.into();
+                    }
+                    assert_eq!(
+                        core.predict_request(predict::PredictRequest {
+                            context_before: "输入".into(),
+                            is_password: password,
+                            is_composing: host_composing,
+                            ..Default::default()
+                        }).status,
+                        "skipped"
+                    );
+                }
+                done.send(core.input.lock().engine.pure_rust.lexicon_init_state()).ok();
+            });
+            let result = result.recv_timeout(std::time::Duration::from_secs(3));
+            drop(sync);
+            assert_eq!(result.unwrap(), (false, false));
+        });
     }
 
     #[test]

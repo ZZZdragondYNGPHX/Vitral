@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vitral-e2e"
+version = "0.1.0"
+description = "Opaque-box E2E test runner, target adapters, and local mock harnesses for Vitral"
+requires-python = ">=3.14"
+dependencies = [
+  "pytest>=9.0",
+  "pytest-timeout>=2.4",
+  "pytest-xdist>=3",
+  "httpx>=0.28",
+  "requests>=2.32",
+  "pyyaml>=6.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vitral_e2e*", "harnesses*"]

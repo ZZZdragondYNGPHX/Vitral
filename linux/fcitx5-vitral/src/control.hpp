@@ -1,11 +1,18 @@
 #pragma once
 
 #include "vitral_core.h"
+#include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <fcitx-utils/log.h>
+#include <fcitx-utils/unixfd.h>
 #include <functional>
+#include <list>
+#include <mutex>
 #include <string>
+#include <sys/eventfd.h>
 #include <systemd/sd-bus.h>
+#include <systemd/sd-event.h>
 #include <thread>
 
 extern "C" VitralStringResult vitral_fcitx_command(VitralEngine *, const char *,
@@ -23,6 +30,13 @@ public:
         thread_([this](std::stop_token stop) { serve(stop); }) {}
 
 private:
+  struct ServiceCall {
+    sd_bus_message *message;
+    std::string command;
+    std::string args;
+    VitralStringResult result{};
+  };
+
   static int dispatch(sd_bus_message *msg, void *userdata,
                       sd_bus_error *error) {
     auto &self = *static_cast<DesktopControl *>(userdata);
@@ -34,6 +48,17 @@ private:
       std::string command(cmd);
       if (command == "panel-state")
         return sd_bus_reply_method_return(msg, "s", self.state_().c_str());
+      if (command == "poll-services" || command == "clipboard-push" ||
+          command == "clipboard-poll" || command == "clipboard-pin" ||
+          command == "clipboard-unpin" || command == "clipboard-clear-unpinned") {
+        {
+          std::lock_guard lock(self.serviceMutex_);
+          self.queued_.emplace_back(msg, std::move(command), args);
+          sd_bus_message_ref(msg);
+        }
+        self.serviceReady_.notify_one();
+        return 1; // The bus thread replies after the service finishes.
+      }
       if (command == "translate-selection" || command == "polish-selection" ||
           command == "toggle-language" || command == "commit-text" ||
           command == "set-preedit") {
@@ -56,6 +81,61 @@ private:
     }
   }
 
+  void runServices(std::stop_token stop, int wake) {
+    std::unique_lock lock(serviceMutex_);
+    std::list<ServiceCall> running;
+    while (serviceReady_.wait(lock, stop, [this] { return !queued_.empty(); })) {
+      if (stop.stop_requested())
+        break;
+      running.splice(running.end(), queued_, queued_.begin());
+      lock.unlock();
+      auto &call = running.front();
+      call.result = vitral_fcitx_command(core_, call.command.c_str(), call.args.c_str());
+      lock.lock();
+      completed_.splice(completed_.end(), running);
+      lock.unlock();
+      int rc;
+      do {
+        rc = eventfd_write(wake, 1);
+      } while (rc < 0 && errno == EINTR);
+      if (rc < 0 && errno != EAGAIN)
+        FCITX_WARN() << "Vitral management wake: " << strerror(errno);
+      lock.lock();
+    }
+  }
+
+  void replyCompleted() {
+    std::list<ServiceCall> ready;
+    {
+      std::lock_guard lock(serviceMutex_);
+      ready.swap(completed_);
+    }
+    // Message references and replies stay on the bus thread.
+    for (auto &call : ready) {
+      auto &result = call.result;
+      const int rc = result.status == VITRAL_STATUS_OK
+                         ? sd_bus_reply_method_return(call.message, "s", result.json_utf8)
+                         : sd_bus_reply_method_errorf(call.message, "dev.vitral.IME.Error", "%s",
+                               result.error_message ? result.error_message : "command failed");
+      if (rc < 0)
+        FCITX_WARN() << "Vitral management reply: " << strerror(-rc);
+      vitral_free_result(result);
+      sd_bus_message_unref(call.message);
+    }
+  }
+
+  static int onServiceReady(sd_event_source *, int wake, uint32_t, void *userdata) {
+    eventfd_t ready;
+    int rc;
+    do {
+      rc = eventfd_read(wake, &ready);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0 && errno != EAGAIN)
+      return -errno;
+    static_cast<DesktopControl *>(userdata)->replyCompleted();
+    return 0;
+  }
+
   void serve(std::stop_token stop) {
     static const sd_bus_vtable methods[] = {
         SD_BUS_VTABLE_START(0),
@@ -64,25 +144,54 @@ private:
         SD_BUS_VTABLE_END};
     sd_bus *bus = nullptr;
     sd_bus_slot *slot = nullptr;
-    int rc = sd_bus_open_user(&bus);
+    sd_event *event = nullptr;
+    sd_event_source *source = nullptr;
+    const auto wake = fcitx::UnixFD::own(eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
+    int rc = wake.isValid() ? sd_event_new(&event) : -errno;
+    if (rc >= 0)
+      rc = sd_event_add_io(event, &source, wake.fd(), EPOLLIN, onServiceReady, this);
+    if (rc >= 0)
+      rc = sd_bus_open_user(&bus);
     if (rc >= 0)
       rc = sd_bus_add_object_vtable(bus, &slot, "/dev/vitral/IME",
                                     "dev.vitral.IME", methods, this);
     if (rc >= 0)
       rc = sd_bus_request_name(bus, "dev.vitral.IME", 0);
-    while (rc >= 0 && !stop.stop_requested()) {
-      rc = sd_bus_process(bus, nullptr);
-      if (rc == 0)
-        rc = sd_bus_wait(bus, 250000);
+    if (rc >= 0)
+      rc = sd_bus_attach_event(bus, event, 0);
+    if (rc >= 0) {
+      std::jthread service([this, fd = wake.fd()](std::stop_token stop) {
+        runServices(stop, fd);
+      });
+      while (rc >= 0 && !stop.stop_requested())
+        rc = sd_event_run(event, 250000);
+      service.request_stop();
+      service.join();
+      replyCompleted();
+      std::list<ServiceCall> pending;
+      {
+        std::lock_guard lock(serviceMutex_);
+        pending.swap(queued_);
+      }
+      for (auto &call : pending) {
+        sd_bus_reply_method_errorf(call.message, "dev.vitral.IME.Error",
+                                   "shutting down");
+        sd_bus_message_unref(call.message);
+      }
     }
     if (rc < 0)
       FCITX_WARN() << "Vitral management bus: " << strerror(-rc);
     sd_bus_slot_unref(slot);
     sd_bus_flush_close_unref(bus);
+    sd_event_source_unref(source);
+    sd_event_unref(event);
   }
 
   VitralEngine *core_;
   Present present_;
   std::function<std::string()> state_;
+  std::mutex serviceMutex_;
+  std::condition_variable_any serviceReady_;
+  std::list<ServiceCall> queued_, completed_;
   std::jthread thread_;
 };

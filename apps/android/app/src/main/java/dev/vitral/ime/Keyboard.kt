@@ -169,9 +169,6 @@ internal class Key(
     private val isComposing: () -> Boolean = { false },
     private val canScrubSpace: () -> Boolean = { true },
 ) : View(ctx) {
-    private val regularTypeface = Typeface.create("sans-serif", Typeface.NORMAL)
-    private val mediumTypeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
-    private val boldTypeface = Typeface.create("sans-serif-medium", Typeface.BOLD)
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val glowPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val strokePaint =
@@ -187,6 +184,22 @@ internal class Key(
         }
     private val keyRect = RectF()
     private val shadowRect = RectF()
+    private val glyphPath = Path()
+    private var cachedFillShader: LinearGradient? = null
+    private var cachedFillTopColor = 0
+    private var cachedFillBottomColor = 0
+    private var cachedFillTop = Float.NaN
+    private var cachedFillBottom = Float.NaN
+    private var cachedBorderShader: LinearGradient? = null
+    private var cachedBorderTopColor = 0
+    private var cachedBorderBottomColor = 0
+    private var cachedBorderTop = Float.NaN
+    private var cachedBorderBottom = Float.NaN
+    private var cachedGlowShader: RadialGradient? = null
+    private var cachedGlowColor = 0
+    private var cachedGlowCx = Float.NaN
+    private var cachedGlowCy = Float.NaN
+    private var cachedGlowRadius = Float.NaN
     private val backspaceHold = BackspaceHold()
     private var downX = 0f
     private var downY = 0f
@@ -249,12 +262,20 @@ internal class Key(
     }
 
     fun refreshCase(english: Boolean, state: Int) {
+        var changed = false
         if (label.length == 1 && label[0] in 'a'..'z') {
-            displayLabel = if (!english || state > 0) label.uppercase() else label
-            contentDescription = displayLabel
+            val nextLabel = if (!english || state > 0) label.uppercase() else label
+            if (nextLabel != displayLabel) {
+                displayLabel = nextLabel
+                contentDescription = displayLabel
+                changed = true
+            }
         }
-        if (label == "⇧") shiftState = state
-        invalidate()
+        if (label == "⇧" && shiftState != state) {
+            shiftState = state
+            changed = true
+        }
+        if (changed) invalidate()
     }
 
     private fun drawCenteredText(
@@ -288,7 +309,8 @@ internal class Key(
     private fun drawShiftGlyph(c: Canvas, cx: Float, cy: Float, color: Int) {
         val s = min(width, height) * 0.19f
         val p =
-            Path().apply {
+            glyphPath.apply {
+                reset()
                 moveTo(cx, cy - s)
                 lineTo(cx + s * 0.92f, cy + s * 0.04f)
                 lineTo(cx + s * 0.40f, cy + s * 0.04f)
@@ -322,7 +344,8 @@ internal class Key(
         val boxLeft = cx - w * 0.40f
         val right = cx + w * 0.92f
         val p =
-            Path().apply {
+            glyphPath.apply {
+                reset()
                 moveTo(leftTip, cy)
                 lineTo(boxLeft, cy - h)
                 lineTo(right, cy - h)
@@ -344,7 +367,8 @@ internal class Key(
         strokePaint.color = color
         strokePaint.strokeWidth = context.dpF(1.9f)
         val p =
-            Path().apply {
+            glyphPath.apply {
+                reset()
                 moveTo(cx + s * 0.82f, cy - s * 0.52f)
                 lineTo(cx + s * 0.82f, cy + s * 0.12f)
                 lineTo(cx - s * 0.70f, cy + s * 0.12f)
@@ -438,16 +462,29 @@ internal class Key(
             }
         }
         paint.style = Paint.Style.FILL
-        paint.shader =
-            LinearGradient(
-                0f,
-                keyRect.top,
-                0f,
-                keyRect.bottom,
-                topFill,
-                bottomFill,
-                Shader.TileMode.CLAMP,
-            )
+        if (
+            cachedFillShader == null ||
+                cachedFillTopColor != topFill ||
+                cachedFillBottomColor != bottomFill ||
+                cachedFillTop != keyRect.top ||
+                cachedFillBottom != keyRect.bottom
+        ) {
+            cachedFillTopColor = topFill
+            cachedFillBottomColor = bottomFill
+            cachedFillTop = keyRect.top
+            cachedFillBottom = keyRect.bottom
+            cachedFillShader =
+                LinearGradient(
+                    0f,
+                    keyRect.top,
+                    0f,
+                    keyRect.bottom,
+                    topFill,
+                    bottomFill,
+                    Shader.TileMode.CLAMP,
+                )
+        }
+        paint.shader = cachedFillShader
         c.drawRoundRect(keyRect, r, r, paint)
         paint.shader = null
 
@@ -455,48 +492,82 @@ internal class Key(
         if (glowStrength > 0.01f) {
             val baseGlow =
                 (if (dark) T.Dark.surfaceKeyPressedGlowArgb else T.Light.surfaceKeyPressedGlowArgb).toInt()
-            val alpha = (((baseGlow ushr 24) and 0xFF) * glowStrength).toInt().coerceIn(0, 255)
-            val centerColor = (alpha shl 24) or (baseGlow and 0x00FFFFFF)
-            val edgeColor = ((alpha * 0.45f).toInt() shl 24) or (baseGlow and 0x00FFFFFF)
+            val glowCx = keyRect.centerX()
+            val glowCy = keyRect.centerY()
+            val glowRadius = (min(keyRect.width(), keyRect.height()) * 0.85f).coerceAtLeast(1f)
+            if (
+                cachedGlowShader == null ||
+                    cachedGlowColor != baseGlow ||
+                    cachedGlowCx != glowCx ||
+                    cachedGlowCy != glowCy ||
+                    cachedGlowRadius != glowRadius
+            ) {
+                val baseAlpha = (baseGlow ushr 24) and 0xFF
+                val edgeColor = ((baseAlpha * 0.45f).toInt() shl 24) or (baseGlow and 0x00FFFFFF)
+                cachedGlowColor = baseGlow
+                cachedGlowCx = glowCx
+                cachedGlowCy = glowCy
+                cachedGlowRadius = glowRadius
+                cachedGlowShader =
+                    RadialGradient(
+                        glowCx,
+                        glowCy,
+                        glowRadius,
+                        baseGlow,
+                        edgeColor,
+                        Shader.TileMode.CLAMP,
+                    )
+            }
             glowPaint.style = Paint.Style.FILL
-            glowPaint.shader =
-                RadialGradient(
-                    keyRect.centerX(),
-                    keyRect.centerY(),
-                    (min(keyRect.width(), keyRect.height()) * 0.85f).coerceAtLeast(1f),
-                    centerColor,
-                    edgeColor,
-                    Shader.TileMode.CLAMP,
-                )
+            glowPaint.shader = cachedGlowShader
+            glowPaint.alpha = (glowStrength * 255f).toInt().coerceIn(0, 255)
             c.drawRoundRect(keyRect, r, r, glowPaint)
+            glowPaint.alpha = 255
             glowPaint.shader = null
             if (!isPressed && !recording) postInvalidateOnAnimation()
         }
 
         // Ultra-delicate glass border (never a harsh wireframe box!) + luminous top specular edge
-        borderPaint.shader =
-            LinearGradient(
-                0f,
-                keyRect.top,
-                0f,
-                keyRect.bottom,
-                when {
-                    clearAllActive -> 0xFFEF4444.toInt()
-                    glowStrength > 0.2f -> (if (dark) T.Dark.accentTextArgb else T.Light.accentPrimaryArgb).toInt()
-                    shiftActive -> (if (dark) 0x557DD3FC else 0x440284C7)
-                    role == KeyRole.ACCENT -> 0x55FFFFFF
-                    dark -> 0x26FFFFFF
-                    else -> 0xE8FFFFFF.toInt()
-                },
-                when {
-                    clearAllActive -> 0xCCDC2626.toInt()
-                    glowStrength > 0.2f -> (if (dark) 0x4438BDF8 else 0x440284C7)
-                    role == KeyRole.ACCENT -> 0x18FFFFFF
-                    dark -> 0x0AFFFFFF
-                    else -> 0x180F172A
-                },
-                Shader.TileMode.CLAMP,
-            )
+        val borderTopColor =
+            when {
+                clearAllActive -> 0xFFEF4444.toInt()
+                glowStrength > 0.2f -> (if (dark) T.Dark.accentTextArgb else T.Light.accentPrimaryArgb).toInt()
+                shiftActive -> (if (dark) 0x557DD3FC else 0x440284C7)
+                role == KeyRole.ACCENT -> 0x55FFFFFF
+                dark -> 0x26FFFFFF
+                else -> 0xE8FFFFFF.toInt()
+            }
+        val borderBottomColor =
+            when {
+                clearAllActive -> 0xCCDC2626.toInt()
+                glowStrength > 0.2f -> (if (dark) 0x4438BDF8 else 0x440284C7)
+                role == KeyRole.ACCENT -> 0x18FFFFFF
+                dark -> 0x0AFFFFFF
+                else -> 0x180F172A
+            }
+        if (
+            cachedBorderShader == null ||
+                cachedBorderTopColor != borderTopColor ||
+                cachedBorderBottomColor != borderBottomColor ||
+                cachedBorderTop != keyRect.top ||
+                cachedBorderBottom != keyRect.bottom
+        ) {
+            cachedBorderTopColor = borderTopColor
+            cachedBorderBottomColor = borderBottomColor
+            cachedBorderTop = keyRect.top
+            cachedBorderBottom = keyRect.bottom
+            cachedBorderShader =
+                LinearGradient(
+                    0f,
+                    keyRect.top,
+                    0f,
+                    keyRect.bottom,
+                    borderTopColor,
+                    borderBottomColor,
+                    Shader.TileMode.CLAMP,
+                )
+        }
+        borderPaint.shader = cachedBorderShader
         c.drawRoundRect(keyRect, r, r, borderPaint)
         borderPaint.shader = null
 
@@ -835,6 +906,9 @@ internal class Key(
 
     companion object {
         private const val CLEAR_ALL_HOLD_MS = 3000L
+        private val regularTypeface: Typeface by lazy { Typeface.create("sans-serif", Typeface.NORMAL) }
+        private val mediumTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.NORMAL) }
+        private val boldTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.BOLD) }
     }
 }
 

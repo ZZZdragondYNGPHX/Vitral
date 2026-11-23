@@ -45,4 +45,4 @@ Vitral 源码可按 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 使用�
 
 ## 开发与验证
 
-[产品规格](docs/PROPOSAL.md) · [架构与模块](docs/architecture.md) · [设计令牌](tokens/design-tokens.json)
+[产品规格](docs/PROPOSAL.md) · [架构与模块](docs/handoff/PROJECT.md) · [测试指南](docs/handoff/TEST_INFRA.md) · [设计令牌](tokens/design-tokens.json)

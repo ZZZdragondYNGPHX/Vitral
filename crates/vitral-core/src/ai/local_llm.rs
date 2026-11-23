@@ -88,25 +88,60 @@ impl LocalLlmEngine {
     pub fn available(model: Option<&LocalLlmModel>) -> bool {
         cfg!(feature = "native-onnx") && model.is_some()
     }
+    pub(crate) fn is_busy(&self) -> bool {
+        #[cfg(feature = "native-onnx")]
+        {
+            self.state.is_locked()
+        }
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn try_generate(
+        &self,
+        model: &LocalLlmModel,
+        request: &LocalLlmRequest,
+    ) -> Result<Option<String>, VitralError> {
+        self.generate_impl(model, request, false)
+    }
+
     pub fn generate(
         &self,
         model: &LocalLlmModel,
         request: &LocalLlmRequest,
     ) -> Result<String, VitralError> {
+        self.generate_impl(model, request, true)
+            .map(Option::unwrap_or_default)
+    }
+
+    fn generate_impl(
+        &self,
+        model: &LocalLlmModel,
+        request: &LocalLlmRequest,
+        wait: bool,
+    ) -> Result<Option<String>, VitralError> {
         request.check_cancel()?;
         if request.max_new_tokens == 0 {
-            return Ok(String::new());
+            return Ok(Some(String::new()));
         }
         #[cfg(not(feature = "native-onnx"))]
         {
-            let _ = model;
+            let _ = (model, wait);
             Err(VitralError::ModelUnavailable(
                 "本地 Qwen3 需要 native-onnx".into(),
             ))
         }
         #[cfg(feature = "native-onnx")]
         {
-            let mut state = self.state.lock();
+            let mut state = if wait {
+                self.state.lock()
+            } else if let Some(state) = self.state.try_lock() {
+                state
+            } else {
+                return Ok(None);
+            };
             request.check_cancel()?;
             if state.as_ref().is_none_or(|s| s.model != *model) {
                 *state = None;
@@ -124,7 +159,7 @@ impl LocalLlmEngine {
             let loaded = state.as_mut().unwrap();
             let result = loaded.generate(request);
             loaded.last_used = Instant::now();
-            result
+            result.map(Some)
         }
     }
 }

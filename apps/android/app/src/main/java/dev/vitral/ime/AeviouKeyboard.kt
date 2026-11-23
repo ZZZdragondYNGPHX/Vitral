@@ -65,6 +65,11 @@ internal class AeviouKeyboard(
         val isAccent: Boolean = false,
         var cx: Float = 0f,
         var cy: Float = 0f,
+        var fillShader: LinearGradient? = null,
+        var shaderTopCol: Int = 0,
+        var shaderBotCol: Int = 0,
+        var shaderCy: Float = Float.NaN,
+        var shaderR: Float = Float.NaN,
     )
 
     private data class Petal(
@@ -79,10 +84,19 @@ internal class AeviouKeyboard(
 
     // Contextual next-word/syllable targets: initial letter -> (targetToken, targetDisplay, rank 0..5)
     private var contextTargets: Map<String, Triple<String, String, Int>> = emptyMap()
+    private var cachedContextDrawOrder: List<HexCell>? = null
 
     fun setContextHints(hints: Map<String, Triple<String, String, Int>>) {
         if (contextTargets != hints) {
             contextTargets = hints
+            cachedContextDrawOrder =
+                if (hints.isEmpty()) cells
+                else
+                    cells.sortedBy { cell ->
+                        val rank = if (!cell.isAction) hints[cell.id]?.third else null
+                        if (rank == null) 0 else (10 - rank)
+                    }
+            if (sliding) refreshSlideHud()
             invalidate()
         }
     }
@@ -163,13 +177,14 @@ internal class AeviouKeyboard(
         }
 
     fun refreshCase(state: Int) {
+        if (shiftState == state) return
         shiftState = state
         if (isPureEnglish) {
             cells.filter { !it.isAction }.forEach {
                 it.label = if (state > 0) it.id.uppercase() else it.id
             }
+            invalidate()
         }
-        invalidate()
     }
 
     fun onCompositionChanged(composing: Boolean) {
@@ -211,7 +226,65 @@ internal class AeviouKeyboard(
     private val centerHistory = ArrayList<PointF>()
     private var activeCenter = PointF()
     private var petals: List<Petal> = emptyList()
-    private val trail = ArrayList<PointF>()
+    private val trailX = FloatArray(TRAIL_CAPACITY)
+    private val trailY = FloatArray(TRAIL_CAPACITY)
+    private var trailHead = 0
+    private var trailSize = 0
+    private var cachedSlidePrefix = ""
+    private var cachedCenterHint = ""
+    private var cachedHudSummary = ""
+
+    private fun clearTrail() {
+        trailHead = 0
+        trailSize = 0
+    }
+
+    private fun pushTrail(x: Float, y: Float) {
+        if (trailSize < TRAIL_CAPACITY) {
+            val idx = (trailHead + trailSize) % TRAIL_CAPACITY
+            trailX[idx] = x
+            trailY[idx] = y
+            trailSize++
+        } else {
+            trailX[trailHead] = x
+            trailY[trailHead] = y
+            trailHead = (trailHead + 1) % TRAIL_CAPACITY
+        }
+    }
+
+    private fun refreshSlideHud() {
+        val cur = currentPrefix()
+        val centerHint =
+            if (cur.isEmpty()) ""
+            else if (isPureEnglish) englishTopHint(cur)
+            else {
+                val first = cur.substring(0, 1)
+                val ctx = contextTargets[first]
+                if (ctx != null && ctx.first == cur) ctx.second
+                else if (allowMixedEnglish) topHintChar(cur).ifEmpty { englishTopHint(cur) }
+                else topHintChar(cur)
+            }
+        cachedSlidePrefix = cur
+        cachedCenterHint = centerHint
+        cachedHudSummary =
+            buildString {
+                append(cur.ifEmpty { "韵母" })
+                if (centerHint.isNotEmpty()) append(" · ").append(centerHint)
+                var shownCount = 0
+                for (p in petals) {
+                    if (p.isBacktrack) continue
+                    if (shownCount == 0) append("   |   ") else append("  ")
+                    val lbl = if (isPureEnglish) p.append else p.append.uppercase()
+                    append(lbl)
+                    if (p.hintChar.isNotEmpty()) {
+                        append(':')
+                        append(if (p.hintChar.length > 2) p.hintChar.substring(0, 2) else p.hintChar)
+                    }
+                    shownCount++
+                    if (shownCount >= 4) break
+                }
+            }
+    }
 
     private val repeatDelete =
         object : Runnable {
@@ -316,9 +389,8 @@ internal class AeviouKeyboard(
     private fun buildHexPath(cx: Float, cy: Float, radius: Float, out: Path) {
         out.reset()
         for (i in 0 until 6) {
-            val angle = (PI / 180.0) * (60.0 * i - 30.0)
-            val x = cx + radius * cos(angle).toFloat()
-            val y = cy + radius * sin(angle).toFloat()
+            val x = cx + radius * HEX_COS[i]
+            val y = cy + radius * HEX_SIN[i]
             if (i == 0) out.moveTo(x, y) else out.lineTo(x, y)
         }
         out.close()
@@ -520,6 +592,7 @@ internal class AeviouKeyboard(
             )
         }
         petals = result
+        refreshSlideHud()
     }
 
     override fun onDraw(c: Canvas) {
@@ -532,11 +605,7 @@ internal class AeviouKeyboard(
         val accentSolid = (if (dark) T.Dark.accentPrimaryArgb else T.Light.accentPrimaryArgb).toInt()
 
         // 1. Base honeycomb grid with elastic magnification on context-predicted initials
-        val drawOrder =
-            cells.sortedBy { cell ->
-                val rank = if (!cell.isAction) contextTargets[cell.id]?.third else null
-                if (rank == null || sliding) 0 else (10 - rank)
-            }
+        val drawOrder = if (sliding) cells else (cachedContextDrawOrder ?: cells)
         for (cell in drawOrder) {
             val ctxHit = if (!cell.isAction) contextTargets[cell.id] else null
             val isCtxGlow = ctxHit != null && !sliding
@@ -575,7 +644,21 @@ internal class AeviouKeyboard(
                     dark -> 0x10FFFFFF
                     else -> 0xCEFFFFFF.toInt()
                 }
-            fillPaint.shader = LinearGradient(0f, cell.cy - r, 0f, cell.cy + r, topCol, botCol, Shader.TileMode.CLAMP)
+            if (
+                cell.fillShader == null ||
+                    cell.shaderTopCol != topCol ||
+                    cell.shaderBotCol != botCol ||
+                    cell.shaderCy != cell.cy ||
+                    cell.shaderR != r
+            ) {
+                cell.shaderTopCol = topCol
+                cell.shaderBotCol = botCol
+                cell.shaderCy = cell.cy
+                cell.shaderR = r
+                cell.fillShader =
+                    LinearGradient(0f, cell.cy - r, 0f, cell.cy + r, topCol, botCol, Shader.TileMode.CLAMP)
+            }
+            fillPaint.shader = cell.fillShader
             c.drawPath(hexPath, fillPaint)
             fillPaint.shader = null
 
@@ -643,10 +726,13 @@ internal class AeviouKeyboard(
 
         // 2. Dynamic Progressive-Convergence Flower Overlay while sliding
         if (sliding) {
-            if (trail.size >= 2) {
+            if (trailSize >= 2) {
                 trailPath.reset()
-                trailPath.moveTo(trail[0].x, trail[0].y)
-                for (i in 1 until trail.size) trailPath.lineTo(trail[i].x, trail[i].y)
+                trailPath.moveTo(trailX[trailHead], trailY[trailHead])
+                for (i in 1 until trailSize) {
+                    val idx = (trailHead + i) % TRAIL_CAPACITY
+                    trailPath.lineTo(trailX[idx], trailY[idx])
+                }
                 trailPaint.color = accentText
                 trailPaint.alpha = 185
                 c.drawPath(trailPath, trailPaint)
@@ -720,17 +806,8 @@ internal class AeviouKeyboard(
             c.drawPath(hexPath, borderPaint)
             borderPaint.strokeWidth = context.dpF(1.1f)
 
-            val cur = currentPrefix()
-            val centerHint =
-                if (cur.isEmpty()) ""
-                else if (isPureEnglish) englishTopHint(cur)
-                else {
-                    val first = cur.substring(0, 1)
-                    val ctx = contextTargets[first]
-                    if (ctx != null && ctx.first == cur) ctx.second
-                    else if (allowMixedEnglish) topHintChar(cur).ifEmpty { englishTopHint(cur) }
-                    else topHintChar(cur)
-                }
+            val cur = cachedSlidePrefix
+            val centerHint = cachedCenterHint
             textPaint.color = 0xFFFFFFFF.toInt()
             textPaint.textSize = context.dpF(if (cur.length >= 5) 11.5f else if (cur.length >= 4) 13.0f else 16.0f)
             val cyText =
@@ -751,17 +828,7 @@ internal class AeviouKeyboard(
             }
 
             // 3. Unobstructed Top-Center Floating HUD Capsule (always visible above right/left thumb!)
-            val hudSummary =
-                buildString {
-                    append(cur.ifEmpty { "韵母" })
-                    if (centerHint.isNotEmpty()) append(" · ").append(centerHint)
-                    val previewPetals =
-                        petals.filter { !it.isBacktrack }.take(4).joinToString("  ") { p ->
-                            val lbl = if (isPureEnglish) p.append else p.append.uppercase()
-                            if (p.hintChar.isNotEmpty()) "$lbl:${p.hintChar.take(2)}" else lbl
-                        }
-                    if (previewPetals.isNotEmpty()) append("   |   ").append(previewPetals)
-                }
+            val hudSummary = cachedHudSummary
             subPaint.textSize = context.dpF(11f)
             val hudW = (subPaint.measureText(hudSummary) + context.dpF(22f)).coerceAtMost(width - context.dpF(16f))
             val hudH = context.dpF(24f)
@@ -869,8 +936,8 @@ internal class AeviouKeyboard(
             stepAnchor = PointF(x, y)
             stepStack.clear()
             centerHistory.clear()
-            trail.clear()
-            trail.add(PointF(x, y))
+            clearTrail()
+            pushTrail(x, y)
             if (hit.id != "aeiou") {
                 stepStack.add(hit.id)
             }
@@ -896,8 +963,7 @@ internal class AeviouKeyboard(
             return
         }
         if (!sliding) return
-        trail.add(PointF(x, y))
-        if (trail.size > 48) trail.removeAt(0)
+        pushTrail(x, y)
         // Require genuine finger displacement before triggering any petal so tapping edge keys (e.g. J) NEVER misfires!
         val armThreshold = if (stepStack.size <= 1) hexRadius * 0.68f else hexRadius * 0.48f
         if (!armedSlide) {
@@ -957,7 +1023,10 @@ internal class AeviouKeyboard(
             val token = currentPrefix()
             sliding = false
             petals = emptyList()
-            trail.clear()
+            clearTrail()
+            cachedSlidePrefix = ""
+            cachedCenterHint = ""
+            cachedHudSummary = ""
             if (token.isNotEmpty()) {
                 // In pure English mode, append a trailing space when a multi-letter word was slid
                 val finalOut =
@@ -1032,7 +1101,10 @@ internal class AeviouKeyboard(
                 clearAllSwipeUp = false
                 sliding = false
                 petals = emptyList()
-                trail.clear()
+                clearTrail()
+                cachedSlidePrefix = ""
+                cachedCenterHint = ""
+                cachedHudSummary = ""
                 stepStack.clear()
                 invalidate()
             }
@@ -1048,6 +1120,9 @@ internal class AeviouKeyboard(
 
     companion object {
         private const val CLEAR_ALL_HOLD_MS = 3000L
+        private const val TRAIL_CAPACITY = 48
+        private val HEX_COS = FloatArray(6) { i -> cos((PI / 180.0) * (60.0 * i - 30.0)).toFloat() }
+        private val HEX_SIN = FloatArray(6) { i -> sin((PI / 180.0) * (60.0 * i - 30.0)).toFloat() }
         // Compact frequency-ranked English everyday + tech lexicon: (lowercase, display, weight)
         private val ENGLISH_WORDS: List<Triple<String, String, Int>> =
             listOf(

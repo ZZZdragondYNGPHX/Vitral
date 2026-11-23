@@ -126,6 +126,8 @@ fun unpack(raw: String): Any {
 
 object Core {
     private val input = Executors.newSingleThreadExecutor()
+    private val auxiliary = Executors.newSingleThreadExecutor()
+    private val voice = Executors.newSingleThreadExecutor()
     private val services = Executors.newSingleThreadExecutor()
     private val main = Handler(Looper.getMainLooper())
     private var handle = 0L
@@ -136,9 +138,15 @@ object Core {
     @Synchronized
     private fun engine(ctx: Context): Long {
         if (handle != 0L) return handle
-        val version = ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime
+        val version =
+            runCatching {
+                ctx.assets.open("models/fingerprint.txt").bufferedReader().use { it.readText().trim() }
+            }
+                .getOrNull()
+                ?.takeIf { it.isNotEmpty() && it.all { ch -> ch in '0'..'9' || ch in 'a'..'f' } }
+                ?: ctx.packageManager.getPackageInfo(ctx.packageName, 0).lastUpdateTime.toString()
         val base = File(ctx.noBackupFilesDir, "models").apply { mkdirs() }
-        val dir = File(base, version.toString())
+        val dir = File(base, version)
         if (!dir.isDirectory) {
             val temp = File(base, "staging")
             temp.deleteRecursively()
@@ -160,6 +168,11 @@ object Core {
                 temp.deleteRecursively()
             }
             base.listFiles()?.filter { it != dir }?.forEach { it.deleteRecursively() }
+            ctx.noBackupFilesDir
+                .listFiles { f ->
+                    f.isFile && f.name.startsWith("rime-corpus-") && f.name.endsWith(".bin")
+                }
+                ?.forEach { it.delete() }
         }
         val preferences = ctx.getSharedPreferences("vitral", 0)
         val id =
@@ -180,29 +193,47 @@ object Core {
         return handle
     }
 
+    private fun dispatch(
+        ctx: Context,
+        executor: java.util.concurrent.ExecutorService,
+        operation: (Long) -> Any,
+        done: (Result<Any>) -> Unit,
+    ) {
+        val app = ctx.applicationContext
+        executor.execute {
+            val result = runCatching { operation(engine(app)) }
+            main.post { done(result) }
+        }
+    }
+
     fun run(
         ctx: Context,
         background: Boolean = false,
         operation: (Long) -> Any,
         done: (Result<Any>) -> Unit = {},
-    ) {
-        val app = ctx.applicationContext
-        (if (background) services else input).execute {
-            val result = runCatching { operation(engine(app)) }
-            main.post { done(result) }
-        }
-    }
+    ) = dispatch(ctx, if (background) services else input, operation, done)
+
+    fun runVoice(
+        ctx: Context,
+        operation: (Long) -> Any,
+        done: (Result<Any>) -> Unit = {},
+    ) = dispatch(ctx, voice, operation, done)
 
     fun call(
         ctx: Context,
         name: String,
         data: JSONObject = JSONObject(),
         background: Boolean = false,
+        auxiliary: Boolean = false,
         done: (Result<Any>) -> Unit = {},
     ) =
-        run(
+        dispatch(
             ctx,
-            background,
+            when {
+                background -> services
+                auxiliary -> this.auxiliary
+                else -> input
+            },
             { h -> unpack(PlatformCommands.execute(h, name, data.toString())) },
             done,
         )
