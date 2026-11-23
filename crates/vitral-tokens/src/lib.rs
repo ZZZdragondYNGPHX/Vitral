@@ -791,21 +791,23 @@ pub fn validate_tokens(doc: &DesignTokensDocument) -> Result<(), Vec<TokenViolat
             "must be 'xiaohe-final'",
         );
     }
-    if doc.ergonomics.schema_keycaps.rime_ice_quanpin.rows != 5 {
-        push(9, "ergonomics.schemaKeycaps.rime_ice_quanpin.rows", "must be 5");
+    if doc.ergonomics.schema_keycaps.rime_ice_quanpin.rows != 4 {
+        push(9, "ergonomics.schemaKeycaps.rime_ice_quanpin.rows", "must be 4");
     }
-    if !doc.ergonomics.schema_keycaps.rime_ice_quanpin.dedicated_top_number_row {
+    if doc.ergonomics.schema_keycaps.rime_ice_quanpin.dedicated_top_number_row {
         push(
             9,
             "ergonomics.schemaKeycaps.rime_ice_quanpin.dedicatedTopNumberRow",
-            "must be true",
+            "must be false",
         );
     }
-    if doc.ergonomics.schema_keycaps.rime_ice_quanpin.top_right_sublabel != "swipe-up-symbol" {
+    if doc.ergonomics.schema_keycaps.rime_ice_quanpin.top_right_sublabel
+        != "swipe-up-number-or-symbol"
+    {
         push(
             9,
             "ergonomics.schemaKeycaps.rime_ice_quanpin.topRightSublabel",
-            "must be 'swipe-up-symbol'",
+            "must be 'swipe-up-number-or-symbol'",
         );
     }
 

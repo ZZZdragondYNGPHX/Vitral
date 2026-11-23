@@ -117,9 +117,9 @@ export const VITRAL_TOKENS = {
         "bottomRightSublabel": "xiaohe-final"
       },
       "rime_ice_quanpin": {
-        "rows": 5,
-        "dedicatedTopNumberRow": true,
-        "topRightSublabel": "swipe-up-symbol"
+        "rows": 4,
+        "dedicatedTopNumberRow": false,
+        "topRightSublabel": "swipe-up-number-or-symbol"
       }
     }
   }

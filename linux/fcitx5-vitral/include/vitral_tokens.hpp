@@ -153,9 +153,9 @@ inline constexpr int32_t kHapticActionThudMs = 16;
 inline constexpr int32_t kFlypyRows = 4;
 inline constexpr std::string_view kFlypyTopLeftSublabel = "swipe-up-number-or-symbol";
 inline constexpr std::string_view kFlypyBottomRightSublabel = "xiaohe-final";
-inline constexpr int32_t kQuanpinRows = 5;
-inline constexpr bool kQuanpinDedicatedTopNumberRow = true;
-inline constexpr std::string_view kQuanpinTopRightSublabel = "swipe-up-symbol";
+inline constexpr int32_t kQuanpinRows = 4;
+inline constexpr bool kQuanpinDedicatedTopNumberRow = false;
+inline constexpr std::string_view kQuanpinTopRightSublabel = "swipe-up-number-or-symbol";
 }  // namespace ergonomics
 
 }  // namespace vitral::tokens

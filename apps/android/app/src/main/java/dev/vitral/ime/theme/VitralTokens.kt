@@ -158,8 +158,8 @@ object VitralTokens {
         const val flypyRows: Int = 4
         const val flypyTopLeftSublabel: String = "swipe-up-number-or-symbol"
         const val flypyBottomRightSublabel: String = "xiaohe-final"
-        const val quanpinRows: Int = 5
-        const val quanpinDedicatedTopNumberRow: Boolean = true
-        const val quanpinTopRightSublabel: String = "swipe-up-symbol"
+        const val quanpinRows: Int = 4
+        const val quanpinDedicatedTopNumberRow: Boolean = false
+        const val quanpinTopRightSublabel: String = "swipe-up-number-or-symbol"
     }
 }

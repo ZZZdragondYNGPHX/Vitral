@@ -327,9 +327,9 @@ def validate_tokens(doc: dict[str, Any]) -> tuple[dict[str, dict[str, Any]], tup
         "Group 9: double_pinyin_flypy.bottomRightSublabel mismatch",
     )
     quanpin = sk.get("rime_ice_quanpin", {})
-    check(quanpin.get("rows") == 5, "Group 9: rime_ice_quanpin.rows must be 5")
-    check(quanpin.get("dedicatedTopNumberRow") is True, "Group 9: rime_ice_quanpin.dedicatedTopNumberRow must be true")
-    check(quanpin.get("topRightSublabel") == "swipe-up-symbol", "Group 9: rime_ice_quanpin.topRightSublabel mismatch")
+    check(quanpin.get("rows") == 4, "Group 9: rime_ice_quanpin.rows must be 4")
+    check(quanpin.get("dedicatedTopNumberRow") is False, "Group 9: rime_ice_quanpin.dedicatedTopNumberRow must be false")
+    check(quanpin.get("topRightSublabel") == "swipe-up-number-or-symbol", "Group 9: rime_ice_quanpin.topRightSublabel mismatch")
 
     if errors:
         raise ValueError("Design token invariant validation failed:\n  - " + "\n  - ".join(errors))

@@ -120,9 +120,9 @@ pub const TOKENS: DesignTokensStatic = DesignTokensStatic {
                 bottom_right_sublabel: "xiaohe-final",
             },
             rime_ice_quanpin: QuanpinKeycapSpec {
-                rows: 5,
-                dedicated_top_number_row: true,
-                top_right_sublabel: "swipe-up-symbol",
+                rows: 4,
+                dedicated_top_number_row: false,
+                top_right_sublabel: "swipe-up-number-or-symbol",
             },
         },
     },
