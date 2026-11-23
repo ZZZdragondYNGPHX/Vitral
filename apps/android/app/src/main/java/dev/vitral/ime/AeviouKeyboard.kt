@@ -45,11 +45,12 @@ internal enum class AeviouEnv {
 internal class AeviouKeyboard(
     ctx: Context,
     private val env: AeviouEnv = AeviouEnv.MIXED,
-    private val shiftState: Int = 0,
+    private var shiftState: Int = 0,
     private val leftHanded: Boolean = false,
     private val darkOverride: Boolean? = null,
     private val onSyllable: (String) -> Unit,
     private val onActionKey: (String) -> Unit,
+    private val isComposing: () -> Boolean = { false },
 ) : View(ctx) {
 
     private val isPureEnglish: Boolean get() = env == AeviouEnv.PURE_EN
@@ -57,7 +58,7 @@ internal class AeviouKeyboard(
 
     private data class HexCell(
         val id: String,
-        val label: String,
+        var label: String,
         val row: Int,
         val col: Int,
         val isAction: Boolean = false,
@@ -161,6 +162,39 @@ internal class AeviouKeyboard(
             }
         }
 
+    fun refreshCase(state: Int) {
+        shiftState = state
+        if (isPureEnglish) {
+            cells.filter { !it.isAction }.forEach {
+                it.label = if (state > 0) it.id.uppercase() else it.id
+            }
+        }
+        invalidate()
+    }
+
+    fun onCompositionChanged(composing: Boolean) {
+        touches.values.forEach { it.deleteHold.allowsDelete(composing) }
+        if (pressedAction?.id == "⌫" && !backspaceHold.allowsDelete(composing)) {
+            removeCallbacks(repeatDelete)
+            removeCallbacks(armClearAll)
+            clearAllPending = false
+            invalidate()
+        }
+    }
+
+    private data class Touch(
+        val cell: HexCell,
+        val x: Float,
+        val y: Float,
+        val time: Long,
+        val deleteHold: BackspaceHold = BackspaceHold(),
+        var moved: Boolean = false,
+    )
+
+    // Only the owner drives the sliding petals; overlapping fingers keep independent taps.
+    private val touches = linkedMapOf<Int, Touch>()
+    private var gesturePointerId: Int? = null
+    private var backspaceHold = BackspaceHold()
     private var hexRadius = 0f
     private var sliding = false
     private var armedSlide = false
@@ -184,7 +218,8 @@ internal class AeviouKeyboard(
             override fun run() {
                 if (pressedAction?.id != "⌫" || clearAllArmed) return
                 repeatingDelete = true
-                onActionKey("⌫")
+                if (!backspaceHold.allowsDelete(isComposing())) return
+                onActionKey("⌫-repeat")
                 postDelayed(this, 65L)
             }
         }
@@ -804,137 +839,192 @@ internal class AeviouKeyboard(
         return best
     }
 
+    private fun beginTouch(touch: Touch) {
+        val hit = touch.cell
+        val x = touch.x
+        val y = touch.y
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armClearAll)
+        repeatingDelete = false
+        clearAllPending = false
+        clearAllArmed = false
+        clearAllSwipeUp = false
+        if (hit.isAction) {
+            pressedAction = hit
+            actionDownX = x
+            actionDownY = y
+            actionPressedAt = touch.time
+            sliding = false
+            armedSlide = false
+            if (hit.id == "⌫") {
+                backspaceHold = touch.deleteHold
+                clearAllPending = !backspaceHold.startedComposing
+                postDelayed(repeatDelete, 360L)
+                if (clearAllPending) postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
+            }
+        } else {
+            pressedAction = null
+            sliding = true
+            armedSlide = false
+            stepAnchor = PointF(x, y)
+            stepStack.clear()
+            centerHistory.clear()
+            trail.clear()
+            trail.add(PointF(x, y))
+            if (hit.id != "aeiou") {
+                stepStack.add(hit.id)
+            }
+            centerHistory.add(PointF(hit.cx, hit.cy))
+            computePetals(PointF(hit.cx, hit.cy), currentPrefix())
+        }
+        invalidate()
+    }
+
+    private fun moveTouch(x: Float, y: Float) {
+        if (pressedAction?.id == "⌫") {
+            if (!clearAllArmed && hypot(x - actionDownX, y - actionDownY) > context.dpF(14f)) {
+                removeCallbacks(repeatDelete)
+                removeCallbacks(armClearAll)
+                clearAllPending = false
+            }
+            if (clearAllArmed) {
+                clearAllSwipeUp =
+                    if (clearAllSwipeUp) actionDownY - y >= context.dpF(16f)
+                    else actionDownY - y >= context.dpF(24f)
+            }
+            invalidate()
+            return
+        }
+        if (!sliding) return
+        trail.add(PointF(x, y))
+        if (trail.size > 48) trail.removeAt(0)
+        // Require genuine finger displacement before triggering any petal so tapping edge keys (e.g. J) NEVER misfires!
+        val armThreshold = if (stepStack.size <= 1) hexRadius * 0.68f else hexRadius * 0.48f
+        if (!armedSlide) {
+            if (hypot(x - stepAnchor.x, y - stepAnchor.y) < armThreshold) {
+                invalidate()
+                return
+            }
+            armedSlide = true
+        }
+        val triggerR = hexRadius * 0.72f
+        val entered =
+            petals.minByOrNull { hypot(x - it.cx, y - it.cy) }?.takeIf {
+                hypot(x - it.cx, y - it.cy) <= triggerR
+            }
+        if (entered != null) {
+            armedSlide = false
+            stepAnchor = PointF(x, y)
+            if (entered.isBacktrack) {
+                if (stepStack.isNotEmpty()) stepStack.removeAt(stepStack.lastIndex)
+                if (centerHistory.size > 1) centerHistory.removeAt(centerHistory.lastIndex)
+                val prevCenter = centerHistory.lastOrNull() ?: PointF(x, y)
+                computePetals(prevCenter, currentPrefix())
+            } else {
+                stepStack.add(entered.append)
+                val nextCenter = PointF(entered.cx, entered.cy)
+                centerHistory.add(nextCenter)
+                computePetals(nextCenter, currentPrefix())
+            }
+        }
+        invalidate()
+    }
+
+    private fun finishTouch(x: Float, y: Float) {
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armClearAll)
+        val act = pressedAction
+        val didRepeat = repeatingDelete
+        val didClearAllArmed = clearAllArmed
+        val didClearAllSwipeUp = clearAllSwipeUp
+        pressedAction = null
+        repeatingDelete = false
+        clearAllPending = false
+        clearAllArmed = false
+        clearAllSwipeUp = false
+        if (act != null) {
+            when {
+                didClearAllArmed && didClearAllSwipeUp -> {
+                    performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    onActionKey("clear-all")
+                }
+                didClearAllArmed || didRepeat -> Unit
+                act.id == "⌫" && !backspaceHold.allowsDelete(isComposing()) -> Unit
+                act.id == "⌫" && x - actionDownX < -context.dpF(20f) -> onActionKey("delete-word")
+                hitCell(x, y) == act -> onActionKey(act.id)
+            }
+        } else if (sliding) {
+            val token = currentPrefix()
+            sliding = false
+            petals = emptyList()
+            trail.clear()
+            if (token.isNotEmpty()) {
+                // In pure English mode, append a trailing space when a multi-letter word was slid
+                val finalOut =
+                    if (isPureEnglish && token.length >= 2 && ENGLISH_WORDS.any { it.first == token }) {
+                        "$token "
+                    } else {
+                        token
+                    }
+                onSyllable(finalOut)
+            }
+        }
+        invalidate()
+    }
+
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                val hit = hitCell(e.x, e.y) ?: return true
-                removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
-                repeatingDelete = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
-                if (hit.isAction) {
-                    pressedAction = hit
-                    actionDownX = e.x
-                    actionDownY = e.y
-                    actionPressedAt = e.eventTime
-                    sliding = false
-                    armedSlide = false
-                    if (hit.id == "⌫") {
-                        clearAllPending = true
-                        postDelayed(repeatDelete, 360L)
-                        postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
-                    }
-                } else {
-                    pressedAction = null
-                    sliding = true
-                    armedSlide = false
-                    stepAnchor = PointF(e.x, e.y)
-                    stepStack.clear()
-                    centerHistory.clear()
-                    trail.clear()
-                    trail.add(PointF(e.x, e.y))
-                    if (hit.id != "aeiou") {
-                        stepStack.add(hit.id)
-                    }
-                    centerHistory.add(PointF(hit.cx, hit.cy))
-                    computePetals(PointF(hit.cx, hit.cy), currentPrefix())
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val index = e.actionIndex
+                val id = e.getPointerId(index)
+                val x = e.getX(index)
+                val y = e.getY(index)
+                val hit = hitCell(x, y) ?: return true
+                val touch = Touch(hit, x, y, e.eventTime)
+                touch.deleteHold.begin(isComposing())
+                touches[id] = touch
+                if (gesturePointerId == null) {
+                    gesturePointerId = id
+                    beginTouch(touch)
                 }
-                invalidate()
             }
             MotionEvent.ACTION_MOVE -> {
-                if (pressedAction?.id == "⌫") {
-                    if (!clearAllArmed && hypot(e.x - actionDownX, e.y - actionDownY) > context.dpF(14f)) {
-                        removeCallbacks(repeatDelete)
-                        removeCallbacks(armClearAll)
-                        clearAllPending = false
-                    }
-                    if (clearAllArmed) {
-                        clearAllSwipeUp =
-                            if (clearAllSwipeUp) actionDownY - e.y >= context.dpF(16f)
-                            else actionDownY - e.y >= context.dpF(24f)
-                    }
-                    invalidate()
-                    return true
+                for ((id, touch) in touches) {
+                    val index = e.findPointerIndex(id)
+                    if (index < 0) continue
+                    val x = e.getX(index)
+                    val y = e.getY(index)
+                    if (id == gesturePointerId) moveTouch(x, y)
+                    else if (hypot(x - touch.x, y - touch.y) > context.dpF(14f)) touch.moved = true
                 }
-                if (!sliding) return true
-                trail.add(PointF(e.x, e.y))
-                if (trail.size > 48) trail.removeAt(0)
-                // Require genuine finger displacement before triggering any petal so tapping edge keys (e.g. J) NEVER misfires!
-                val armThreshold = if (stepStack.size <= 1) hexRadius * 0.68f else hexRadius * 0.48f
-                if (!armedSlide) {
-                    if (hypot(e.x - stepAnchor.x, e.y - stepAnchor.y) < armThreshold) {
-                        invalidate()
-                        return true
-                    }
-                    armedSlide = true
-                }
-                val triggerR = hexRadius * 0.72f
-                val entered =
-                    petals.minByOrNull { hypot(e.x - it.cx, e.y - it.cy) }?.takeIf {
-                        hypot(e.x - it.cx, e.y - it.cy) <= triggerR
-                    }
-                if (entered != null) {
-                    armedSlide = false
-                    stepAnchor = PointF(e.x, e.y)
-                    if (entered.isBacktrack) {
-                        if (stepStack.isNotEmpty()) stepStack.removeAt(stepStack.lastIndex)
-                        if (centerHistory.size > 1) centerHistory.removeAt(centerHistory.lastIndex)
-                        val prevCenter = centerHistory.lastOrNull() ?: PointF(e.x, e.y)
-                        computePetals(prevCenter, currentPrefix())
-                    } else {
-                        stepStack.add(entered.append)
-                        val nextCenter = PointF(entered.cx, entered.cy)
-                        centerHistory.add(nextCenter)
-                        computePetals(nextCenter, currentPrefix())
-                    }
-                }
-                invalidate()
             }
-            MotionEvent.ACTION_UP -> {
-                removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
-                val act = pressedAction
-                val didRepeat = repeatingDelete
-                val didClearAllArmed = clearAllArmed
-                val didClearAllSwipeUp = clearAllSwipeUp
-                pressedAction = null
-                repeatingDelete = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
-                if (act != null) {
-                    when {
-                        didClearAllArmed && didClearAllSwipeUp -> {
-                            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
-                            onActionKey("clear-all")
-                        }
-                        didClearAllArmed || didRepeat -> Unit
-                        act.id == "⌫" && e.x - actionDownX < -context.dpF(20f) -> onActionKey("delete-word")
-                        hitCell(e.x, e.y) == act -> onActionKey(act.id)
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
+                val index = e.actionIndex
+                val id = e.getPointerId(index)
+                val touch = touches.remove(id) ?: return true
+                val x = e.getX(index)
+                val y = e.getY(index)
+                if (id == gesturePointerId) {
+                    finishTouch(x, y)
+                    gesturePointerId = null
+                    touches.entries.firstOrNull { !it.value.moved }?.let { (nextId, next) ->
+                        gesturePointerId = nextId
+                        beginTouch(next)
                     }
-                } else if (sliding) {
-                    val token = currentPrefix()
-                    sliding = false
-                    petals = emptyList()
-                    trail.clear()
-                    if (token.isNotEmpty()) {
-                        // In pure English mode, append a trailing space when a multi-letter word was slid
-                        val finalOut =
-                            if (isPureEnglish && token.length >= 2 && ENGLISH_WORDS.any { it.first == token }) {
-                                "$token "
-                            } else {
-                                token
-                            }
-                        onSyllable(finalOut)
+                } else if (!touch.moved && hitCell(x, y) == touch.cell) {
+                    val cell = touch.cell
+                    if (cell.isAction) {
+                        if (cell.id != "⌫" || touch.deleteHold.allowsDelete(isComposing())) onActionKey(cell.id)
+                    } else if (cell.id != "aeiou") {
+                        onSyllable(cell.id)
                     }
                 }
-                invalidate()
             }
             MotionEvent.ACTION_CANCEL -> {
                 removeCallbacks(repeatDelete)
                 removeCallbacks(armClearAll)
+                touches.clear()
+                gesturePointerId = null
                 pressedAction = null
                 repeatingDelete = false
                 clearAllPending = false

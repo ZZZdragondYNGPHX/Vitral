@@ -43,6 +43,8 @@ pub struct RimeDictCorpus {
     pub word_readings: HashMap<String, (Vec<String>, u64)>,
     pub spaced_pinyin_to_words: HashMap<String, Vec<(String, u64)>>,
     pub max_word_chars: usize,
+    /// Bounded reading buckets keyed by one initial per syllable.
+    pub initial_readings: HashMap<String, Vec<String>>,
     pub abbreviations: HashMap<String, Vec<(String, u64)>>,
     pub continuations: HashMap<String, Vec<(String, u64)>>,
     word_bloom: Vec<u64>,
@@ -136,14 +138,35 @@ impl RimeDictCorpus {
         }
 
         // Sort and cap candidate lists per spaced_pinyin key for fast O(1) lattice lookup
-        for list in spaced_pinyin_to_words.values_mut() {
+        for (key, list) in &mut spaced_pinyin_to_words {
+            let limit = if key.contains(' ') { 48 } else { 120 };
             list.sort_by_key(|a| std::cmp::Reverse(a.1));
-            let mut seen = HashSet::with_capacity(list.len().min(48));
+            let mut seen = HashSet::with_capacity(list.len().min(limit));
             list.retain(|(w, _)| seen.insert(w.clone()));
-            if list.len() > 48 {
-                list.truncate(48);
+            list.truncate(limit);
+        }
+
+        let mut initial_readings: HashMap<String, Vec<String>> = HashMap::new();
+        for reading in spaced_pinyin_to_words.keys() {
+            let syllables: Vec<_> = reading.split_whitespace().collect();
+            if !(2..=6).contains(&syllables.len()) {
+                continue;
+            }
+            let key: String = syllables.iter().filter_map(|s| s.chars().next()).collect();
+            let bucket = initial_readings.entry(key).or_default();
+            let weight = |r: &str| spaced_pinyin_to_words[r][0].1;
+            let rank = bucket.partition_point(|r| {
+                weight(r) > weight(reading) || (weight(r) == weight(reading) && r < reading)
+            });
+            if rank < 128 {
+                bucket.insert(rank, reading.clone());
+                bucket.truncate(128);
             }
         }
+        for bucket in initial_readings.values_mut() {
+            bucket.shrink_to_fit();
+        }
+        initial_readings.shrink_to_fit();
 
         // Bound every initials bucket while building it; never collect the entire corpus twice.
         let mut abbreviations: HashMap<String, Vec<(String, u64)>> = HashMap::new();
@@ -214,6 +237,7 @@ impl RimeDictCorpus {
             word_readings,
             spaced_pinyin_to_words,
             max_word_chars: max_word_chars.min(12),
+            initial_readings,
             abbreviations,
             continuations,
             word_bloom,
@@ -1318,6 +1342,28 @@ impl PolyphoneAnnotator {
 #[cfg(test)]
 mod continuation_tests {
     use super::*;
+
+    #[test]
+    fn homophone_bucket_limits_distinguish_single_and_multiple_syllables() {
+        let root =
+            std::env::temp_dir().join(format!("vitral-homophone-bounds-{}", std::process::id()));
+        let dict_dir = root.join("rime/cn_dicts");
+        fs::create_dir_all(&dict_dir).unwrap();
+        let mut dict = String::from("---\nname: test\n...\n");
+        for i in 0..130 {
+            let ch = char::from_u32(0x4e00 + i).unwrap();
+            for (word, reading) in [(ch.to_string(), "shi"), (format!("是{ch}"), "shi shi")] {
+                dict.push_str(&format!("{word}\t{reading}\t{}\n", 1_000 - i));
+            }
+        }
+        fs::write(dict_dir.join("base.dict.yaml"), dict).unwrap();
+        let corpus = RimeDictCorpus::build(Some(&root));
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(corpus.spaced_pinyin_to_words["shi"].len(), 120);
+        assert_eq!(corpus.spaced_pinyin_to_words["shi shi"].len(), 48);
+        assert_eq!(corpus.spaced_pinyin_to_words["shi"][119].1, 881);
+        assert_eq!(corpus.spaced_pinyin_to_words["shi shi"][47].1, 953);
+    }
 
     #[test]
     fn continuation_buckets_keep_wider_single_character_coverage() {

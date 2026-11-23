@@ -1467,11 +1467,12 @@ mod tests {
             let after_cands = partial_val["candidates"].as_array().unwrap();
             let pr_idx = after_cands
                 .iter()
-                .position(|c| {
-                    c["text"].as_str() == Some("手写中问")
-                        && c["comment"].as_str() == Some("shou xie zhong wen")
-                })
-                .expect("expected PureRust candidate '手写中问' after partial '你好'");
+                .position(|c| c["comment"].as_str() == Some("shou xie zhong wen"))
+                .expect("expected contextual PureRust candidate after partial '你好'");
+            let expected = format!(
+                "你好{}",
+                after_cands[pr_idx]["text"].as_str().unwrap_or_default()
+            );
             vitral_free_result(partial_res);
 
             let sel_res = vitral_select_candidate(engine, pr_idx);
@@ -1480,7 +1481,7 @@ mod tests {
             let sel_val: serde_json::Value = serde_json::from_str(sel_json).unwrap();
             assert_eq!(
                 sel_val["commit_text"].as_str(),
-                Some("你好手写中问"),
+                Some(expected.as_str()),
                 "vitral_select_candidate on PureRust candidate must preserve prefix"
             );
             vitral_free_result(sel_res);

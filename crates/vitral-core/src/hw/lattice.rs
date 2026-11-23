@@ -24,6 +24,42 @@ pub struct LatticeSlot {
     pub top8: Vec<Top8Candidate>,
 }
 
+pub(super) fn segment_strokes_with_locks(
+    strokes: &[Vec<StrokePoint>],
+    bundle: &HwOnnxBundle,
+    ids: &IdsIndex,
+    locked: impl Iterator<Item = (usize, usize)>,
+) -> Vec<SegmentedSpan> {
+    let mut locked: Vec<_> = locked.collect();
+    locked.sort_unstable();
+    let segment_range = |range: std::ops::Range<usize>| {
+        let offset = range.start;
+        segment_strokes(&strokes[range], bundle, ids)
+            .into_iter()
+            .map(move |mut span| {
+                span.stroke_start += offset;
+                span.stroke_end += offset;
+                span
+            })
+    };
+    let mut spans = Vec::new();
+    let mut offset = 0;
+    for (start, end) in locked {
+        if start < offset || end >= strokes.len() || start > end {
+            continue;
+        }
+        spans.extend(segment_range(offset..start));
+        spans.push(SegmentedSpan {
+            stroke_start: start,
+            stroke_end: end,
+            strokes: strokes[start..=end].to_vec(),
+        });
+        offset = end + 1;
+    }
+    spans.extend(segment_range(offset..strokes.len()));
+    spans
+}
+
 /// Dual-regime CASIA-OLHWDB spatiotemporal stroke segmentation:
 /// - Superimposed writing: a long pause before restarting in the previous glyph area splits the ink.
 /// - Horizontal connected writing: routes pause/wide-gap candidates through a batched
@@ -78,9 +114,11 @@ pub fn segment_strokes(
         let gap_x = next.min_x - cur_max_x;
         let paused = dt >= fade_ms;
 
-        // A pause before the right component of a glyph needs the same visual
-        // comparison as a short pen lift. An overlaid restart stays a boundary.
-        if paused && gap_x < -0.05 * char_scale {
+        // A paused stroke that returns deep into the left half starts overlaid ink.
+        // Shallow overlap near the right edge still needs a visual comparison.
+        let overlaid_restart = next.cx <= cur_min_x + 0.5 * cur_w
+            && cur_max_x - next.cx >= 0.25 * char_scale;
+        if paused && overlaid_restart {
             hard_splits[i] = true;
             cur_min_x = valid[i + 1].1.min_x;
             cur_max_x = valid[i + 1].1.max_x;
@@ -191,29 +229,14 @@ pub fn segment_strokes(
                 let p_r = preds_r.first().map(|p| p.prob).unwrap_or(0.0);
                 let p_m = preds_m.first().map(|p| p.prob).unwrap_or(0.0);
 
-                let compact_single_box = merged_aspect <= 1.35 && gap_x <= 0.28 * char_scale;
-                let ids_compound_match = compact_single_box
-                    && !ids.is_empty()
-                    && !preds_l.is_empty()
-                    && !preds_r.is_empty()
-                    && preds_m.iter().take(3).any(|pm| {
-                        pm.prob >= 0.25
-                            && matches!(
-                                ids.char_decomposition(pm.ch),
-                                Some((IdcOp::LeftRight, a, b))
-                                    if canonical_radical(a) == canonical_radical(preds_l[0].ch)
-                                        && canonical_radical(b) == canonical_radical(preds_r[0].ch)
-                            )
-                    });
-
+                let compact_single_box = merged_aspect <= 1.55 && gap_x <= 0.33 * char_scale;
+                let ids_compound_match =
+                    compact_single_box && matches_ids_compound(ids, &preds_l, &preds_r, &preds_m);
                 let geo_mean = (p_l * p_r).sqrt();
-                let should_split = if ids_compound_match {
-                    false
-                } else if compact_single_box {
-                    (geo_mean > p_m * 1.0) || (!bundle.has_hw_onnx() && p_m == 0.0)
-                } else {
-                    (geo_mean > p_m * 0.80) || (!bundle.has_hw_onnx() && p_m == 0.0)
-                };
+                let merged_margin = if compact_single_box { 1.0 } else { 0.80 };
+                let separated_without_model = !bundle.has_hw_onnx() && p_m == 0.0 && gap_x >= 0.0;
+                let should_split =
+                    !ids_compound_match && (geo_mean > p_m * merged_margin || separated_without_model);
                 if should_split {
                     hard_splits[i] = true;
                 }
@@ -241,6 +264,22 @@ pub fn segment_strokes(
         }
     }
     spans
+}
+
+fn matches_ids_compound(
+    ids: &IdsIndex,
+    left: &[VisualPrediction],
+    right: &[VisualPrediction],
+    merged: &[VisualPrediction],
+) -> bool {
+    merged.iter().take(3).filter(|p| p.prob >= 0.25).any(|p| {
+        let Some((IdcOp::LeftRight, a, b)) = ids.char_decomposition(p.ch) else {
+            return false;
+        };
+        let (a, b) = (canonical_radical(a), canonical_radical(b));
+        left.iter().take(3).any(|p| canonical_radical(p.ch) == a)
+            && right.iter().take(3).any(|p| canonical_radical(p.ch) == b)
+    })
 }
 
 fn quick_top3_triple(
@@ -459,4 +498,78 @@ pub fn build_confusion_lattice(
         })
         .collect();
     Ok(slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stroke(points: &[(f32, f32)], start: u64) -> Vec<StrokePoint> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, &(x, y))| StrokePoint {
+                x,
+                y,
+                timestamp_ms: start + i as u64 * 10,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn long_pause_only_hard_splits_deep_left_restarts() {
+        let bundle = HwOnnxBundle::load_paths(&crate::models::ModelPaths::default());
+        let ids = IdsIndex::default();
+        let first = stroke(&[(0.10, 0.10), (0.75, 0.10), (0.75, 0.80)], 0);
+        let shallow_overlap = stroke(&[(0.68, 0.40), (0.85, 0.80)], 600);
+        let restart = stroke(&[(0.25, 0.20), (0.25, 0.70)], 600);
+        assert_eq!(
+            segment_strokes(&[first.clone(), shallow_overlap], &bundle, &ids).len(),
+            1
+        );
+        assert_eq!(segment_strokes(&[first, restart], &bundle, &ids).len(), 2);
+    }
+
+    #[test]
+    fn locked_span_keeps_both_boundaries_and_blocks_internal_splits() {
+        let bundle = HwOnnxBundle::load_paths(&crate::models::ModelPaths::default());
+        let ids = IdsIndex::default();
+        let strokes = [
+            stroke(&[(0.1, 0.1), (0.1, 0.8)], 0),
+            stroke(&[(0.1, 0.3), (0.8, 0.3)], 30),
+            stroke(&[(0.2, 0.1), (0.2, 0.8)], 600),
+            stroke(&[(0.1, 0.5), (0.9, 0.5)], 630),
+        ];
+        let natural = segment_strokes(&strokes, &bundle, &ids);
+        assert_eq!((natural[0].stroke_start, natural[0].stroke_end), (0, 1));
+        let locked = segment_strokes_with_locks(
+            &strokes,
+            &bundle,
+            &ids,
+            [(3, 4), (2, 3), (1, 2), (0, usize::MAX), (3, 2)].into_iter(),
+        );
+        let bounds: Vec<_> = locked
+            .iter()
+            .map(|span| (span.stroke_start, span.stroke_end))
+            .collect();
+        assert_eq!(bounds, [(0, 0), (1, 2), (3, 3)]);
+        assert_eq!(locked[1].strokes, strokes[1..=2]);
+    }
+
+    #[test]
+    fn ids_checks_top_three_on_both_sides_of_a_compound() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let ids = IdsIndex::load_cached(Some(&assets));
+        let prediction = |ch, prob: f32| VisualPrediction {
+            ch,
+            prob,
+            raw_logit: prob.ln(),
+        };
+        let left = [prediction('小', 0.6), prediction('水', 0.2), prediction('川', 0.1)];
+        let right = [prediction('司', 0.5), prediction('丁', 0.3), prediction('可', 0.15)];
+        let merged = [prediction('何', 0.5), prediction('河', 0.3)];
+        assert!(matches_ids_compound(&ids, &left, &right, &merged));
+        assert!(!matches_ids_compound(&ids, &left[..1], &right, &merged));
+        assert!(!matches_ids_compound(&ids, &left, &right[..2], &merged));
+    }
 }

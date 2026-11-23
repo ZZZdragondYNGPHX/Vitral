@@ -367,8 +367,8 @@ pub fn speech_context(
     }
 }
 
-/// Conservative PY-GEC: personal 2–6 Hanzi phrases only, exact full pinyin,
-/// no overlaps and at most 25% changed Hanzi over the complete transcript.
+/// Correct exact pinyin homophones only with positive left-context evidence.
+/// Limit replacements to personal 2–6 Hanzi phrases and 25% of the transcript's Hanzi.
 pub fn phonetic_correct_transcript(
     text: &str,
     retention: &crate::ret::RetentionEngine,
@@ -448,24 +448,39 @@ pub fn phonetic_correct_transcript(
             if retention.pinned_words.contains(&original) {
                 continue;
             }
-            if let Some(gram) = gram {
-                let context: String = chars[..at]
-                    .iter()
-                    .rev()
-                    .take(3)
-                    .copied()
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-                if let (Some(old), Some(new)) = (
-                    gram.lookup(&context, &original),
-                    gram.lookup(&context, word),
-                ) {
-                    if old > new + 2.0 {
-                        continue;
-                    }
-                }
+            let start = chars[..at]
+                .iter()
+                .rposition(|&ch| !crate::ret::is_cjk(ch))
+                .map_or(0, |index| index + 1);
+            let context: String = chars[start..at].iter().collect();
+            let personal = context.char_indices().find_map(|(start, _)| {
+                let following = retention.context_bigrams.get(&context[start..])?;
+                let old = following.get(&original).copied();
+                let new = following.get(*word).copied();
+                (old.is_some() || new.is_some()).then_some((old, new))
+            });
+            let personal_advantage = personal.is_some_and(|(old, new)| {
+                let old = old.unwrap_or(0.0);
+                new.is_some_and(|new| new >= 2.0 && new >= old + 1.0 && new >= old * 1.5)
+            });
+            let gram_advantage = || {
+                gram.is_some_and(|gram| {
+                    let start = context.char_indices().rev().nth(2).map_or(0, |(start, _)| start);
+                    context[start..]
+                        .char_indices()
+                        .find_map(|(offset, _)| {
+                            let prefix = &context[start + offset..];
+                            let old = gram.lookup(prefix, &original);
+                            let new = gram.lookup(prefix, word);
+                            (old.is_some() || new.is_some()).then_some((old, new))
+                        })
+                        .is_some_and(|(old, new)| {
+                            new.is_some_and(|new| old.map_or(new > 0.0, |old| new > old + 2.0))
+                        })
+                })
+            };
+            if !personal_advantage && !gram_advantage() {
+                continue;
             }
             chars[at..at + n].copy_from_slice(replacement);
             edits += diff;
@@ -484,23 +499,55 @@ pub fn phonetic_correct_transcript(
 mod qwen_tests {
     use super::*;
     #[test]
-    fn personal_homophones_and_edit_gate() {
+    fn asr_keeps_common_words_without_positive_context() {
+        let mut r = crate::ret::RetentionEngine::default();
+        r.pinned_words.insert("指导".into());
+        r.frecency.insert("知道".into(), 4.0);
+        let transcript = "我知道这件事情";
+        assert_eq!(phonetic_correct_transcript(transcript, &r, None), transcript);
+        r.context_bigrams
+            .insert("我".into(), [("指导".into(), 1.0)].into());
+        assert_eq!(phonetic_correct_transcript(transcript, &r, None), transcript);
+
+        let path = crate::imp::polyphone::default_assets_dir_candidates()
+            .unwrap()
+            .join("rime/wanxiang-lts-zh-hans.gram");
+        let gram = crate::eng::gram::RimeGramDb::open_cached(&path).unwrap();
+        assert!(gram.lookup("我", "知道").is_some());
+        assert!(gram.lookup("我", "指导").is_none());
+        assert_eq!(
+            phonetic_correct_transcript(transcript, &r, Some(&gram)),
+            transcript
+        );
+    }
+
+    #[test]
+    fn personal_homophones_require_context_and_respect_the_edit_budget() {
         let mut r = crate::ret::RetentionEngine::default();
         r.pinned_words.insert("维创".into());
+        r.context_bigrams
+            .insert("明天联系".into(), [("维创".into(), 4.0)].into());
         assert_eq!(
             phonetic_correct_transcript("明天联系伟创讨论项目", &r, None),
             "明天联系维创讨论项目"
+        );
+        assert_eq!(
+            phonetic_correct_transcript("明天拜访伟创讨论项目", &r, None),
+            "明天拜访伟创讨论项目"
         );
         assert_eq!(phonetic_correct_transcript("伟创", &r, None), "伟创");
         assert_eq!(
             phonetic_correct_transcript("明天联系微软讨论项目", &r, None),
             "明天联系微软讨论项目"
         );
+        r.context_bigrams
+            .insert("创".into(), [("维创".into(), 4.0)].into());
         assert_eq!(
             phonetic_correct_transcript("伟创伟创伟创伟创", &r, None),
-            "维创维创伟创伟创"
+            "伟创维创维创伟创"
         );
     }
+
     #[test]
     fn speech_hotwords_use_current_app_and_personal_vocabulary() {
         let mut r = crate::ret::RetentionEngine::default();

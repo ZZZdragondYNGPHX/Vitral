@@ -90,6 +90,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "models-refresh-catalog" => to_value(core.models_refresh_catalog(v.get("url").filter(|v| !v.is_null()).map(|_| string(v, "url")).transpose()?)?)?,
         "reload-assets" => to_value(core.reload_assets()?)?,
         "on-app-focus" => to_value(core.on_app_focus(string(v, "app_id")?)?)?,
+        "notify-deleted-chars" => { core.notify_deleted_chars(arg(v, "count")?); json!({"ok":true}) },
         "process-key" => {
             let mut flags = 0;
             for m in v["modifiers"].as_array().into_iter().flatten() {
@@ -177,7 +178,10 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "on-ime-close" => to_value(core.on_ime_close())?,
         "dismiss-quick-paste" => to_value(core.dismiss_quick_paste())?,
         "clipboard-pin" => {
-            to_value(core.clipboard_pin(string(v, "id")?, v["shortcut_code"].as_str())?)?
+            let code = v.get("shortcut_code").map(|code| {
+                if code.is_null() { Ok(None) } else { string(v, "shortcut_code").map(Some) }
+            }).transpose()?;
+            to_value(core.clipboard_pin_update(string(v, "id")?, code)?)?
         }
         "clipboard-unpin" => to_value(core.clipboard_unpin(string(v, "id")?)?)?,
         "clipboard-clear-unpinned" => to_value(core.clipboard_clear_unpinned())?,

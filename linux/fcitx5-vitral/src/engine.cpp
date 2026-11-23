@@ -35,6 +35,16 @@ namespace {
 using namespace fcitx;
 using namespace vitral::tokens;
 
+constexpr bool canReportIdleDeletion(CapabilityFlags capabilities) {
+  constexpr auto passwordOrSensitive =
+      static_cast<CapabilityFlags::storage_type>(CapabilityFlag::PasswordOrSensitive);
+  return (capabilities.toInteger() & passwordOrSensitive) == 0;
+}
+
+static_assert(canReportIdleDeletion(CapabilityFlag::NoFlag));
+static_assert(!canReportIdleDeletion(CapabilityFlag::Password));
+static_assert(!canReportIdleDeletion(CapabilityFlag::Sensitive));
+
 QJsonObject unpack(VitralStringResult result) {
   QJsonObject data;
   if (result.status == VITRAL_STATUS_OK && result.json_utf8) {
@@ -178,8 +188,17 @@ public:
               return;
             }
             if (cmd == "commit-text") {
-              ic->commitString(text);
+              cancelPrediction(ic);
+              if (composing_)
+                unpack(vitral_process_key(core_, FcitxKey_Escape, 0,
+                                         VITRAL_SWIPE_DIR_NONE));
+              composing_ = false;
+              hasPrev_ = hasNext_ = false;
               ic->inputPanel().reset();
+              ic->updatePreedit();
+              ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+              ic->commitString(text);
+              schedulePrediction("live", predictionDelay_);
             } else {
               ic->inputPanel().setClientPreedit(
                   Text(text, TextFormatFlag::Underline));
@@ -382,6 +401,12 @@ public:
     if (event.isRelease() || english_ || key.states().test(KeyState::Ctrl) ||
         key.states().test(KeyState::Alt) || key.states().test(KeyState::Super))
       return;
+    if (!composing_ && sym == FcitxKey_BackSpace) {
+      if (active_ && ic->hasFocus() &&
+          canReportIdleDeletion(ic->capabilityFlags()))
+        command("notify-deleted-chars", {{"count", 1}});
+      return;
+    }
     auto list = std::dynamic_pointer_cast<CommonCandidateList>(
         ic->inputPanel().candidateList());
     if (list && list->size() > 0 && !key.states().test(KeyState::Shift)) {

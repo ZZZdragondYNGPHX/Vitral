@@ -7,64 +7,25 @@ pub fn classify_1d_primitive(geom: &GlyphGeometry) -> Option<Vec<VisualPredictio
     if geom.stroke_count != 1 {
         return None;
     }
-    if geom.is_single_horizontal {
-        return Some(vec![
-            VisualPrediction {
-                ch: '一',
-                prob: 0.94,
-                raw_logit: 4.5,
-            },
-            VisualPrediction {
-                ch: '丶',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-            VisualPrediction {
-                ch: '丨',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-        ]);
-    }
-    if geom.is_single_vertical {
-        return Some(vec![
-            VisualPrediction {
-                ch: '丨',
-                prob: 0.94,
-                raw_logit: 4.5,
-            },
-            VisualPrediction {
-                ch: '丿',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-            VisualPrediction {
-                ch: '丶',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-        ]);
-    }
-    if geom.is_single_dot {
-        return Some(vec![
-            VisualPrediction {
-                ch: '丶',
-                prob: 0.94,
-                raw_logit: 4.5,
-            },
-            VisualPrediction {
-                ch: '一',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-            VisualPrediction {
-                ch: '丨',
-                prob: 0.03,
-                raw_logit: 1.0,
-            },
-        ]);
-    }
-    None
+    let candidates: &[(char, f32)] = if geom.is_single_horizontal {
+        &[('一', 0.44), ('-', 0.32), ('丶', 0.16), ('丨', 0.08)]
+    } else if geom.is_single_vertical {
+        &[('丨', 0.44), ('1', 0.32), ('丿', 0.16), ('丶', 0.08)]
+    } else if geom.is_single_dot {
+        &[('丶', 0.42), ('、', 0.30), ('.', 0.16), ('一', 0.08), ('丨', 0.04)]
+    } else {
+        return None;
+    };
+    Some(
+        candidates
+            .iter()
+            .map(|&(ch, prob)| VisualPrediction {
+                ch,
+                prob,
+                raw_logit: prob.ln(),
+            })
+            .collect(),
+    )
 }
 
 /// Purely geometric single-stroke primitive recognizer (`一`, `丨`, `丶`, `丿`, `乀`)
@@ -116,4 +77,35 @@ pub fn classify_single_stroke_primitive(geom: &GlyphGeometry) -> Option<Vec<Visu
         ]);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hw::{lattice::build_lattice_slot_from_predictions, StrokePoint};
+
+    #[test]
+    fn single_strokes_keep_digit_and_punctuation_choices() {
+        let cases: &[(&[(f32, f32)], &[char])] = &[
+            (&[(0.5, 0.1), (0.5, 0.9)], &['丨', '1']),
+            (&[(0.1, 0.5), (0.9, 0.5)], &['一', '-']),
+            (&[(0.5, 0.5)], &['丶', '、', '.']),
+        ];
+        for &(points, expected) in cases {
+            let stroke = points
+                .iter()
+                .map(|&(x, y)| StrokePoint {
+                    x,
+                    y,
+                    timestamp_ms: 0,
+                })
+                .collect();
+            let geom = GlyphGeometry::from_strokes(&[stroke]);
+            let predictions = classify_1d_primitive(&geom).unwrap();
+            let slot = build_lattice_slot_from_predictions(0, 0, 0, &predictions, false);
+            assert!(!slot.locked_by_entropy);
+            let got: Vec<_> = predictions.iter().map(|p| p.ch).collect();
+            assert!(got.starts_with(expected));
+        }
+    }
 }

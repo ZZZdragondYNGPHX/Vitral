@@ -56,7 +56,7 @@ impl PersonalReranker {
         for (i, w) in self.weights.iter_mut().enumerate() {
             *w += eta * diff[i] - 0.01 * (*w - DEFAULT_RERANK_WEIGHTS[i]);
             *w = if i == 8 {
-                w.clamp(-0.5, 2.0)
+                w.clamp(0.0, 2.0)
             } else {
                 w.clamp(0.15, 4.0)
             };
@@ -165,6 +165,54 @@ impl UserPhrase {
                 .collect::<String>()
                 .to_ascii_lowercase()
         }
+    }
+
+    pub(crate) fn spaced_quanpin(&self) -> Option<Cow<'_, str>> {
+        let chars = self.word.chars().count();
+        if self.quanpin.split_whitespace().count() == chars {
+            return Some(Cow::Borrowed(&self.quanpin));
+        }
+
+        // Older records stored compact pinyin. Recover its boundaries using the
+        // corresponding Xiaohe pairs, which have explicit two-keystroke boundaries.
+        if self.xiaohe.len() != chars * 2 || !self.xiaohe.is_ascii() {
+            return None;
+        }
+        let mut remaining = self.quanpin.as_str();
+        let mut syllables = Vec::with_capacity(chars);
+        let readings = crate::imp::xiaohe::xiaohe_reverse_map();
+        for offset in (0..self.xiaohe.len()).step_by(2) {
+            let mut choices = readings.get(&self.xiaohe[offset..offset + 2])?
+                .iter()
+                .filter(|&&syllable| remaining.starts_with(syllable));
+            let &syllable = choices.next()?;
+            if choices.next().is_some() {
+                return None;
+            }
+            remaining = &remaining[syllable.len()..];
+            syllables.push(syllable);
+        }
+        remaining.is_empty().then(|| Cow::Owned(syllables.join(" ")))
+    }
+
+    pub(crate) fn matches_code(&self, code: &str, is_flypy: bool) -> bool {
+        if is_flypy {
+            return self.xiaohe == code;
+        }
+        if !code.contains([' ', '\'']) {
+            return self.quanpin.bytes().filter(|&b| b != b' ').eq(code.bytes());
+        }
+        let Some(reading) = self.spaced_quanpin() else {
+            return false;
+        };
+        let mut remaining = code;
+        for syllable in reading.split_whitespace() {
+            let Some(tail) = remaining.strip_prefix(syllable) else {
+                return false;
+            };
+            remaining = tail.trim_start_matches([' ', '\'']);
+        }
+        remaining.is_empty()
     }
 
     fn effective_acronym(&self) -> Cow<'_, str> {
@@ -401,6 +449,78 @@ impl RetentionEngine {
         self.score_candidate_features(&feats, adaptive)
     }
 
+    pub fn has_mismatched_single_char_code(&self, word: &str, code: &str) -> bool {
+        if word.chars().count() != 1 || code.is_empty() || !self.frecency.contains_key(word) {
+            return false;
+        }
+        let code = normalize(code);
+        if self
+            .code_preferences
+            .get(&code)
+            .is_some_and(|words| words.contains_key(word))
+        {
+            return false;
+        }
+        self.code_preferences
+            .iter()
+            .any(|(other, words)| other != &code && words.contains_key(word))
+    }
+
+    fn code_preference_at(&self, word: &str, code: &str, now_ms: u64) -> f64 {
+        let Some(weight) = self.code_preferences.get(code).and_then(|words| words.get(word)) else {
+            return 0.0;
+        };
+        let last_ms = self.habit_updated_ms
+            .get(&format!("c:{code}"))
+            .copied()
+            .unwrap_or(now_ms);
+        weight * (-self.lambda() * (now_ms.saturating_sub(last_ms) as f64 / 1000.0)).exp()
+    }
+
+    fn single_char_reading_limit(
+        &self,
+        word: &str,
+        code: &str,
+        alternate: &str,
+        global: f64,
+        now_ms: u64,
+    ) -> Option<f64> {
+        if word.chars().count() != 1 || code.is_empty() || global <= 0.0 {
+            return None;
+        }
+        let mut matching = self.code_preference_at(word, code, now_ms);
+        if !alternate.is_empty() && alternate != code {
+            matching += self.code_preference_at(word, alternate, now_ms);
+        }
+        if matching > 0.0 {
+            // When other readings account for most of the history, require repeated
+            // choices in this reading before personal ranking overrides the dictionary.
+            return (global > matching + 1.0).then(|| (matching - 1.0).max(0.0));
+        }
+        self.has_mismatched_single_char_code(word, code).then_some(0.0)
+    }
+
+    pub(crate) fn reading_frecency_at(
+        &self,
+        word: &str,
+        syllable: &str,
+        flypy: bool,
+        now_ms: u64,
+    ) -> f64 {
+        let global = self.decayed_score_at(word, now_ms);
+        if word.chars().count() != 1 || global <= 0.0 {
+            return global;
+        }
+        let xiaohe = crate::imp::xiaohe::syllable_to_xiaohe(syllable);
+        let (code, alternate) = if flypy {
+            (xiaohe.as_str(), syllable)
+        } else {
+            (syllable, xiaohe.as_str())
+        };
+        self.single_char_reading_limit(word, code, alternate, global, now_ms)
+            .unwrap_or(global)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn extract_candidate_features(
         &self,
@@ -460,7 +580,8 @@ impl RetentionEngine {
             &normalize(prev_context.unwrap_or_default()),
         );
         feats[3] = lookup(&self.app_frecency, "a:", &app_key);
-        feats[4] = lookup(&self.code_preferences, "c:", &normalize(code));
+        let code = normalize(code);
+        feats[4] = self.code_preference_at(word, &code, now_ms);
         feats[5] = query_vec.map_or(0.0, |v| self.query_knn_semantic(v, word, app_id, now_ms));
         feats[6] = word
             .chars()
@@ -471,6 +592,13 @@ impl RetentionEngine {
             });
         feats[7] = f64::from(self.user_phrases.contains_key(word));
         feats[8] = base_rank.map_or(0.0, |rank| 1.0 / (1.0 + rank as f64));
+        if let Some(local) = self.single_char_reading_limit(word, &code, "", feats[0], now_ms) {
+            let ratio = local / feats[0];
+            for i in [0, 1, 3, 5] {
+                feats[i] *= ratio;
+            }
+            feats[4] = feats[4].min(local);
+        }
         feats
     }
 
@@ -701,7 +829,8 @@ impl RetentionEngine {
                     xiaohe: normalize(xiaohe),
                     quanpin: quanpin
                         .split_whitespace()
-                        .collect::<String>()
+                        .collect::<Vec<_>>()
+                        .join(" ")
                         .to_ascii_lowercase(),
                     acronym: UserPhrase::derive_acronym(combined_word, quanpin, xiaohe),
                     count,
@@ -751,7 +880,8 @@ impl RetentionEngine {
                     word: phrase.to_string(),
                     quanpin: quanpin
                         .split_whitespace()
-                        .collect::<String>()
+                        .collect::<Vec<_>>()
+                        .join(" ")
                         .to_ascii_lowercase(),
                     xiaohe: normalize(&xiaohe),
                     acronym: UserPhrase::derive_acronym(phrase, &quanpin, &xiaohe),
@@ -772,6 +902,15 @@ impl RetentionEngine {
         self.enforce_bounds();
     }
 
+    pub(crate) fn max_user_phrase_syllables(&self) -> usize {
+        self.user_phrases
+            .values()
+            .filter(|p| !self.erased_words.contains(&p.word))
+            .map(|p| p.word.chars().count())
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn query_user_phrases(&self, compact_code: &str, is_flypy: bool) -> Vec<&UserPhrase> {
         if compact_code.is_empty() {
             return Vec::new();
@@ -780,14 +919,7 @@ impl RetentionEngine {
         let mut phrases: Vec<_> = self
             .user_phrases
             .values()
-            .filter(|p| {
-                !self.erased_words.contains(&p.word)
-                    && if is_flypy {
-                        p.xiaohe == code
-                    } else {
-                        p.quanpin == code
-                    }
-            })
+            .filter(|p| !self.erased_words.contains(&p.word) && p.matches_code(&code, is_flypy))
             .collect();
         phrases.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.word.cmp(&b.word)));
         phrases
@@ -826,7 +958,8 @@ impl RetentionEngine {
                 word: word.into(),
                 quanpin: quanpin
                     .split_whitespace()
-                    .collect::<String>()
+                    .collect::<Vec<_>>()
+                    .join(" ")
                     .to_ascii_lowercase(),
                 xiaohe: normalize(xiaohe),
                 acronym: UserPhrase::derive_acronym(word, quanpin, xiaohe),
@@ -884,6 +1017,8 @@ impl RetentionEngine {
         if context.is_empty() || !(1..=3).contains(&prefix.len()) {
             return Vec::new();
         }
+        let allow_acronym =
+            is_flypy || !crate::imp::xiaohe::canonical_syllable_set().contains(prefix.as_str());
         let Some(followers) = self.context_bigrams.get(&context) else {
             return Vec::new();
         };
@@ -905,13 +1040,12 @@ impl RetentionEngine {
                     return None;
                 }
                 let matches = if let Some(phrase) = self.user_phrases.get(word) {
-                    (if is_flypy {
-                        &phrase.xiaohe
+                    let matches_code = if is_flypy {
+                        phrase.xiaohe.starts_with(&prefix)
                     } else {
-                        &phrase.quanpin
-                    })
-                    .starts_with(&prefix)
-                        || phrase.effective_acronym().starts_with(&prefix)
+                        phrase.quanpin.bytes().filter(|&b| b != b' ').take(prefix.len()).eq(prefix.bytes())
+                    };
+                    matches_code || (allow_acronym && phrase.effective_acronym().starts_with(&prefix))
                 } else {
                     let (quanpin, xiaohe) = annotate_prefix(word);
                     let acronym = UserPhrase::derive_acronym(word, &quanpin, &xiaohe);
@@ -920,7 +1054,8 @@ impl RetentionEngine {
                     } else {
                         quanpin.split_whitespace().collect::<String>()
                     };
-                    normalize(&code).starts_with(&prefix) || acronym.starts_with(&prefix)
+                    normalize(&code).starts_with(&prefix)
+                        || (allow_acronym && acronym.starts_with(&prefix))
                 };
                 matches.then(|| (word.clone(), weight))
             })
@@ -1379,6 +1514,85 @@ mod personalization_tests {
     use super::*;
 
     #[test]
+    fn single_character_history_is_isolated_by_reading() {
+        let now = 1_000;
+        let context = project_context_fallback("讨论项目进度安排");
+        for (word, learned, other) in [
+            ("的", "de", "di"),
+            ("会", "hui", "kuai"),
+            ("说", "shuo", "shui"),
+            ("了", "le", "liao"),
+            ("给", "gei", "ji"),
+            ("没", "mei", "mo"),
+            ("着", "zhe", "zhao"),
+            ("和", "he", "huo"),
+        ] {
+            let mut r = RetentionEngine::default();
+            r.record_contextual_selection(
+                word,
+                learned,
+                Some("前文"),
+                Some("editor"),
+                now,
+                100.0,
+                true,
+            );
+            r.record_semantic_memory(context, word, Some("editor"), now);
+            let features = |r: &RetentionEngine, code: &str, adaptive| {
+                r.extract_candidate_features(
+                    word,
+                    code,
+                    Some("前文"),
+                    Some("editor"),
+                    now,
+                    adaptive,
+                    Some(&context),
+                    None,
+                    Some(0),
+                )
+            };
+            let matching = features(&r, &format!(" {} ", learned.to_uppercase()), true);
+            for i in [0, 1, 2, 3, 4, 5] {
+                assert!(matching[i] > 0.0, "{word}: {matching:?}");
+            }
+            let mismatching = features(&r, other, true);
+            for i in [0, 1, 3, 4, 5] {
+                assert_eq!(mismatching[i], 0.0, "{word}: {mismatching:?}");
+            }
+            assert_eq!(mismatching[2], matching[2]);
+            assert_eq!(features(&r, other, false)[0], matching[0]);
+            assert!(!r.has_mismatched_single_char_code(word, ""));
+            r.record_contextual_selection(word, other, None, None, now, 1.0, true);
+            assert!(!r.has_mismatched_single_char_code(word, other));
+        }
+        let mut r = RetentionEngine::default();
+        r.record_selection_at("的", now, 100.0);
+        assert!(!r.has_mismatched_single_char_code("的", "di"));
+        r.record_contextual_selection("你好", "nihao", None, None, now, 100.0, true);
+        assert!(!r.has_mismatched_single_char_code("你好", "nh"));
+        r.code_preferences
+            .entry("de".into())
+            .or_default()
+            .insert("地".into(), 1.0);
+        assert!(!r.has_mismatched_single_char_code("地", "di"));
+    }
+
+    #[test]
+    fn dictionary_rank_feedback_stays_nonnegative_and_counts_updates() {
+        let mut reranker = PersonalReranker::default();
+        let mut chosen = [0.0; 9];
+        let mut skipped = [0.0; 9];
+        chosen[8] = 0.5;
+        skipped[8] = 1.0;
+        for now in 1..=20 {
+            assert!(reranker.update_pairwise(&chosen, &skipped, now));
+            assert_eq!(reranker.weights[8], 0.0);
+            assert_eq!(reranker.updates, now);
+            assert_eq!(reranker.updated_ms, now);
+        }
+    }
+
+    #[test]
     fn typed_phrase_updates_preserve_counts_after_frecency_decay() {
         let mut r = RetentionEngine::default();
         let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe("ce shi ci zu");
@@ -1697,7 +1911,7 @@ mod phase3_tests {
         }
         for (i, &w) in r.reranker.weights.iter().enumerate() {
             assert!(if i == 8 {
-                (-0.5..=2.0).contains(&w)
+                (0.0..=2.0).contains(&w)
             } else {
                 (0.15..=4.0).contains(&w)
             });

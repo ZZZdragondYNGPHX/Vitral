@@ -618,6 +618,10 @@ impl VitralCore {
         Ok(act)
     }
 
+    pub fn notify_deleted_chars(&self, count: usize) {
+        self.input.lock().engine.notify_deleted_chars(count);
+    }
+
     pub fn select_candidate(&self, index: usize) -> Result<InputAction, VitralError> {
         let (act, seq_changed) = {
             let mut st = self.input.lock();
@@ -625,10 +629,6 @@ impl VitralCore {
                 return Ok(action);
             }
             let before_seq = st.retention.crdt_seq;
-            let canonical = st.engine.canonical_at(index).map(str::to_string);
-            let code = st.engine.candidate_code_at(index).to_string();
-            let feedback = st.engine.selection_feedback(index);
-            let is_clipboard = st.engine.is_clipboard_candidate(index);
             let sync_st = self.sync.lock();
             let imported = self.imported_lexicon.read();
             let InputState {
@@ -642,18 +642,6 @@ impl VitralCore {
                 &imported,
                 retention,
             )?;
-            if !is_clipboard {
-                if let Some(word) = committed.as_deref() {
-                    engine.record_candidate_commit(
-                        canonical.as_deref().unwrap_or(word),
-                        &code,
-                        feedback,
-                        &imported,
-                        retention,
-                        RetentionEngine::now_epoch_ms(),
-                    );
-                }
-            }
             (
                 engine.empty_action(committed),
                 retention.crdt_seq != before_seq,
@@ -1303,15 +1291,31 @@ impl VitralCore {
         item_id: &str,
         shortcut_code: Option<&str>,
     ) -> Result<ClipboardState, VitralError> {
+        self.clipboard_pin_update(item_id, Some(shortcut_code))
+    }
+
+    pub(crate) fn clipboard_pin_update(
+        &self,
+        item_id: &str,
+        shortcut_code: Option<Option<&str>>,
+    ) -> Result<ClipboardState, VitralError> {
         let state = {
             let mut sync_st = self.sync.lock();
             let before = sync_st.clipboard.export_ring();
-            let state = sync_st.clipboard.pin(item_id, shortcut_code)?;
+            let existing = before
+                .iter()
+                .find(|e| e.id == item_id)
+                .and_then(|e| e.shortcut_code.as_deref());
+            let state = sync_st
+                .clipboard
+                .pin(item_id, shortcut_code.unwrap_or(existing))?;
             self.record_clipboard_change(&mut sync_st, &before);
             state
         };
         let background_sync = self.input.lock().engine.config.background_sync;
-        if !background_sync { let _ = self.poll_clipboard(); }
+        if !background_sync {
+            let _ = self.poll_clipboard();
+        }
         Ok(state)
     }
 
@@ -1606,6 +1610,51 @@ mod tests {
         assert_eq!(result.language, "zh");
         assert!(result.transcript.contains("天气") || result.transcript.contains("你好"));
         assert!(matches!(core.voice_stop(), Err(VitralError::NotInitialized)));
+    }
+
+    #[test]
+    fn clipboard_shortcuts_normalize_validate_and_preserve_missing_field() {
+        let core = VitralCore::init(r#"{"pure_offline":true}"#).unwrap();
+        let pushed = core.clipboard_push(ClipboardPayload {
+            id: None,
+            content: "saved".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 1,
+        });
+        let id = &pushed.ring[0].id;
+        for invalid in ["a1", "a-b", "a b", "汉", "abcdefghijklmnopq"] {
+            assert!(matches!(
+                core.clipboard_pin(id, Some(invalid)),
+                Err(VitralError::InvalidArgument(_))
+            ));
+        }
+        core.clipboard_pin(id, Some(" AbC ")).unwrap();
+        assert_eq!(
+            core.clipboard_state().ring[0].shortcut_code.as_deref(),
+            Some("abc")
+        );
+        crate::commands::execute(&core, "clipboard-pin", &serde_json::json!({"id":id})).unwrap();
+        assert_eq!(
+            core.clipboard_state().ring[0].shortcut_code.as_deref(),
+            Some("abc")
+        );
+        for value in [serde_json::Value::Null, serde_json::json!("")] {
+            crate::commands::execute(
+                &core,
+                "clipboard-pin",
+                &serde_json::json!({"id":id,"shortcut_code":value}),
+            )
+            .unwrap();
+            assert!(core.clipboard_state().ring[0].shortcut_code.is_none());
+        }
+        let mut old = serde_json::to_value(&pushed.ring[0]).unwrap();
+        old["shortcut_code"] = serde_json::json!(" OLDCODE ");
+        let entry: crate::clip::ClipboardEntry = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(entry.shortcut_code.as_deref(), Some("oldcode"));
+        old["shortcut_code"] = serde_json::json!("old-1");
+        let entry: crate::clip::ClipboardEntry = serde_json::from_value(old).unwrap();
+        assert!(entry.shortcut_code.is_none());
     }
 
     #[test]
@@ -2796,7 +2845,8 @@ mod m1a_tests {
             .position(|c| c.text == "我去")
             .unwrap_or(1);
         let partial_res = core.select_candidate(partial_idx).unwrap();
-        if partial_res.commit_text.is_none() {
+        // Pure-Rust can commit the selected segment while retaining the unconsumed preedit.
+        if partial_res.commit_text.is_none() || !partial_res.preedit.text.is_empty() {
             assert!(
                 !partial_res.preedit.text.is_empty(),
                 "partial select_candidate wiped preedit!"
@@ -6120,7 +6170,8 @@ mod m1c_tests {
         // confirmed_non_ascii_prefix and applies OpenCcMode::Traditional conversion
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
-            // 2a. Simplified: "nihaoshouxiezhongwen" -> partial "你好" -> select_candidate("手写中问")
+            // Confirmed prefixes now affect grammar ranking; select the contextual PureRust alternative.
+            // 2a. Simplified confirmed prefix plus the selected remaining text.
             let core = VitralCore::init(r#"{"schema":"rime_ice"}"#).unwrap();
             let full = type_ascii(&core, "nihaoshouxiezhongwen");
             let nihao_idx = full
@@ -6137,21 +6188,22 @@ mod m1c_tests {
             let pr_idx = after_partial
                 .candidates
                 .iter()
-                .position(|c| c.text == "手写中问" && c.comment == "shou xie zhong wen")
+                .position(|c| c.comment == "shou xie zhong wen")
                 .unwrap_or_else(|| {
                     panic!(
-                        "expected PureRust candidate '手写中问' after partial '你好', got: {:?}",
+                        "expected contextual PureRust alternative after partial '你好', got: {:?}",
                         after_partial.candidates
                     )
                 });
+            let expected = format!("你好{}", after_partial.candidates[pr_idx].text);
             let committed = core.select_candidate(pr_idx).unwrap();
             assert_eq!(
                 committed.commit_text.as_deref(),
-                Some("你好手写中问"),
+                Some(expected.as_str()),
                 "select_candidate on PureRust candidate must preserve confirmed prefix"
             );
 
-            // 2b. Traditional from start: "womenshouxiezhongwen" -> partial "我們" -> select_candidate("手寫中問")
+            // 2b. Traditional prefix and rendered remaining candidate.
             let tc_core = VitralCore::init(r#"{"schema":"rime_ice"}"#).unwrap();
             tc_core.set_opencc_mode(OpenCcMode::Traditional);
             let tc_full = type_ascii(&tc_core, "womenshouxiezhongwen");
@@ -6169,17 +6221,18 @@ mod m1c_tests {
             let tc_pr_idx = tc_after_partial
                 .candidates
                 .iter()
-                .position(|c| c.text == "手寫中問" && c.comment == "shou xie zhong wen")
+                .position(|c| c.comment == "shou xie zhong wen")
                 .unwrap_or_else(|| {
                     panic!(
-                        "expected Traditional PureRust candidate '手寫中問', got: {:?}",
+                        "expected Traditional PureRust alternative, got: {:?}",
                         tc_after_partial.candidates
                     )
                 });
+            let expected = format!("我們{}", tc_after_partial.candidates[tc_pr_idx].text);
             let tc_committed = tc_core.select_candidate(tc_pr_idx).unwrap();
             assert_eq!(
                 tc_committed.commit_text.as_deref(),
-                Some("我們手寫中問"),
+                Some(expected.as_str()),
                 "select_candidate on PureRust candidate under Traditional must preserve Traditional prefix"
             );
 
@@ -6201,18 +6254,19 @@ mod m1c_tests {
             let sw_pr_idx = sw_after_partial
                 .candidates
                 .iter()
-                .position(|c| c.text == "手写中问" && c.comment == "shou xie zhong wen")
+                .position(|c| c.comment == "shou xie zhong wen")
                 .unwrap_or_else(|| {
                     panic!(
-                        "expected PureRust candidate '手写中问', got: {:?}",
+                        "expected contextual PureRust alternative, got: {:?}",
                         sw_after_partial.candidates
                     )
                 });
+            let expected = format!("我們{}", sw_after_partial.candidates[sw_pr_idx].text);
             switch_core.set_opencc_mode(OpenCcMode::Traditional);
             let sw_committed = switch_core.select_candidate(sw_pr_idx).unwrap();
             assert_eq!(
                 sw_committed.commit_text.as_deref(),
-                Some("我們手写中问"),
+                Some(expected.as_str()),
                 "select_candidate on PureRust must convert confirmed prefix via convert_opencc"
             );
         }

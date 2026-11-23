@@ -9,7 +9,7 @@ use crate::error::VitralError;
 use crate::imp::ImportedLexiconIndex;
 use crate::ret::RetentionEngine;
 use ids_exta::{compose_rare_candidates, find_bipartite_splits, IdsIndex};
-use lattice::{build_confusion_lattice, segment_strokes};
+use lattice::{build_confusion_lattice, segment_strokes_with_locks};
 use onnx_models::HwOnnxBundle;
 use pure_fallback::{classify_1d_primitive, classify_single_stroke_primitive};
 use raster::{render_directmap, GlyphGeometry, StrokeStats, DIRECTMAP_LEN};
@@ -292,6 +292,8 @@ impl HandwritingSession {
 
     fn decode_current(&mut self, ctx: &HwDecodeContext<'_>) -> Result<HandwritingPayload, VitralError> {
         let mode = self.active_mode.ok_or(VitralError::NotInitialized)?;
+        self.manual_locked_by_span
+            .retain(|&(start, end), _| start <= end && end < self.strokes.len());
         let assets = self
             .assets_dir
             .clone()
@@ -325,7 +327,12 @@ impl HandwritingSession {
                     }));
                 }
 
-                let spans = segment_strokes(&self.strokes, &bundle, &ids);
+                let spans = segment_strokes_with_locks(
+                    &self.strokes,
+                    &bundle,
+                    &ids,
+                    self.manual_locked_by_span.keys().copied(),
+                );
                 let lattice = build_confusion_lattice(&spans, &bundle, &ids)?;
 
                 let span_bounds: Vec<(usize, usize)> = lattice
@@ -629,4 +636,36 @@ fn decode_mode1(
             }
         })
         .collect())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shrinking_public_strokes_removes_stale_manual_locks() {
+        let imported = ImportedLexiconIndex::new(None);
+        let retention = RetentionEngine::default();
+        let mut session = HandwritingSession {
+            active_mode: Some(HwMode::ContinuousLattice),
+            model_paths: Some(crate::models::ModelPaths::default()),
+            strokes: vec![Vec::new(), Vec::new()],
+            manual_locked_by_span: [((0, 1), "十".into()), ((1, 0), "一".into())].into(),
+            ..Default::default()
+        };
+        session.strokes.clear();
+        let ctx = HwDecodeContext {
+            imported: &imported,
+            retention: &retention,
+            gram: None,
+            tier3: None,
+            offline_guard: None,
+        };
+        assert!(matches!(
+            session.decode_current(&ctx).unwrap(),
+            HandwritingPayload::Mode2(Mode2Result { slots, .. }) if slots.is_empty()
+        ));
+        assert!(session.manual_locked_by_span.is_empty());
+    }
 }

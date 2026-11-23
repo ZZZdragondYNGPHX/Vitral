@@ -9,6 +9,7 @@ use std::{
     ptr,
     rc::{Rc, Weak},
     sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
 };
 use windows::{
     core::*,
@@ -147,6 +148,8 @@ struct Editor {
     panel: Cell<*mut c_void>,
     view: RefCell<View>,
     shift_held: Cell<bool>,
+    shortcuts: RefCell<Vec<String>>,
+    ipc_failed: Cell<bool>,
     prediction_timer: Cell<usize>,
     prediction_polls: Cell<u32>,
     prediction_trigger: Cell<bool>,
@@ -177,8 +180,17 @@ impl Drop for Editor {
 }
 impl Editor {
     fn call(&self, name: &str, v: Value) -> Result<Value> {
-        vitral_core::windows_host::request(&self.host, &self.id, name, &v)
-            .map_err(|e| Error::new(E_FAIL, e.to_string()))
+        vitral_core::windows_host::request_with_timeout(
+            &self.host,
+            &self.id,
+            name,
+            &v,
+            Duration::from_millis(1500),
+        )
+        .map_err(|e| {
+            self.ipc_failed.set(true);
+            Error::new(E_FAIL, e.to_string())
+        })
     }
     fn draw(&self, glow: bool, activity: bool) {
         let v = self.view.borrow();
@@ -210,7 +222,7 @@ impl Editor {
             )
         }
     }
-    fn cancel_prediction(&self, dismissed: bool) {
+    fn clear_prediction(&self) -> (u64, bool) {
         let timer = self.prediction_timer.replace(0);
         if timer != 0 {
             unsafe {
@@ -220,23 +232,110 @@ impl Editor {
                 timers.borrow_mut().remove(&timer);
             });
         }
-        let id = self.view.borrow().prediction_id;
-        let visible = !self.view.borrow().prediction_text.is_empty();
-        let _ = self.call(
-            if dismissed {
-                "predict-dismiss"
-            } else {
-                "predict-cancel"
-            },
-            json!({"id":id}),
-        );
         let mut v = self.view.borrow_mut();
-        v.prediction_id = 0;
+        let id = std::mem::take(&mut v.prediction_id);
+        let visible = !v.prediction_text.is_empty();
         v.prediction_text.clear();
-        drop(v);
-        if visible {
+        (id, visible)
+    }
+    fn cancel_prediction(&self, dismissed: bool) {
+        let (id, visible) = self.clear_prediction();
+        if id != 0 {
+            let _ = self.call(
+                if dismissed {
+                    "predict-dismiss"
+                } else {
+                    "predict-cancel"
+                },
+                json!({"id":id}),
+            );
+        }
+        if self.ipc_failed.get() {
+            self.reset_local();
+        } else if visible {
             self.draw(false, true);
         }
+    }
+    fn reset_local(&self) {
+        self.clear_prediction();
+        self.shift_held.set(false);
+        self.view.replace(View::default());
+        self.shortcuts.borrow_mut().clear();
+        let old = self.composition.borrow_mut().take();
+        if let Some((ctx, comp)) = old {
+            let session: ITfEditSession = Finish {
+                comp,
+                _live: Live::new(),
+            }
+            .into();
+            unsafe {
+                let _ = ctx.RequestEditSession(
+                    self.tid.get(),
+                    &session,
+                    TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+                );
+            }
+        }
+        self.draw(false, true);
+    }
+    fn current_context(&self) -> Option<ITfContext> {
+        unsafe { self.mgr.borrow().as_ref()?.GetFocus().ok()?.GetTop().ok() }
+    }
+    fn input_access(&self, ctx: Option<&ITfContext>) -> InputAccess {
+        let Some(ctx) = ctx else {
+            return InputAccess::Blocked;
+        };
+        if input_disabled(ctx) {
+            return InputAccess::Blocked;
+        }
+        let access = Rc::new(Cell::new(InputAccess::Unknown));
+        let session: ITfEditSession = InputScopeCheck {
+            ctx: ctx.clone(),
+            access: access.clone(),
+            _live: Live::new(),
+        }
+        .into();
+        let result = unsafe { ctx.RequestEditSession(self.tid.get(), &session, TF_ES_SYNC | TF_ES_READ) };
+        if result.is_ok_and(|hr| hr.is_ok()) {
+            access.get()
+        } else {
+            InputAccess::Unknown
+        }
+    }
+    fn clear_input(&self, edit: Option<(&ITfContext, u32)>) {
+        let composing = self.composition.borrow().is_some();
+        if let Some((ctx, ec)) = edit {
+            if self.composition.borrow().as_ref().is_some_and(|(owner, _)| owner == ctx) {
+                let composition = self.composition.borrow_mut().take();
+                if let Some((_, comp)) = composition {
+                    unsafe {
+                        let _ = comp.GetRange().and_then(|range| range.SetText(ec, 0, &[]));
+                        let _ = comp.EndComposition(ec);
+                    }
+                }
+            }
+        }
+        self.cancel_prediction(false);
+        if composing && !self.ipc_failed.get() {
+            let _ = self.call("process-key", json!({"keycode":"Escape"}));
+        }
+        self.reset_local();
+    }
+    fn protect_input(&self, ctx: Option<&ITfContext>, composing_ok: bool) -> bool {
+        let access = self.input_access(ctx);
+        let composing = composing_ok && self.composition.borrow().as_ref().is_some_and(
+            |(owner, _)| ctx == Some(owner),
+        );
+        if access.permits_key(composing) {
+            return true;
+        }
+        if access == InputAccess::Blocked {
+            self.clear_input(None);
+        } else {
+            self.shift_held.set(false);
+            self.cancel_prediction(false);
+        }
+        false
     }
     fn arm_prediction(self: &Rc<Self>, delay: u32) {
         let timer = unsafe { SetTimer(None, 0, delay, Some(prediction_tick)) };
@@ -257,7 +356,10 @@ impl Editor {
         }
         self.prediction_polls.set(0);
         self.prediction_trigger.set(catch_up);
-        let state = self.call("profile-state", json!({})).unwrap_or_default();
+        let Ok(state) = self.call("profile-state", json!({})) else {
+            self.reset_local();
+            return;
+        };
         if state["prediction_enabled"] == false {
             return;
         }
@@ -272,6 +374,9 @@ impl Editor {
         self.arm_prediction(delay);
     }
     fn poll_prediction(self: &Rc<Self>) {
+        if !self.protect_input(self.current_context().as_ref(), false) {
+            return;
+        }
         if !self.view.borrow().active
             || self.composition.borrow().is_some()
             || self.view.borrow().mode != 0
@@ -293,6 +398,7 @@ impl Editor {
             )
         };
         let Ok(r) = r else {
+            self.reset_local();
             return;
         };
         self.view.borrow_mut().prediction_id = r["id"].as_u64().unwrap_or(0);
@@ -308,6 +414,11 @@ impl Editor {
             self.draw(false, false);
         }
     }
+    fn refresh_shortcuts(&self) -> Result<()> {
+        let state = self.call("shortcuts-state", json!({}))?;
+        self.shortcuts.replace(shortcut_bindings(&state));
+        Ok(())
+    }
     fn on_ime_open(&self) -> Result<Value> {
         let app = std::env::current_exe().unwrap_or_default();
         self.call("on-ime-open", json!({"app_id":app}))
@@ -320,7 +431,15 @@ impl Editor {
             return;
         }
         if open {
-            let opened = self.on_ime_open();
+            if !self.protect_input(self.current_context().as_ref(), false) {
+                return;
+            }
+            self.ipc_failed.set(false);
+            let opened = self.on_ime_open().and_then(|r| {
+                self.call("process-key", json!({"keycode":"Escape"}))?;
+                self.refresh_shortcuts()?;
+                Ok(r)
+            });
             let mut v = self.view.borrow_mut();
             v.active = opened.is_ok();
             if let Ok(r) = opened {
@@ -343,29 +462,107 @@ impl Editor {
                 v.english = r["lang_mode"] == "en";
             }
             drop(v);
+            if self.ipc_failed.get() {
+                self.reset_local();
+                return;
+            }
             self.schedule_prediction(true);
         } else {
             self.cancel_prediction(false);
-            self.shift_held.set(false);
-            self.view.replace(View::default());
             self.on_ime_close();
-            let old = self.composition.borrow_mut().take();
-            if let Some((ctx, comp)) = old {
-                let session: ITfEditSession = Finish {
-                    comp,
-                    _live: Live::new(),
-                }
-                .into();
-                unsafe {
-                    let _ = ctx.RequestEditSession(
-                        self.tid.get(),
-                        &session,
-                        TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
-                    );
-                }
-            }
+            self.reset_local();
         }
         self.draw(false, true);
+    }
+}
+fn shortcut_bindings(state: &Value) -> Vec<String> {
+    state["bindings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|binding| binding["key"].as_str())
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputAccess {
+    Allowed,
+    Blocked,
+    Unknown,
+}
+impl InputAccess {
+    fn permits_key(self, composing: bool) -> bool {
+        self == Self::Allowed || (self == Self::Unknown && composing)
+    }
+}
+fn input_disabled(ctx: &ITfContext) -> bool {
+    let Ok(mgr) = ctx.cast::<ITfCompartmentMgr>() else {
+        return false;
+    };
+    [
+        GUID_COMPARTMENT_KEYBOARD_DISABLED,
+        GUID_COMPARTMENT_EMPTYCONTEXT,
+    ]
+    .iter()
+    .any(|guid| unsafe {
+        mgr.GetCompartment(guid)
+            .and_then(|c| c.GetValue())
+            .ok()
+            .and_then(|v| i32::try_from(&v).ok())
+            .is_some_and(|v| v != 0)
+    })
+}
+fn classify_scopes(scopes: &[InputScope]) -> InputAccess {
+    if scopes.iter().any(|s| matches!(*s, IS_PASSWORD | IS_NUMERIC_PIN | IS_ALPHANUMERIC_PIN)) {
+        InputAccess::Blocked
+    } else {
+        InputAccess::Allowed
+    }
+}
+// App input-scope properties require a read edit cookie for the current selection.
+fn read_input_scope(ctx: &ITfContext, ec: u32) -> Result<InputAccess> {
+    unsafe {
+        let property = ctx.GetAppProperty(&GUID_PROP_INPUTSCOPE)?;
+        let mut selection = [TF_SELECTION::default()];
+        let mut fetched = 0;
+        let selected = ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
+        let range = ManuallyDrop::take(&mut selection[0].range);
+        selected?;
+        let Some(range) = range.filter(|_| fetched != 0) else {
+            return Ok(InputAccess::Unknown);
+        };
+        let value = property.GetValue(ec, &range)?;
+        if value.is_empty() {
+            return Ok(InputAccess::Allowed);
+        }
+        let scope = IUnknown::try_from(&value)?.cast::<ITfInputScope>()?;
+        let mut scopes = ptr::null_mut();
+        let mut count = 0;
+        let result = scope.GetInputScopes(&mut scopes, &mut count);
+        let access = if result.is_err() || (count != 0 && scopes.is_null()) {
+            InputAccess::Unknown
+        } else if count == 0 {
+            InputAccess::Allowed
+        } else {
+            classify_scopes(std::slice::from_raw_parts(scopes, count as usize))
+        };
+        CoTaskMemFree(Some(scopes.cast()));
+        result?;
+        Ok(access)
+    }
+}
+#[implement(ITfEditSession)]
+struct InputScopeCheck {
+    ctx: ITfContext,
+    access: Rc<Cell<InputAccess>>,
+    _live: Live,
+}
+impl ITfEditSession_Impl for InputScopeCheck_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        self.access.set(read_input_scope(&self.ctx, ec)?);
+        Ok(())
     }
 }
 #[implement(ITfEditSession)]
@@ -415,6 +612,8 @@ impl Service {
                 panel: Cell::new(ptr::null_mut()),
                 view: Default::default(),
                 shift_held: Cell::new(false),
+                shortcuts: Default::default(),
+                ipc_failed: Cell::new(false),
                 prediction_timer: Cell::new(0),
                 prediction_polls: Cell::new(0),
                 prediction_trigger: Cell::new(false),
@@ -503,7 +702,14 @@ impl ITfCompositionSink_Impl for Service_Impl {
             .is_some_and(|(_, c)| Some(c) == comp);
         if matches {
             self.editor.composition.replace(None);
-            let _ = self.editor.call("process-key", json!({"keycode":"Escape"}));
+            if self
+                .editor
+                .call("process-key", json!({"keycode":"Escape"}))
+                .is_err()
+            {
+                self.editor.reset_local();
+                return Ok(());
+            }
             self.editor.view.borrow_mut().words.clear();
             self.editor.draw(false, true);
         }
@@ -583,12 +789,7 @@ impl Service_Impl {
             }
         }
         if let Some(key) = Self::shortcut_name(code) {
-            if self
-                .editor
-                .call("shortcut-match", json!({"key":key}))
-                .ok()
-                .is_some_and(|v| v.is_string())
-            {
+            if self.editor.shortcuts.borrow().contains(&key) {
                 return Some(Action::new(
                     if (l.0 & (1 << 30)) != 0 {
                         "shortcut-repeat"
@@ -613,6 +814,9 @@ impl Service_Impl {
         }
         if view.english || down(0x11) || down(0x12) || down(0x5b) || down(0x5c) {
             return None;
+        }
+        if !composing && code == u32::from(VK_BACK.0) {
+            return Some(Action::new("notify-deleted-chars", json!({"count":1})));
         }
         if composing
             && (49..=53).contains(&code)
@@ -692,14 +896,21 @@ impl Service_Impl {
             _live: Live::new(),
         }
         .into();
-        unsafe {
+        let result = unsafe {
             ctx.RequestEditSession(
                 self.editor.tid.get(),
                 &session,
                 TF_ES_SYNC | TF_ES_READWRITE,
-            )?
-            .ok()?;
+            )
+            .and_then(|hr| hr.ok())
+        };
+        if self.editor.ipc_failed.get() {
+            self.editor.reset_local();
+            // A later prediction/settings call may fail after text was inserted.
+            // Only pass the key through when the edit session did not handle it.
+            return Ok(handled.get());
         }
+        result?;
         Ok(handled.get())
     }
 }
@@ -709,23 +920,43 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok(())
     }
     fn OnTestKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
+        if !self.editor.protect_input(ctx, true) {
+            return Ok(false.into());
+        }
         if !matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
             self.editor.shift_held.set(false);
         }
+        self.editor.focus(true);
+        let shortcut = Self::shortcut_name(w.0 as u32);
+        if shortcut.is_some() && self.editor.view.borrow().active && self.editor.refresh_shortcuts().is_err() {
+            self.editor.reset_local();
+            return Ok(false.into());
+        }
         let action = self.key(w, l);
+        let shift_shortcut = shortcut.as_deref() == Some("Shift")
+            && self.editor.shortcuts.borrow().iter().any(|key| key == "Shift");
         if !action
             .as_ref()
             .is_some_and(|a| matches!(a.cmd, "prediction-accept" | "prediction-dismiss"))
         {
             self.editor.cancel_prediction(false);
         }
-        Ok((ctx.is_some() && action.is_some()).into())
+        Ok((ctx.is_some() && (action.is_some() || shift_shortcut) && !self.editor.ipc_failed.get()).into())
     }
     fn OnKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
+        if !self.editor.protect_input(ctx, true) {
+            return Ok(false.into());
+        }
         if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
-            self.editor
-                .shift_held
-                .set(Self::shortcut_name(w.0 as u32).is_some());
+            self.editor.shift_held.set(
+                Self::shortcut_name(w.0 as u32).is_some()
+                    && self
+                        .editor
+                        .shortcuts
+                        .borrow()
+                        .iter()
+                        .any(|key| key == "Shift"),
+            );
             return Ok(false.into());
         }
         self.editor.shift_held.set(false);
@@ -736,15 +967,30 @@ impl ITfKeyEventSink_Impl for Service_Impl {
     }
     fn OnTestKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
         Ok((ctx.is_some()
+            && self.editor.view.borrow().active
             && matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1)
             && self.editor.shift_held.get())
         .into())
     }
     fn OnKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
+        if !self.editor.view.borrow().active {
+            self.editor.shift_held.set(false);
+            return Ok(false.into());
+        }
         if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1)
             && self.editor.shift_held.replace(false)
             && Self::shortcut_name(w.0 as u32).is_some()
         {
+            if !self.editor.protect_input(ctx, true) {
+                return Ok(false.into());
+            }
+            if self.editor.refresh_shortcuts().is_err() {
+                self.editor.reset_local();
+                return Ok(false.into());
+            }
+            if !self.editor.shortcuts.borrow().iter().any(|key| key == "Shift") {
+                return Ok(false.into());
+            }
             return Ok(ctx
                 .is_some_and(|c| {
                     self.edit(c, Action::new("shortcut-key", json!({"key":"Shift"})))
@@ -770,7 +1016,21 @@ struct Edit {
 impl ITfEditSession_Impl for Edit_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         let ed = &self.editor;
+        let access = if input_disabled(&self.ctx) {
+            InputAccess::Blocked
+        } else {
+            read_input_scope(&self.ctx, ec).unwrap_or(InputAccess::Unknown)
+        };
+        if access != InputAccess::Allowed {
+            ed.clear_input(Some((&self.ctx, ec)));
+            return Ok(());
+        }
         let a = &self.action;
+        if a.cmd == "notify-deleted-chars" {
+            ed.call(a.cmd, a.args.clone())?;
+            ed.view.borrow_mut().context_before.pop();
+            return Ok(());
+        }
         if a.cmd == "shortcut-repeat" {
             self.handled.set(true);
             return Ok(());
@@ -974,6 +1234,10 @@ unsafe extern "C" fn panel_event(
     let service = &*owner.cast::<Service_Impl>();
     let _live: ITfTextInputProcessor = service.to_interface();
     let ed = &service.editor;
+    let Some(ctx) = ed.current_context() else { return };
+    if !ed.protect_input(Some(&ctx), true) {
+        return;
+    }
     let mode = ed.view.borrow().mode;
     let action = match op {
         0 if mode == 1 => {
@@ -1048,6 +1312,7 @@ unsafe extern "C" fn panel_event(
         }
         8 => {
             let Ok(r) = ed.call("quick-paste-state", json!({})) else {
+                ed.reset_local();
                 return;
             };
             let id = r["quick_paste"]["id"].as_str().unwrap_or("");
@@ -1064,11 +1329,34 @@ unsafe extern "C" fn panel_event(
     if action.cmd != "prediction-accept" {
         ed.cancel_prediction(false);
     }
-    let mgr = ed.mgr.borrow().clone();
-    if let Some(ctx) = mgr
-        .and_then(|m| m.GetFocus().ok())
-        .and_then(|d| d.GetTop().ok())
-    {
-        let _ = service.edit(&ctx, action);
+    if ed.ipc_failed.get() {
+        ed.reset_local();
+        return;
+    }
+    let _ = service.edit(&ctx, action);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshed_shortcut_bindings_drop_removed_and_empty_keys() {
+        let shortcuts = RefCell::new(shortcut_bindings(&json!({"bindings":[{"key":"F1"}]})));
+        shortcuts.replace(shortcut_bindings(&json!({"bindings":[{"key":""},{"key":"Ctrl+F2"}]})));
+        assert_eq!(&*shortcuts.borrow(), &["Ctrl+F2"]);
+    }
+
+    #[test]
+    fn protected_scopes_always_pass_keys_through() {
+        for scope in [IS_PASSWORD, IS_NUMERIC_PIN, IS_ALPHANUMERIC_PIN] {
+            let access = classify_scopes(&[IS_DEFAULT, scope]);
+            assert_eq!(access, InputAccess::Blocked);
+            assert!(!access.permits_key(false));
+            assert!(!access.permits_key(true));
+        }
+        assert!(classify_scopes(&[IS_DEFAULT]).permits_key(false));
+        assert!(!InputAccess::Unknown.permits_key(false));
+        assert!(InputAccess::Unknown.permits_key(true));
     }
 }

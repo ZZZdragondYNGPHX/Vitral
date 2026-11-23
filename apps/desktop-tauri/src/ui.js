@@ -397,9 +397,17 @@ function createClipRow(item) {
   pinBtn.textContent = item.pinned ? "保存简码" : "置顶";
   pinBtn.onclick = () =>
     run(async () => {
+      const rawCode = code.value.trim();
+      if (rawCode && !/^[A-Za-z]{1,16}$/.test(rawCode)) {
+        setNotice("简码请使用 1–16 位英文字母，不含数字、符号或空格", "error");
+        code.focus();
+        return;
+      }
+      const shortcutCode = rawCode.toLowerCase();
+      code.value = shortcutCode;
       const r = await api("clipboard-pin", {
         id: item.id,
-        shortcut_code: code.value.trim() || null,
+        shortcut_code: shortcutCode || null,
       });
       clipboardEntries = r.ring || [];
       renderClipboard();

@@ -28,7 +28,25 @@ pub fn normalize_syllable(raw: &str) -> String {
             out = out.replace('v', "u");
         }
     }
-    out
+    match out.as_str() {
+        "nue" => "nve".to_string(),
+        "lue" => "lve".to_string(),
+        _ => out,
+    }
+}
+
+/// Compare canonical syllables with their typed spelling, including bounded nue/lue aliases.
+pub(crate) fn matches_quanpin_reading(syllables: &[String], raw: &str) -> bool {
+    let compact = raw.replace(['\'', ' '], "");
+    let mut offset = 0;
+    syllables.iter().all(|syllable| {
+        let end = offset + syllable.len();
+        let matches = compact
+            .get(offset..end)
+            .is_some_and(|part| normalize_syllable(part) == *syllable);
+        offset = end;
+        matches
+    }) && offset == compact.len()
 }
 
 /// Convert a single pinyin syllable (toned or untoned) to Xiaohe Shuangpin (`double_pinyin_flypy`) 2-letter code.

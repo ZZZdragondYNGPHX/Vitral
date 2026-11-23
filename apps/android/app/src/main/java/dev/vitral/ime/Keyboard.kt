@@ -71,6 +71,88 @@ internal enum class SublabelMode {
     CLEAN,   // zen pure letters
 }
 
+/** One physical hold may delete preedit or host text, never cross from the former to the latter. */
+internal class BackspaceHold {
+    var startedComposing = false
+        private set
+    private var blocked = false
+
+    fun begin(composing: Boolean) {
+        startedComposing = composing
+        blocked = false
+    }
+
+    fun allowsDelete(composing: Boolean): Boolean {
+        if (startedComposing && !composing) blocked = true
+        return !blocked
+    }
+}
+
+/** Coalesce auto-repeat ticks while an async delete is in flight, without dropping discrete taps. */
+internal class BackspaceFlightGate {
+    var inFlight = 0
+        private set
+
+    fun shouldDrop(isRepeat: Boolean): Boolean = isRepeat && inFlight > 0
+
+    fun onDispatched() {
+        inFlight += 1
+    }
+
+    fun onCompleted() {
+        if (inFlight > 0) inFlight -= 1
+    }
+
+    fun reset() {
+        inFlight = 0
+    }
+}
+
+internal fun shouldDeleteHostText(
+    composingAtCallback: Boolean,
+    startedComposingAtDispatch: Boolean,
+    isRepeat: Boolean,
+): Boolean = !composingAtCallback && (!isRepeat || !startedComposingAtDispatch)
+
+internal fun trailingWordDeleteSlice(before: String, lastCommitted: String): Pair<String, Boolean> {
+    if (before.isEmpty()) return "" to false
+    if (
+        lastCommitted.isNotEmpty() &&
+            lastCommitted.codePointCount(0, lastCommitted.length) <= 8 &&
+            before.endsWith(lastCommitted)
+    ) {
+        return lastCommitted to true
+    }
+    if (before.last().code < 128) {
+        val trimmedLen = before.trimEnd(' ').length
+        val trailSpaces = before.length - trimmedLen
+        val wordLen =
+            before
+                .substring(0, trimmedLen)
+                .takeLastWhile { it.code < 128 && it.isLetterOrDigit() }
+                .length
+        val count = (wordLen + trailSpaces).coerceAtLeast(1)
+        return before.takeLast(count) to false
+    }
+    val cpCount = before.codePointCount(0, before.length).coerceAtMost(4)
+    val start = before.offsetByCodePoints(before.length, -cpCount)
+    return before.substring(start) to false
+}
+
+internal fun formatPreedit(raw: String, comment: String): String {
+    // Only use complete, matching annotations; abbreviations and partial syllables stay raw.
+    val syllables = comment.trim().split(Regex("[\\s'’]+"))
+    if (syllables.size < 2 || syllables.any { part -> part.isEmpty() || part.any { !it.isLetter() } })
+        return raw
+    val letters = raw.filter { it.isLetter() }
+    if (!syllables.joinToString("").equals(letters, ignoreCase = true)) return raw
+    if (raw.any { !it.isLetter() && it != '\'' && it != '’' && !it.isWhitespace() }) return raw
+    var offset = 0
+    return syllables.joinToString("'") { part ->
+        letters.substring(offset, offset + part.length).also { offset += part.length }
+    }
+}
+
 internal class Key(
     ctx: Context,
     private val label: String,
@@ -79,11 +161,13 @@ internal class Key(
     private val action: (String) -> Unit,
     private val voice: ((Boolean) -> Unit)? = null,
     private val role: KeyRole = KeyRole.PRIMARY,
-    private val displayLabel: String = label,
-    private val shiftState: Int = 0, // 0=off, 1=single, 2=capsLock
+    private var displayLabel: String = label,
+    private var shiftState: Int = 0, // 0=off, 1=single, 2=capsLock
     private val spaceHint: String = "",
     private val darkOverride: Boolean? = null,
     private val sublabelMode: SublabelMode = SublabelMode.DUAL,
+    private val isComposing: () -> Boolean = { false },
+    private val canScrubSpace: () -> Boolean = { true },
 ) : View(ctx) {
     private val regularTypeface = Typeface.create("sans-serif", Typeface.NORMAL)
     private val mediumTypeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -103,6 +187,7 @@ internal class Key(
         }
     private val keyRect = RectF()
     private val shadowRect = RectF()
+    private val backspaceHold = BackspaceHold()
     private var downX = 0f
     private var downY = 0f
     private var swipeUpActive = false
@@ -129,7 +214,8 @@ internal class Key(
             override fun run() {
                 if (!isPressed || clearAllArmed) return
                 repeatingDelete = true
-                action("⌫")
+                if (!backspaceHold.allowsDelete(isComposing())) return
+                action("⌫-repeat")
                 postDelayed(this, 65L)
             }
         }
@@ -148,7 +234,27 @@ internal class Key(
         contentDescription = displayLabel.ifEmpty { label }
         isFocusable = true
         isClickable = true
-        setOnClickListener { action(label) }
+        setOnClickListener {
+            if (label != "⌫" || backspaceHold.allowsDelete(isComposing())) action(label)
+        }
+    }
+
+    fun onCompositionChanged(composing: Boolean) {
+        if (label == "⌫" && isPressed && !backspaceHold.allowsDelete(composing)) {
+            removeCallbacks(repeatDelete)
+            removeCallbacks(armClearAll)
+            clearAllPending = false
+            invalidate()
+        }
+    }
+
+    fun refreshCase(english: Boolean, state: Int) {
+        if (label.length == 1 && label[0] in 'a'..'z') {
+            displayLabel = if (!english || state > 0) label.uppercase() else label
+            contentDescription = displayLabel
+        }
+        if (label == "⇧") shiftState = state
+        invalidate()
     }
 
     private fun drawCenteredText(
@@ -261,9 +367,9 @@ internal class Key(
 
     override fun onDraw(c: Canvas) {
         val dark = darkOverride ?: context.darkKeyboard
+        val density = context.resources.displayMetrics.density
         val padX = context.dpF(2.2f)
-        val padY = context.dpF(3.6f)
-        val r = context.dpF(T.Radius.mobileKeycapPx.toFloat())
+        val padY = min(context.dpF(3.6f), height * 0.075f)
 
         val now = SystemClock.uptimeMillis()
         val glowStrength =
@@ -275,6 +381,10 @@ internal class Key(
             }
         val pressDepth = if (isPressed) context.dpF(0.6f) else 0f
         keyRect.set(padX, padY + pressDepth, width - padX, height - padY + pressDepth)
+        val keyHdp = (keyRect.height() / density).coerceAtLeast(1f)
+        val r = min(context.dpF(T.Radius.mobileKeycapPx.toFloat()), keyRect.height() * 0.28f)
+        val maxTextDp = (keyHdp * 0.56f).coerceAtLeast(10f)
+        val compactScale = (keyHdp / 40f).coerceIn(0.76f, 1f)
 
         // Soft bottom shadow for liquid-glass keycap elevation
         if (!isPressed) {
@@ -452,7 +562,16 @@ internal class Key(
         }
 
         if (swipeUpActive && upper.isNotEmpty()) {
-            drawCenteredText(c, upper, cx, cy, 20f, accentText, Paint.Align.CENTER, bold = true)
+            drawCenteredText(
+                c,
+                upper,
+                cx,
+                cy,
+                20f.coerceAtMost(maxTextDp),
+                accentText,
+                Paint.Align.CENTER,
+                bold = true,
+            )
             return
         }
 
@@ -461,14 +580,23 @@ internal class Key(
             "⌫" -> {
                 when {
                     clearAllArmed && clearAllSwipeUp ->
-                        drawCenteredText(c, "松手清空", cx, cy, 10.5f, 0xFFFFFFFF.toInt(), Paint.Align.CENTER, bold = true)
+                        drawCenteredText(
+                            c,
+                            "松手清空",
+                            cx,
+                            cy,
+                            10.5f.coerceAtMost(maxTextDp),
+                            0xFFFFFFFF.toInt(),
+                            Paint.Align.CENTER,
+                            bold = true,
+                        )
                     clearAllArmed ->
                         drawCenteredText(
                             c,
                             "↑ 清空",
                             cx,
                             cy,
-                            11.5f,
+                            11.5f.coerceAtMost(maxTextDp),
                             if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt(),
                             Paint.Align.CENTER,
                             bold = true,
@@ -480,7 +608,16 @@ internal class Key(
                 if (displayLabel == "↵" || displayLabel.isEmpty()) {
                     drawReturnGlyph(c, cx, cy, primaryText)
                 } else {
-                    drawCenteredText(c, displayLabel, cx, cy, 13.5f, primaryText, Paint.Align.CENTER, bold = true)
+                    drawCenteredText(
+                        c,
+                        displayLabel,
+                        cx,
+                        cy,
+                        13.5f.coerceAtMost(maxTextDp),
+                        primaryText,
+                        Paint.Align.CENTER,
+                        bold = true,
+                    )
                 }
             }
             "空格" -> {
@@ -490,7 +627,7 @@ internal class Key(
                         "◂  移动光标  ▸",
                         cx,
                         cy,
-                        12.5f,
+                        12.5f.coerceAtMost(maxTextDp),
                         accentText,
                         Paint.Align.CENTER,
                         bold = true,
@@ -502,7 +639,7 @@ internal class Key(
                         hint,
                         cx,
                         cy,
-                        12f,
+                        12f.coerceAtMost(maxTextDp),
                         secondaryText,
                         Paint.Align.CENTER,
                         medium = true,
@@ -520,9 +657,10 @@ internal class Key(
                         displayLabel.length == 2 -> 14.0f
                         role == KeyRole.PRIMARY -> if (showFinal) 19.0f else 20.0f
                         else -> 16.0f
-                    }
+                    }.coerceAtMost(maxTextDp)
                 val yOffset =
                     when {
+                        keyHdp < 34f -> 0f
                         showFinal -> -context.dpF(0.5f)
                         showUpper -> context.dpF(1.0f)
                         else -> 0f
@@ -540,13 +678,13 @@ internal class Key(
                 )
                 if (showUpper) {
                     val subInsetX = context.dpF(4.8f)
-                    val subInsetY = context.dpF(7.2f)
+                    val subInsetY = min(context.dpF(7.2f), keyRect.height() * 0.25f)
                     drawCenteredText(
                         c,
                         upper,
                         if (flypy) keyRect.left + subInsetX else keyRect.right - subInsetX,
                         keyRect.top + subInsetY,
-                        8.2f,
+                        8.2f * compactScale,
                         secondaryText,
                         if (flypy) Paint.Align.LEFT else Paint.Align.RIGHT,
                         alpha = 148,
@@ -559,8 +697,8 @@ internal class Key(
                             c,
                             finalLabel,
                             keyRect.right - context.dpF(4.6f),
-                            keyRect.bottom - context.dpF(5.8f),
-                            7.8f,
+                            keyRect.bottom - min(context.dpF(5.8f), keyRect.height() * 0.22f),
+                            7.8f * compactScale,
                             accentText,
                             Paint.Align.RIGHT,
                             medium = true,
@@ -591,9 +729,10 @@ internal class Key(
                     postDelayed(startVoice, T.Ergonomics.spacebarVoiceHoldThresholdMs.toLong())
                 }
                 if (label == "⌫") {
-                    clearAllPending = true
+                    backspaceHold.begin(isComposing())
+                    clearAllPending = !backspaceHold.startedComposing
                     postDelayed(repeatDelete, 360L)
-                    postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
+                    if (clearAllPending) postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
                 }
             }
             MotionEvent.ACTION_MOVE -> {
@@ -608,7 +747,7 @@ internal class Key(
                         if (clearAllSwipeUp) downY - e.y >= context.dp(16)
                         else downY - e.y >= context.dp(24)
                 }
-                if (label == "空格" && !recording) {
+                if (label == "空格" && !recording && canScrubSpace()) {
                     val step = context.dpF(14f)
                     if (!spaceScrubbing && abs(e.x - downX) > step) {
                         spaceScrubbing = true
@@ -655,6 +794,7 @@ internal class Key(
                     }
                     didClearAllArmed -> Unit
                     didRepeat || didScrub -> Unit
+                    label == "⌫" && !backspaceHold.allowsDelete(isComposing()) -> Unit
                     label == "⌫" && e.x - downX < -context.dp(20) -> action("delete-word")
                     didSwipeUp || (upper.isNotEmpty() && downY - e.y > context.dp(16)) ->
                         action(upper)
@@ -680,6 +820,8 @@ internal class Key(
                 }
             }
         }
+        if (e.actionMasked == MotionEvent.ACTION_UP || e.actionMasked == MotionEvent.ACTION_CANCEL)
+            backspaceHold.begin(composing = false)
         invalidate()
         return true
     }

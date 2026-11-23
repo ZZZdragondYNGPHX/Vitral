@@ -6,7 +6,7 @@ use std::{
     io::{self, Read, Write},
     os::windows::{
         fs::OpenOptionsExt,
-        io::{AsRawHandle, FromRawHandle},
+        io::{AsRawHandle, FromRawHandle, OwnedHandle},
     },
     path::{Path, PathBuf},
     ptr::null_mut,
@@ -17,7 +17,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
-    System::{Pipes::*, RemoteDesktop::ProcessIdToSessionId, Threading::*},
+    System::{Pipes::*, RemoteDesktop::ProcessIdToSessionId, Threading::*, IO::*},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn wide(s: &str) -> Vec<u16> {
@@ -126,6 +126,7 @@ fn connect() -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
+        .custom_flags(FILE_FLAG_OVERLAPPED)
         .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(name)?;
     unsafe {
@@ -175,30 +176,206 @@ fn read_frame<T: serde::de::DeserializeOwned>(file: &mut File) -> Result<T> {
     file.read_exact(&mut data)?;
     Ok(serde_json::from_slice(&data)?)
 }
+// The buffer and OVERLAPPED must outlive cancellation, including after a timeout.
+struct PipeIo {
+    overlapped: OVERLAPPED,
+    data: Vec<u8>,
+    event: OwnedHandle,
+}
+// hEvent belongs to event; no pointers reference another thread's stack.
+unsafe impl Send for PipeIo {}
+// LibraryLoader is only needed for the overlapped I/O reaper in this module.
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut HMODULE) -> windows_sys::core::BOOL;
+    fn FreeLibraryAndExitThread(module: HMODULE, exit_code: u32) -> !;
+}
+const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+
+struct PipeReaper {
+    pending: Box<PipeIo>,
+    module: HMODULE,
+}
+
+unsafe extern "system" fn reap_pipe_io(param: *mut std::ffi::c_void) -> u32 {
+    let reaper = unsafe { Box::from_raw(param.cast::<PipeReaper>()) };
+    unsafe { WaitForSingleObject(reaper.pending.event.as_raw_handle(), INFINITE) };
+    let module = reaper.module;
+    drop(reaper);
+    // Release the DLL reference without returning into its code.
+    unsafe { FreeLibraryAndExitThread(module, 0) }
+}
+
+fn reap_cancelled_io(pending: Box<PipeIo>) {
+    unsafe {
+        let mut module = null_mut();
+        if GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            transfer as *const () as *const u16,
+            &mut module,
+        ) != 0
+        {
+            let param = Box::into_raw(Box::new(PipeReaper { pending, module }));
+            let thread = CreateThread(null_mut(), 0, Some(reap_pipe_io), param.cast(), 0, null_mut());
+            if !thread.is_null() {
+                CloseHandle(thread);
+                return;
+            }
+            let reaper = Box::from_raw(param);
+            WaitForSingleObject(reaper.pending.event.as_raw_handle(), INFINITE);
+            drop(reaper);
+            FreeLibrary(module);
+        } else {
+            WaitForSingleObject(pending.event.as_raw_handle(), INFINITE);
+        }
+    }
+}
+
+fn transfer(
+    file: &mut Option<File>,
+    data: Vec<u8>,
+    writing: bool,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
+    unsafe {
+        let event = CreateEventW(null_mut(), 1, 0, null_mut());
+        if event.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut pending = Box::new(PipeIo {
+            overlapped: OVERLAPPED {
+                hEvent: event,
+                ..std::mem::zeroed()
+            },
+            data,
+            event: OwnedHandle::from_raw_handle(event),
+        });
+        let handle = file.as_ref().unwrap().as_raw_handle();
+        let mut offset = 0;
+        while offset < pending.data.len() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Vitral pipe request timed out",
+                ));
+            }
+            ResetEvent(event);
+            pending.overlapped = OVERLAPPED {
+                hEvent: event,
+                ..std::mem::zeroed()
+            };
+            let data = &mut pending.data[offset..];
+            let mut count = 0;
+            let ok = if writing {
+                WriteFile(
+                    handle,
+                    data.as_ptr(),
+                    data.len() as u32,
+                    null_mut(),
+                    &mut pending.overlapped,
+                )
+            } else {
+                ReadFile(
+                    handle,
+                    data.as_mut_ptr(),
+                    data.len() as u32,
+                    null_mut(),
+                    &mut pending.overlapped,
+                )
+            };
+            if ok == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(ERROR_IO_PENDING as i32) {
+                    return Err(error);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let wait =
+                    WaitForSingleObject(event, remaining.as_millis().min((INFINITE - 1) as u128) as u32);
+                if wait != WAIT_OBJECT_0 {
+                    let error = if wait == WAIT_TIMEOUT {
+                        io::Error::new(io::ErrorKind::TimedOut, "Vitral pipe request timed out")
+                    } else {
+                        io::Error::last_os_error()
+                    };
+                    CancelIoEx(handle, &pending.overlapped);
+                    drop(file.take());
+                    reap_cancelled_io(pending);
+                    return Err(error);
+                }
+            }
+            if GetOverlappedResult(handle, &pending.overlapped, &mut count, 0) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if count == 0 {
+                return Err(io::Error::new(
+                    if writing {
+                        io::ErrorKind::WriteZero
+                    } else {
+                        io::ErrorKind::UnexpectedEof
+                    },
+                    "Vitral pipe closed",
+                ));
+            }
+            offset += count as usize;
+        }
+        Ok(std::mem::take(&mut pending.data))
+    }
+}
 pub fn request(host: &Path, editor: &str, cmd: &str, args: &Value) -> Result<Value> {
+    request_with_timeout(host, editor, cmd, args, Duration::from_secs(120))
+}
+
+pub fn request_with_timeout(
+    host: &Path,
+    editor: &str,
+    cmd: &str,
+    args: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pipe timeout"))?;
     let mut launched = false;
-    let start = Instant::now();
-    let mut file = loop {
+    let mut connect_deadline = deadline.min(Instant::now() + Duration::from_millis(1500));
+    let mut file = Some(loop {
+        if Instant::now() >= connect_deadline {
+            return Err(
+                io::Error::new(io::ErrorKind::TimedOut, "Vitral pipe request timed out").into(),
+            );
+        }
         match connect() {
             Ok(f) => break f,
             Err(e)
                 if e.kind() == io::ErrorKind::NotFound
                     || e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
             {
-                if start.elapsed() > Duration::from_secs(5) {
-                    return Err(e.into());
-                }
                 if !launched && e.kind() == io::ErrorKind::NotFound {
                     std::process::Command::new(host).arg("--engine").spawn()?;
                     launched = true;
+                    connect_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
                 }
-                std::thread::sleep(Duration::from_millis(25));
+                std::thread::sleep(
+                    Duration::from_millis(25)
+                        .min(connect_deadline.saturating_duration_since(Instant::now())),
+                );
             }
             Err(e) => return Err(e.into()),
         }
-    };
-    write_frame(&mut file, &(editor, cmd, args))?;
-    let reply: Value = read_frame(&mut file)?;
+    });
+    let data = serde_json::to_vec(&(editor, cmd, args))?;
+    if data.len() > 32 * 1024 * 1024 {
+        return Err("message exceeds 32 MiB".into());
+    }
+    let mut frame = (data.len() as u32).to_le_bytes().to_vec();
+    frame.extend_from_slice(&data);
+    transfer(&mut file, frame, true, deadline)?;
+    let header = transfer(&mut file, vec![0; 4], false, deadline)?;
+    let len = u32::from_le_bytes(header.try_into().unwrap()) as usize;
+    if len > 32 * 1024 * 1024 {
+        return Err("message exceeds 32 MiB".into());
+    }
+    let data = transfer(&mut file, vec![0; len], false, deadline)?;
+    let reply: Value = serde_json::from_slice(&data)?;
     if let Some(e) = reply["error"].as_str() {
         return Err(e.to_string().into());
     }
@@ -295,5 +472,43 @@ pub fn serve() -> Result<()> {
                 }
             }
         });
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_deadline_does_not_connect_or_launch_the_engine() {
+        let error = request_with_timeout(Path::new("unused"), "", "profile-state", &json!({}), Duration::ZERO)
+            .unwrap_err();
+        assert_eq!(error.downcast_ref::<io::Error>().unwrap().kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn pending_pipe_read_times_out_and_releases_the_client() {
+        let name = format!(
+            r"\\.\pipe\Vitral.io-test.{}",
+            unsafe { GetCurrentProcessId() },
+        );
+        let server = unsafe {
+            let pipe = CreateNamedPipeW(
+                wide(&name).as_ptr(), PIPE_ACCESS_DUPLEX, PIPE_REJECT_REMOTE_CLIENTS, 1,
+                64, 64, 0, null_mut(),
+            );
+            assert_ne!(pipe, INVALID_HANDLE_VALUE);
+            File::from_raw_handle(pipe)
+        };
+        let mut client = Some(OpenOptions::new().read(true).write(true)
+            .custom_flags(FILE_FLAG_OVERLAPPED).open(name).unwrap());
+        // Opening the client first already connects this pipe instance.
+        let connected = unsafe { ConnectNamedPipe(server.as_raw_handle(), null_mut()) };
+        assert!(connected != 0 || io::Error::last_os_error().raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32));
+        let error = transfer(&mut client, vec![0; 4], false, Instant::now() + Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(client.is_none());
     }
 }

@@ -1,5 +1,7 @@
 use crate::eng::gram::RimeGramDb;
+#[cfg(test)]
 use crate::eng::quanpin::{decode_quanpin_with_fuzzy, decode_xiaohe_long_context};
+use crate::eng::quanpin::{decode_quanpin_context, decode_xiaohe_context};
 use crate::eng::{CandidateItem, OpenCcMode, PageInfo, SchemaKind};
 use crate::imp::polyphone::RimeDictCorpus;
 use crate::imp::ImportedLexiconIndex;
@@ -124,6 +126,7 @@ pub struct PureRustEngine {
     grammar_path: Option<PathBuf>,
     corpus: OnceLock<Arc<RimeDictCorpus>>,
     gram: OnceLock<Option<Arc<RimeGramDb>>>,
+    pub(super) confirmed_prefix: String,
     pub fuzzy_pinyin: bool,
     pub syllable_split: bool,
     pub page_index: usize,
@@ -137,6 +140,7 @@ impl PureRustEngine {
             grammar_path: crate::models::ModelPaths::bundled(assets_dir).grammar,
             corpus: OnceLock::new(),
             gram: OnceLock::new(),
+            confirmed_prefix: String::new(),
             fuzzy_pinyin: false,
             syllable_split: false,
             page_index: 0,
@@ -501,8 +505,8 @@ impl PureRustEngine {
 
         let corpus = Arc::clone(self.get_corpus());
         let gram = self.get_gram();
-        let decoded = match schema {
-            SchemaKind::RimeIce => decode_quanpin_with_fuzzy(
+        let mut decoded = match schema {
+            SchemaKind::RimeIce => decode_quanpin_context(
                 raw_input,
                 &corpus,
                 gram,
@@ -511,18 +515,31 @@ impl PureRustEngine {
                 40,
                 self.fuzzy_pinyin,
                 self.syllable_split,
+                &self.confirmed_prefix,
             ),
-            SchemaKind::DoublePinyinFlypy => {
-                decode_xiaohe_long_context(raw_input, &corpus, gram, imported, retention, 40)
-            }
+            SchemaKind::DoublePinyinFlypy => decode_xiaohe_context(
+                raw_input,
+                &corpus,
+                gram,
+                imported,
+                retention,
+                40,
+                &self.confirmed_prefix,
+            ),
         };
 
+        // Prefer the longest valid input span before deduplicating typo and prefix paths.
+        decoded.sort_by(|a, b| {
+            b.consumed_len
+                .cmp(&a.consumed_len)
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
         let exact_reading = |syllables: &[String]| {
             syllables
                 .iter()
                 .all(|s| crate::imp::xiaohe::canonical_syllable_set().contains(s.as_str()))
                 && if schema == SchemaKind::RimeIce {
-                    syllables.concat() == raw_input.replace(['\'', ' '], "")
+                    crate::imp::xiaohe::matches_quanpin_reading(syllables, raw_input)
                 } else {
                     crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&syllables.join(" ")) == raw_input
                 }
@@ -592,13 +609,18 @@ impl PureRustEngine {
                 canonical: cand.text,
                 consumed_len: cand.consumed_len,
             };
-            if pinned {
+            if pinned && decoded.consumed_len == raw_input.len() {
                 pinned_items.push(decoded);
             } else {
                 normal_items.push((decoded, cand.score));
             }
         }
 
+        let single_query = match schema {
+            SchemaKind::RimeIce => crate::imp::xiaohe::canonical_syllable_set()
+                .contains(crate::imp::xiaohe::normalize_syllable(raw_input).as_str()),
+            SchemaKind::DoublePinyinFlypy => raw_input.len() == 2,
+        };
         normal_items.sort_by(|a, b| {
             let exact = |c: &DecodedCandidate| {
                 c.consumed_len == raw_input.len()
@@ -610,34 +632,47 @@ impl PureRustEngine {
                             .collect::<Vec<_>>(),
                     )
             };
-            let fuzzy = self.fuzzy_pinyin && schema == SchemaKind::RimeIce;
-            (fuzzy && exact(&b.0))
-                .cmp(&(fuzzy && exact(&a.0)))
+            let single_syllable = |c: &DecodedCandidate| c.item.comment.split_whitespace().count() == 1;
+            (b.0.consumed_len == raw_input.len())
+                .cmp(&(a.0.consumed_len == raw_input.len()))
                 .then_with(|| {
-                    b.0.item
-                        .frecency_score
-                        .max(0.0)
-                        .total_cmp(&a.0.item.frecency_score.max(0.0))
-                        .then_with(|| b.0.consumed_len.cmp(&a.0.consumed_len))
-                        .then_with(|| b.1.total_cmp(&a.1))
+                    (single_query && single_syllable(&b.0) && exact(&b.0))
+                        .cmp(&(single_query && single_syllable(&a.0) && exact(&a.0)))
                 })
+                .then_with(|| {
+                    if single_query || !self.fuzzy_pinyin {
+                        b.0.item
+                            .frecency_score
+                            .max(0.0)
+                            .total_cmp(&a.0.item.frecency_score.max(0.0))
+                            .then_with(|| b.1.total_cmp(&a.1))
+                    } else {
+                        (b.1 + b.0.item.frecency_score.max(0.0))
+                            .total_cmp(&(a.1 + a.0.item.frecency_score.max(0.0)))
+                    }
+                })
+                .then_with(|| b.0.consumed_len.cmp(&a.0.consumed_len))
+                .then_with(|| exact(&b.0).cmp(&exact(&a.0)))
         });
         let personal_count = normal_items
             .iter()
-            .take_while(|(c, _)| c.item.frecency_score > 0.0)
+            .take_while(|(c, _)| c.consumed_len == raw_input.len() && c.item.frecency_score > 0.0)
             .count();
         pinned_items.extend(normal_items.drain(..personal_count).map(|(c, _)| c));
         // Keep typo/completion ranking intact until there is an exact full reading.
-        let has_sentence = normal_items.iter().any(|(c, _)| {
-            c.consumed_len == raw_input.len()
-                && c.item.comment.split_whitespace().count() > 1
-                && (schema == SchemaKind::DoublePinyinFlypy
-                    || c.item
-                        .comment
-                        .chars()
-                        .filter(|ch| !ch.is_whitespace())
-                        .eq(raw_input.chars().filter(|ch| ch.is_ascii_alphabetic())))
-        });
+        let has_sentence = pinned_items
+            .iter()
+            .chain(normal_items.iter().map(|(c, _)| c))
+            .any(|c| {
+                c.consumed_len == raw_input.len()
+                    && c.item.comment.split_whitespace().count() > 1
+                    && (schema == SchemaKind::DoublePinyinFlypy
+                        || c.item
+                            .comment
+                            .chars()
+                            .filter(|ch| !ch.is_whitespace())
+                            .eq(raw_input.chars().filter(|ch| ch.is_ascii_alphabetic())))
+            });
         let has_partial = normal_items
             .iter()
             .any(|(c, _)| c.consumed_len < raw_input.len());
@@ -651,6 +686,25 @@ impl PureRustEngine {
                 if candidate.consumed_len == raw_input.len() {
                     full.push((candidate, score));
                 } else if candidate.canonical.chars().count() > 1
+                    && (schema == SchemaKind::DoublePinyinFlypy || {
+                        let reading: String = candidate.item.comment.split_whitespace().collect();
+                        let raw_prefix = raw_input[..candidate.consumed_len].replace(['\'', ' '], "");
+                        let last = candidate
+                            .item
+                            .comment
+                            .split_whitespace()
+                            .last()
+                            .unwrap_or("");
+                        reading == raw_prefix
+                            && !raw_input[candidate.consumed_len..]
+                                .chars()
+                                .next()
+                                .is_some_and(|ch| {
+                                    ch.is_ascii_alphabetic()
+                                        && crate::imp::xiaohe::canonical_syllable_set()
+                                            .contains(format!("{last}{ch}").as_str())
+                                })
+                    })
                     && lengths.insert(candidate.consumed_len)
                 {
                     prefixes.push((candidate, score));
@@ -669,7 +723,8 @@ impl PureRustEngine {
             }
             // Preserve the best sentences, then expose selectable prefixes and homophones.
             singles.sort_by(|a, b| b.1.total_cmp(&a.1));
-            let rest_full = full.split_off(full.len().min(2));
+            let head_count = 2_usize.saturating_sub(pinned_items.len()).min(full.len());
+            let rest_full = full.split_off(head_count);
             let rest_singles = singles.split_off(singles.len().min(2));
             full.extend(prefixes);
             full.extend(singles);
@@ -777,233 +832,265 @@ impl PureRustEngine {
     }
 }
 
-/// Cross-platform pure-Rust Simplified -> Traditional conversion fallback (used on Android/Windows
-/// and `--no-default-features`; Linux `native-rime` uses `libopencc.so` directly).
-pub fn pure_rust_opencc(mode: OpenCcMode, text: &str) -> String {
-    if mode == OpenCcMode::Simplified || text.is_empty() {
-        return text.to_string();
-    }
-    let mut s = if mode == OpenCcMode::TaiwanStandard {
-        text.replace("软件", "軟體")
-            .replace("硬件", "硬體")
-            .replace("内存", "記憶體")
-            .replace("网络", "網路")
-            .replace("信息", "資訊")
-            .replace("屏幕", "螢幕")
-            .replace("鼠标", "滑鼠")
-            .replace("打印", "列印")
-            .replace("程序", "程式")
-            .replace("默认", "預設")
-    } else {
-        text.to_string()
-    };
-
-    let map = s2t_char_map();
-    s = s
-        .chars()
-        .map(|c| map.get(&c).copied().unwrap_or(c))
-        .collect();
-    s
+struct OpenCcTable {
+    entries: HashMap<&'static str, [&'static str; 3]>,
+    max_prefix_bytes: HashMap<char, usize>,
 }
 
-fn s2t_char_map() -> &'static HashMap<char, char> {
-    static MAP: OnceLock<HashMap<char, char>> = OnceLock::new();
-    MAP.get_or_init(|| {
-        const PAIRS: &[(char, char)] = &[
-            ('万', '萬'), ('与', '與'), ('专', '專'), ('业', '業'), ('东', '東'), ('丝', '絲'),
-            ('两', '兩'), ('严', '嚴'), ('丧', '喪'), ('个', '個'), ('丰', '豐'), ('临', '臨'),
-            ('为', '為'), ('丽', '麗'), ('举', '舉'), ('么', '麼'), ('义', '義'), ('乌', '烏'),
-            ('乐', '樂'), ('乔', '喬'), ('习', '習'), ('乡', '鄉'), ('书', '書'), ('买', '買'),
-            ('乱', '亂'), ('争', '爭'), ('亏', '虧'), ('云', '雲'), ('亚', '亞'), ('产', '產'),
-            ('亲', '親'), ('亿', '億'), ('仅', '僅'), ('从', '從'), ('仓', '倉'), ('仪', '儀'),
-            ('们', '們'), ('价', '價'), ('众', '眾'), ('优', '優'), ('会', '會'), ('伟', '偉'),
-            ('传', '傳'), ('伤', '傷'), ('伦', '倫'), ('伪', '偽'), ('体', '體'), ('余', '餘'),
-            ('佣', '傭'), ('侠', '俠'), ('侣', '侶'), ('侦', '偵'), ('侧', '側'), ('侨', '僑'),
-            ('俩', '倆'), ('债', '債'), ('倾', '傾'), ('假', '假'), ('偿', '償'), ('储', '儲'),
-            ('儿', '兒'), ('党', '黨'), ('兰', '蘭'), ('关', '關'), ('兴', '興'), ('养', '養'),
-            ('内', '內'), ('冈', '岡'), ('册', '冊'), ('写', '寫'), ('军', '軍'), ('农', '農'),
-            ('冲', '衝'), ('决', '決'), ('况', '況'), ('冻', '凍'), ('净', '淨'), ('准', '準'),
-            ('凉', '涼'), ('凌', '凌'), ('减', '減'), ('几', '幾'), ('凤', '鳳'), ('凭', '憑'),
-            ('凯', '凱'), ('击', '擊'), ('凿', '鑿'), ('划', '劃'), ('刘', '劉'), ('则', '則'),
-            ('刚', '剛'), ('创', '創'), ('删', '刪'), ('别', '別'), ('利', '利'), ('刮', '颳'),
-            ('制', '制'), ('刷', '刷'), ('刺', '刺'), ('刻', '刻'), ('剂', '劑'), ('剑', '劍'),
-            ('剧', '劇'), ('劝', '勸'), ('办', '辦'), ('务', '務'), ('动', '動'), ('助', '助'),
-            ('劳', '勞'), ('势', '勢'), ('勤', '勤'), ('区', '區'), ('医', '醫'), ('华', '華'),
-            ('协', '協'), ('单', '單'), ('卖', '賣'), ('卢', '盧'), ('卫', '衛'), ('却', '卻'),
-            ('厂', '廠'), ('厅', '廳'), ('历', '歷'), ('厉', '厲'), ('压', '壓'), ('厌', '厭'),
-            ('厕', '廁'), ('县', '縣'), ('参', '參'), ('双', '雙'), ('发', '發'), ('变', '變'),
-            ('叙', '敘'), ('台', '臺'), ('叶', '葉'), ('号', '號'), ('叹', '嘆'), ('后', '後'),
-            ('吓', '嚇'), ('吗', '嗎'), ('吨', '噸'), ('听', '聽'), ('启', '啟'), ('吴', '吳'),
-            ('员', '員'), ('呜', '嗚'), ('咏', '詠'), ('品', '品'), ('响', '響'), ('哑', '啞'),
-            ('哗', '嘩'), ('咱', '咱'), ('哀', '哀'), ('唤', '喚'), ('喜', '喜'), ('喝', '喝'),
-            ('喷', '噴'), ('器', '器'), ('园', '園'), ('困', '困'), ('围', '圍'), ('固', '固'),
-            ('国', '國'), ('图', '圖'), ('团', '團'), ('圣', '聖'), ('场', '場'), ('坏', '壞'),
-            ('块', '塊'), ('坚', '堅'), ('坛', '壇'), ('坝', '壩'), ('坟', '墳'), ('坠', '墜'),
-            ('垄', '壟'), ('垒', '壘'), ('垦', '墾'), ('垫', '墊'), ('尘', '塵'), ('墙', '牆'),
-            ('增', '增'), ('声', '聲'), ('处', '處'), ('备', '備'), ('复', '復'), ('够', '夠'),
-            ('头', '頭'), ('夸', '誇'), ('夺', '奪'), ('奋', '奮'), ('奖', '獎'), ('奥', '奧'),
-            ('妆', '妝'), ('妇', '婦'), ('妈', '媽'), ('妖', '妖'), ('妙', '妙'), ('妥', '妥'),
-            ('妨', '妨'), ('妹', '妹'), ('妻', '妻'), ('始', '始'), ('姐', '姐'), ('姑', '姑'),
-            ('姓', '姓'), ('委', '委'), ('威', '威'), ('娃', '娃'), ('娇', '嬌'), ('娘', '娘'),
-            ('娱', '娛'), ('孙', '孫'), ('学', '學'), ('宁', '寧'), ('宝', '寶'), ('实', '實'),
-            ('审', '審'), ('写', '寫'), ('宽', '寬'), ('宠', '寵'), ('将', '將'), ('尊', '尊'),
-            ('寻', '尋'), ('对', '對'), ('导', '導'), ('小', '小'), ('尔', '爾'), ('尘', '塵'),
-            ('尝', '嘗'), ('层', '層'), ('届', '屆'), ('属', '屬'), ('岗', '崗'), ('岛', '島'),
-            ('峡', '峽'), ('川', '川'), ('州', '州'), ('巡', '巡'), ('帅', '帥'), ('师', '師'),
-            ('帐', '帳'), ('带', '帶'), ('帮', '幫'), ('广', '廣'), ('庄', '莊'), ('庆', '慶'),
-            ('库', '庫'), ('应', '應'), ('庙', '廟'), ('庞', '龐'), ('废', '廢'), ('开', '開'),
-            ('异', '異'), ('弃', '棄'), ('张', '張'), ('弥', '彌'), ('弯', '彎'), ('强', '強'),
-            ('弹', '彈'), ('归', '歸'), ('当', '當'), ('录', '錄'), ('形', '形'), ('彩', '彩'),
-            ('影', '影'), ('彻', '徹'), ('征', '徵'), ('待', '待'), ('很', '很'), ('律', '律'),
-            ('复', '復'), ('微', '微'), ('德', '德'), ('心', '心'), ('忆', '憶'), ('忧', '憂'),
-            ('快', '快'), ('怀', '懷'), ('态', '態'), ('怂', '慫'), ('怜', '憐'), ('思', '思'),
-            ('总', '總'), ('恋', '戀'), ('恳', '懇'), ('恶', '惡'), ('恼', '惱'), ('悬', '懸'),
-            ('情', '情'), ('惊', '驚'), ('惠', '惠'), ('惨', '慘'), ('惯', '慣'), ('想', '想'),
-            ('爱', '愛'), ('感', '感'), ('愿', '願'), ('慈', '慈'), ('慎', '慎'), ('慢', '慢'),
-            ('戏', '戲'), ('战', '戰'), ('户', '戶'), ('房', '房'), ('所', '所'), ('才', '才'),
-            ('打', '打'), ('扑', '撲'), ('托', '托'), ('执', '執'), ('扩', '擴'), ('扫', '掃'),
-            ('扬', '揚'), ('扰', '擾'), ('扶', '扶'), ('找', '找'), ('承', '承'), ('技', '技'),
-            ('把', '把'), ('报', '報'), ('拟', '擬'), ('拥', '擁'), ('择', '擇'), ('挂', '掛'),
-            ('指', '指'), ('按', '按'), ('挑', '挑'), ('挖', '挖'), ('挥', '揮'), ('损', '損'),
-            ('换', '換'), ('据', '據'), ('捷', '捷'), ('扫', '掃'), ('授', '授'), ('掉', '掉'),
-            ('掌', '掌'), ('排', '排'), ('探', '探'), ('接', '接'), ('控', '控'), ('推', '推'),
-            ('掩', '掩'), ('提', '提'), ('插', '插'), ('握', '握'), ('援', '援'), ('搜', '搜'),
-            ('搞', '搞'), ('搬', '搬'), ('搭', '搭'), ('携', '攜'), ('摄', '攝'), ('摆', '擺'),
-            ('摊', '攤'), ('支', '支'), ('收', '收'), ('改', '改'), ('攻', '攻'), ('放', '放'),
-            ('政', '政'), ('故', '故'), ('效', '效'), ('敌', '敵'), ('敏', '敏'), ('救', '救'),
-            ('教', '教'), ('敢', '敢'), ('散', '散'), ('敬', '敬'), ('数', '數'), ('整', '整'),
-            ('文', '文'), ('斗', '鬥'), ('料', '料'), ('斜', '斜'), ('斩', '斬'), ('断', '斷'),
-            ('新', '新'), ('方', '方'), ('施', '施'), ('旁', '旁'), ('旅', '旅'), ('旋', '旋'),
-            ('无', '無'), ('既', '既'), ('时', '時'), ('明', '明'), ('易', '易'), ('星', '星'),
-            ('春', '春'), ('显', '顯'), ('昼', '晝'), ('晚', '晚'), ('普', '普'), ('景', '景'),
-            ('晴', '晴'), ('智', '智'), ('暂', '暫'), ('曲', '曲'), ('更', '更'), ('书', '書'),
-            ('会', '會'), ('月', '月'), ('有', '有'), ('服', '服'), ('朗', '朗'), ('望', '望'),
-            ('朝', '朝'), ('期', '期'), ('木', '木'), ('未', '未'), ('本', '本'), ('术', '術'),
-            ('机', '機'), ('杀', '殺'), ('杂', '雜'), ('权', '權'), ('条', '條'), ('来', '來'),
-            ('杨', '楊'), ('极', '極'), ('构', '構'), ('析', '析'), ('林', '林'), ('果', '果'),
-            ('枪', '槍'), ('枯', '枯'), ('架', '架'), ('柏', '柏'), ('查', '查'), ('标', '標'),
-            ('栈', '棧'), ('栋', '棟'), ('栏', '欄'), ('树', '樹'), ('校', '校'), ('样', '樣'),
-            ('核', '核'), ('根', '根'), ('格', '格'), ('栽', '栽'), ('框', '框'), ('案', '案'),
-            ('桌', '桌'), ('桥', '橋'), ('梦', '夢'), ('检', '檢'), ('棉', '棉'), ('棋', '棋'),
-            ('棒', '棒'), ('棚', '棚'), ('森', '森'), ('植', '植'), ('椭', '橢'), ('楼', '樓'),
-            ('概', '概'), ('榜', '榜'), ('模', '模'), ('横', '橫'), ('欢', '歡'), ('欧', '歐'),
-            ('欲', '欲'), ('欺', '欺'), ('款', '款'), ('歌', '歌'), ('止', '止'), ('正', '正'),
-            ('此', '此'), ('步', '步'), ('武', '武'), ('岁', '歲'), ('历', '歷'), ('归', '歸'),
-            ('死', '死'), ('残', '殘'), ('段', '段'), ('杀', '殺'), ('母', '母'), ('每', '每'),
-            ('毒', '毒'), ('比', '比'), ('毛', '毛'), ('毫', '毫'), ('民', '民'), ('气', '氣'),
-            ('氢', '氫'), ('水', '水'), ('永', '永'), ('求', '求'), ('汉', '漢'), ('汗', '汗'),
-            ('江', '江'), ('池', '池'), ('汤', '湯'), ('汪', '汪'), ('汽', '汽'), ('沈', '沈'),
-            ('沉', '沉'), ('沙', '沙'), ('没', '沒'), ('河', '河'), ('油', '油'), ('治', '治'),
-            ('沿', '沿'), ('泉', '泉'), ('法', '法'), ('波', '波'), ('注', '注'), ('泪', '淚'),
-            ('泰', '泰'), ('泳', '泳'), ('泽', '澤'), ('洋', '洋'), ('洗', '洗'), ('洛', '洛'),
-            ('洞', '洞'), ('津', '津'), ('洪', '洪'), ('洲', '洲'), ('活', '活'), ('派', '派'),
-            ('流', '流'), ('浅', '淺'), ('测', '測'), ('济', '濟'), ('浑', '渾'), ('浓', '濃'),
-            ('浙', '浙'), ('浦', '浦'), ('浩', '浩'), ('浪', '浪'), ('浮', '浮'), ('海', '海'),
-            ('涂', '塗'), ('消', '消'), ('涉', '涉'), ('涌', '湧'), ('涛', '濤'), ('涨', '漲'),
-            ('润', '潤'), ('清', '清'), ('渐', '漸'), ('渡', '渡'), ('港', '港'), ('游', '遊'),
-            ('湖', '湖'), ('湾', '灣'), ('源', '源'), ('准', '準'), ('溜', '溜'), ('满', '滿'),
-            ('滥', '濫'), ('滨', '濱'), ('滴', '滴'), ('演', '演'), ('漠', '漠'), ('漫', '漫'),
-            ('潜', '潛'), ('潮', '潮'), ('激', '激'), ('火', '火'), ('灭', '滅'), ('灯', '燈'),
-            ('灰', '灰'), ('灵', '靈'), ('灾', '災'), ('灿', '燦'), ('炉', '爐'), ('炎', '炎'),
-            ('炮', '炮'), ('点', '點'), ('炼', '煉'), ('烂', '爛'), ('烈', '烈'), ('烤', '烤'),
-            ('烧', '燒'), ('热', '熱'), ('焦', '焦'), ('然', '然'), ('照', '照'), ('煮', '煮'),
-            ('熊', '熊'), ('熟', '熟'), ('燃', '燃'), ('爆', '爆'), ('爱', '愛'), ('父', '父'),
-            ('爷', '爺'), ('片', '片'), ('版', '版'), ('牌', '牌'), ('牙', '牙'), ('牛', '牛'),
-            ('物', '物'), ('特', '特'), ('牵', '牽'), ('牺', '犧'), ('犯', '犯'), ('状', '狀'),
-            ('犹', '猶'), ('狂', '狂'), ('独', '獨'), ('狭', '狹'), ('狮', '獅'), ('狱', '獄'),
-            ('猎', '獵'), ('猪', '豬'), ('猫', '貓'), ('献', '獻'), ('猴', '猴'), ('玄', '玄'),
-            ('率', '率'), ('玉', '玉'), ('王', '王'), ('玩', '玩'), ('环', '環'), ('现', '現'),
-            ('球', '球'), ('理', '理'), ('琴', '琴'), ('瑞', '瑞'), ('瓜', '瓜'), ('瓦', '瓦'),
-            ('瓶', '瓶'), ('甘', '甘'), ('甜', '甜'), ('生', '生'), ('产', '產'), ('用', '用'),
-            ('田', '田'), ('由', '由'), ('甲', '甲'), ('申', '申'), ('电', '電'), ('男', '男'),
-            ('界', '界'), ('留', '留'), ('略', '略'), ('番', '番'), ('画', '畫'), ('异', '異'),
-            ('当', '當'), ('疏', '疏'), ('疑', '疑'), ('疗', '療'), ('疯', '瘋'), ('疲', '疲'),
-            ('疾', '疾'), ('病', '病'), ('痕', '痕'), ('痛', '痛'), ('痴', '痴'), ('瘦', '瘦'),
-            ('登', '登'), ('白', '白'), ('百', '百'), ('的', '的'), ('皇', '皇'), ('皮', '皮'),
-            ('益', '益'), ('监', '監'), ('盖', '蓋'), ('盘', '盤'), ('盛', '盛'), ('目', '目'),
-            ('直', '直'), ('相', '相'), ('省', '省'), ('看', '看'), ('真', '真'), ('眠', '眠'),
-            ('眼', '眼'), ('着', '著'), ('睁', '睜'), ('睡', '睡'), ('督', '督'), ('短', '短'),
-            ('石', '石'), ('矿', '礦'), ('码', '碼'), ('破', '破'), ('研', '研'), ('硬', '硬'),
-            ('确', '確'), ('磁', '磁'), ('磨', '磨'), ('示', '示'), ('礼', '禮'), ('社', '社'),
-            ('祖', '祖'), ('祝', '祝'), ('神', '神'), ('票', '票'), ('禁', '禁'), ('福', '福'),
-            ('离', '離'), ('秀', '秀'), ('私', '私'), ('秋', '秋'), ('种', '種'), ('科', '科'),
-            ('秒', '秒'), ('秘', '秘'), ('租', '租'), ('称', '稱'), ('移', '移'), ('程', '程'),
-            ('税', '稅'), ('稳', '穩'), ('究', '究'), ('穷', '窮'), ('空', '空'), ('穿', '穿'),
-            ('突', '突'), ('窗', '窗'), ('立', '立'), ('站', '站'), ('竟', '竟'), ('章', '章'),
-            ('童', '童'), ('端', '端'), ('竹', '竹'), ('笑', '笑'), ('笔', '筆'), ('符', '符'),
-            ('第', '第'), ('等', '等'), ('简', '簡'), ('算', '算'), ('管', '管'), ('箱', '箱'),
-            ('篇', '篇'), ('篮', '籃'), ('米', '米'), ('类', '類'), ('粉', '粉'), ('精', '精'),
-            ('系', '系'), ('素', '素'), ('紧', '緊'), ('紫', '紫'), ('累', '累'), ('繁', '繁'),
-            ('红', '紅'), ('约', '約'), ('级', '級'), ('纪', '紀'), ('纯', '純'), ('纲', '綱'),
-            ('纳', '納'), ('纵', '縱'), ('纷', '紛'), ('纸', '紙'), ('纽', '紐'), ('线', '線'),
-            ('练', '練'), ('组', '組'), ('细', '細'), ('织', '織'), ('终', '終'), ('经', '經'),
-            ('结', '結'), ('绕', '繞'), ('绘', '繪'), ('给', '給'), ('绝', '絕'), ('统', '統'),
-            ('继', '繼'), ('绩', '績'), ('绪', '緒'), ('续', '續'), ('维', '維'), ('综', '綜'),
-            ('绿', '綠'), ('缓', '緩'), ('编', '編'), ('缘', '緣'), ('缝', '縫'), ('缩', '縮'),
-            ('缺', '缺'), ('网', '網'), ('罗', '羅'), ('置', '置'), ('罪', '罪'), ('罚', '罰'),
-            ('署', '署'), ('美', '美'), ('群', '群'), ('义', '義'), ('羽', '羽'), ('习', '習'),
-            ('老', '老'), ('考', '考'), ('者', '者'), ('而', '而'), ('耐', '耐'), ('耳', '耳'),
-            ('联', '聯'), ('聪', '聰'), ('声', '聲'), ('职', '職'), ('肉', '肉'), ('肩', '肩'),
-            ('肯', '肯'), ('育', '育'), ('背', '背'), ('胎', '胎'), ('胜', '勝'), ('胞', '胞'),
-            ('胡', '胡'), ('能', '能'), ('脉', '脈'), ('脱', '脫'), ('脑', '腦'), ('脸', '臉'),
-            ('临', '臨'), ('自', '自'), ('至', '至'), ('致', '致'), ('与', '與'), ('兴', '興'),
-            ('举', '舉'), ('旧', '舊'), ('舍', '舍'), ('舞', '舞'), ('航', '航'), ('舰', '艦'),
-            ('良', '良'), ('色', '色'), ('节', '節'), ('花', '花'), ('芳', '芳'), ('英', '英'),
-            ('茶', '茶'), ('草', '草'), ('药', '藥'), ('获', '獲'), ('菜', '菜'), ('营', '營'),
-            ('落', '落'), ('叶', '葉'), ('著', '著'), ('蒸', '蒸'), ('蓝', '藍'), ('藏', '藏'),
-            ('虎', '虎'), ('处', '處'), ('虚', '虛'), ('号', '號'), ('虫', '蟲'), ('蛋', '蛋'),
-            ('蛙', '蛙'), ('融', '融'), ('血', '血'), ('行', '行'), ('街', '街'), ('冲', '衝'),
-            ('衣', '衣'), ('表', '表'), ('补', '補'), ('装', '裝'), ('西', '西'), ('要', '要'),
-            ('覆', '覆'), ('见', '見'), ('观', '觀'), ('规', '規'), ('视', '視'), ('觉', '覺'),
-            ('角', '角'), ('解', '解'), ('触', '觸'), ('言', '言'), ('计', '計'), ('认', '認'),
-            ('讨', '討'), ('让', '讓'), ('训', '訓'), ('议', '議'), ('记', '記'), ('讲', '講'),
-            ('许', '許'), ('论', '論'), ('设', '設'), ('访', '訪'), ('证', '證'), ('评', '評'),
-            ('识', '識'), ('诉', '訴'), ('词', '詞'), ('译', '譯'), ('试', '試'), ('诗', '詩'),
-            ('话', '話'), ('该', '該'), ('详', '詳'), ('语', '語'), ('误', '誤'), ('说', '說'),
-            ('请', '請'), ('诸', '諸'), ('读', '讀'), ('课', '課'), ('谁', '誰'), ('调', '調'),
-            ('谈', '談'), ('谋', '謀'), ('谓', '謂'), ('谢', '謝'), ('谷', '谷'), ('豆', '豆'),
-            ('象', '象'), ('豪', '豪'), ('贝', '貝'), ('负', '負'), ('贡', '貢'), ('财', '財'),
-            ('责', '責'), ('贤', '賢'), ('败', '敗'), ('货', '貨'), ('质', '質'), ('购', '購'),
-            ('贴', '貼'), ('贵', '貴'), ('贷', '貸'), ('费', '費'), ('贺', '賀'), ('资', '資'),
-            ('赏', '賞'), ('赔', '賠'), ('赖', '賴'), ('赚', '賺'), ('赛', '賽'), ('赞', '贊'),
-            ('走', '走'), ('赴', '赴'), ('起', '起'), ('超', '超'), ('越', '越'), ('趋', '趨'),
-            ('足', '足'), ('跳', '跳'), ('路', '路'), ('身', '身'), ('车', '車'), ('轨', '軌'),
-            ('军', '軍'), ('软', '軟'), ('较', '較'), ('载', '載'), ('轻', '輕'), ('辉', '輝'),
-            ('辈', '輩'), ('输', '輸'), ('转', '轉'), ('轮', '輪'), ('辞', '辭'), ('辩', '辯'),
-            ('农', '農'), ('边', '邊'), ('达', '達'), ('过', '過'), ('迈', '邁'), ('运', '運'),
-            ('近', '近'), ('返', '返'), ('还', '還'), ('这', '這'), ('进', '進'), ('远', '遠'),
-            ('违', '違'), ('连', '連'), ('迟', '遲'), ('追', '追'), ('退', '退'), ('送', '送'),
-            ('适', '適'), ('逃', '逃'), ('选', '選'), ('透', '透'), ('逐', '逐'), ('递', '遞'),
-            ('途', '途'), ('通', '通'), ('速', '速'), ('造', '造'), ('逢', '逢'), ('遇', '遇'),
-            ('遍', '遍'), ('道', '道'), ('遗', '遺'), ('遥', '遙'), ('避', '避'), ('邦', '邦'),
-            ('那', '那'), ('邮', '郵'), ('邻', '鄰'), ('部', '部'), ('都', '都'), ('乡', '鄉'),
-            ('配', '配'), ('酒', '酒'), ('酸', '酸'), ('醒', '醒'), ('采', '采'), ('释', '釋'),
-            ('里', '裡'), ('重', '重'), ('野', '野'), ('量', '量'), ('金', '金'), ('针', '針'),
-            ('钟', '鐘'), ('钢', '鋼'), ('钱', '錢'), ('铁', '鐵'), ('银', '銀'), ('锁', '鎖'),
-            ('错', '錯'), ('镜', '鏡'), ('长', '長'), ('门', '門'), ('闭', '閉'), ('问', '問'),
-            ('闲', '閒'), ('间', '間'), ('闻', '聞'), ('阅', '閱'), ('防', '防'), ('阳', '陽'),
-            ('阴', '陰'), ('阵', '陣'), ('阶', '階'), ('阻', '阻'), ('阿', '阿'), ('附', '附'),
-            ('际', '際'), ('陆', '陸'), ('陈', '陳'), ('降', '降'), ('限', '限'), ('院', '院'),
-            ('除', '除'), ('险', '險'), ('陪', '陪'), ('随', '隨'), ('隐', '隱'), ('隔', '隔'),
-            ('难', '難'), ('雄', '雄'), ('集', '集'), ('雨', '雨'), ('雪', '雪'), ('零', '零'),
-            ('雷', '雷'), ('雾', '霧'), ('需', '需'), ('震', '震'), ('青', '青'), ('静', '靜'),
-            ('非', '非'), ('面', '面'), ('革', '革'), ('音', '音'), ('页', '頁'), ('顶', '頂'),
-            ('项', '項'), ('顺', '順'), ('须', '須'), ('顾', '顧'), ('预', '預'), ('领', '領'),
-            ('颇', '頗'), ('频', '頻'), ('颗', '顆'), ('题', '題'), ('颜', '顏'), ('愿', '願'),
-            ('类', '類'), ('风', '風'), ('飞', '飛'), ('食', '食'), ('饭', '飯'), ('饮', '飲'),
-            ('饰', '飾'), ('饱', '飽'), ('馆', '館'), ('首', '首'), ('香', '香'), ('马', '馬'),
-            ('驾', '駕'), ('验', '驗'), ('骑', '騎'), ('骗', '騙'), ('高', '高'), ('鬼', '鬼'),
-            ('魂', '魂'), ('鱼', '魚'), ('鲁', '魯'), ('鲜', '鮮'), ('鸟', '鳥'), ('鸡', '雞'),
-            ('鸣', '鳴'), ('鸭', '鴨'), ('鸿', '鴻'), ('鹅', '鵝'), ('麦', '麥'), ('麻', '麻'),
-            ('黄', '黃'), ('黑', '黑'), ('默', '默'), ('齐', '齊'), ('龙', '龍'), ('龟', '龜'),
-        ];
-        PAIRS.iter().copied().collect()
-    })
+impl OpenCcTable {
+    fn load() -> Self {
+        let mut table = Self {
+            entries: HashMap::new(),
+            max_prefix_bytes: HashMap::new(),
+        };
+        for line in include_str!("opencc_delta.tsv")
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+        {
+            let mut fields = line.split('\t');
+            let input = fields.next().unwrap();
+            let standard = fields.next().unwrap_or_default();
+            let regional = |value| if value == "=" { standard } else { value };
+            let taiwan = regional(fields.next().unwrap_or_default());
+            let hong_kong = regional(fields.next().unwrap_or_default());
+            table.entries.insert(input, [standard, taiwan, hong_kong]);
+            table
+                .max_prefix_bytes
+                .entry(input.chars().next().unwrap())
+                .and_modify(|max| *max = (*max).max(input.len()))
+                .or_insert(input.len());
+        }
+        table
+    }
+}
+
+/// Use the longest matching OpenCC phrase or character for the selected locale.
+pub fn pure_rust_opencc(mode: OpenCcMode, mut text: &str) -> String {
+    let mode = match mode {
+        OpenCcMode::Simplified => return text.to_owned(),
+        OpenCcMode::Traditional => 0,
+        OpenCcMode::TaiwanStandard => 1,
+        OpenCcMode::HongKong => 2,
+    };
+    if text.is_empty() {
+        return String::new();
+    }
+
+    static TABLE: OnceLock<OpenCcTable> = OnceLock::new();
+    let table = TABLE.get_or_init(OpenCcTable::load);
+    let mut output = String::with_capacity(text.len());
+    while let Some(first) = text.chars().next() {
+        let mut matched = (first.len_utf8(), &text[..first.len_utf8()]);
+        if let Some(&max_bytes) = table.max_prefix_bytes.get(&first) {
+            for (offset, ch) in text.char_indices() {
+                let end = offset + ch.len_utf8();
+                if end > max_bytes {
+                    break;
+                }
+                if let Some(converted) = table
+                    .entries
+                    .get(&text[..end])
+                    .map(|values| values[mode])
+                    .filter(|value| !value.is_empty())
+                {
+                    matched = (end, converted);
+                }
+            }
+        }
+        output.push_str(matched.1);
+        text = &text[matched.0..];
+    }
+    output
 }
 
 #[cfg(test)]
 mod device_tests {
     use super::*;
+
+    #[test]
+    fn opencc_disambiguates_phrases_and_regional_variants() {
+        let text = "头发发财，理发皇后后来；干活干净茶几几乎出丑。方便面/软件/内存/鼠标/信息，兑换说话卫生，𫔶Vitral😀";
+        for (mode, expected) in [
+            (OpenCcMode::Simplified, text),
+            (
+                OpenCcMode::Traditional,
+                "頭髮發財，理髮皇后後來；幹活乾淨茶几幾乎出醜。方便麪/軟件/內存/鼠標/信息，兌換說話衛生，闑Vitral😀",
+            ),
+            (
+                OpenCcMode::TaiwanStandard,
+                "頭髮發財，理髮皇后後來；幹活乾淨茶几幾乎出醜。泡麵/軟體/記憶體/滑鼠/資訊，兌換說話衛生，闑Vitral😀",
+            ),
+            (
+                OpenCcMode::HongKong,
+                "頭髮發財，理髮皇后後來；幹活乾淨茶几幾乎出醜。方便麪/軟件/內存/鼠標/信息，兑換説話衞生，闑Vitral😀",
+            ),
+        ] {
+            assert_eq!(pure_rust_opencc(mode, text), expected, "{mode:?}");
+            assert_eq!(pure_rust_opencc(mode, ""), "");
+        }
+    }
+
+    #[test]
+    fn opencc_preserves_native_phrase_boundaries_before_suffixes() {
+        for (mode, expected) in [
+            (OpenCcMode::Traditional, "發明了，啓發式；明瞭、髮式／會發明瞭"),
+            (OpenCcMode::TaiwanStandard, "發明了，啟發式；明瞭、髮式／會發明瞭"),
+            (OpenCcMode::HongKong, "發明了，啓發式；明瞭、髮式／會發明瞭"),
+        ] {
+            assert_eq!(
+                pure_rust_opencc(mode, "发明了，启发式；明了、发式／会发明了"),
+                expected,
+                "{mode:?}",
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn opencc_phrases_match_the_locked_native_configs() {
+        let opencc_dir = crate::imp::polyphone::default_assets_dir_candidates()
+            .unwrap()
+            .join("opencc");
+        for mode in [
+            OpenCcMode::Traditional,
+            OpenCcMode::TaiwanStandard,
+            OpenCcMode::HongKong,
+        ] {
+            for input in [
+                "头发", "发财", "理发", "皇后", "后来", "干活", "干净", "茶几", "几乎", "出丑",
+                "方便面", "软件", "内存", "鼠标", "信息", "兑换", "里面", "卫生", "写字台", "𫔶",
+                "发明了", "启发式", "会发明了", "发明了一个启发式方法",
+                "皇后来理发，顺便买了方便面。",
+                "我把软件装到电脑上，查看内存和鼠标信息。",
+            ] {
+                let native = crate::eng::opencc_ffi::convert_text(&opencc_dir, mode, input).unwrap();
+                assert_eq!(pure_rust_opencc(mode, input), native, "{mode:?}: {input}");
+            }
+        }
+    }
+
+    #[test]
+    fn sentence_polish_real_corpus_regressions() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let mut engine = PureRustEngine::new(Some(&assets));
+        for (code, expected) in [
+            ("wmquchifan", "我们去吃饭"),
+            ("jttianqi", "今天天气"),
+            ("zenmban", "怎么办"),
+            ("nuedai", "虐待"),
+            ("luewei", "略微"),
+            ("zhonggou", "中国"),
+            ("zhongguo", "中国"),
+        ] {
+            let candidates = engine.query_all_candidates_contextual(
+                code,
+                SchemaKind::RimeIce,
+                OpenCcMode::Simplified,
+                None,
+                None,
+                None,
+                None,
+                false,
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .take(5)
+                    .any(|c| c.canonical == expected && c.consumed_len == code.len()),
+                "{code}: {candidates:?}"
+            );
+        }
+        let plain = decode_quanpin_context(
+            "quchifan",
+            engine.get_corpus(),
+            engine.get_gram(),
+            None,
+            None,
+            40,
+            false,
+            false,
+            "",
+        );
+        let prefixed = decode_quanpin_context(
+            "quchifan",
+            engine.get_corpus(),
+            engine.get_gram(),
+            None,
+            None,
+            40,
+            false,
+            false,
+            "我要",
+        );
+        let plain = plain.iter().find(|c| c.text == "去吃饭").unwrap();
+        let prefixed = prefixed.iter().find(|c| c.text == "去吃饭").unwrap();
+        assert_ne!(plain.score, prefixed.score);
+        assert_eq!(prefixed.consumed_len, "quchifan".len());
+        assert_eq!(prefixed.syllables, ["qu", "chi", "fan"]);
+        engine.fuzzy_pinyin = true;
+        let mut preference = RetentionEngine::default();
+        let now = RetentionEngine::now_epoch_ms();
+        for _ in 0..8 {
+            preference.record_contextual_selection(
+                "你是李老师",
+                "nishilaoshi",
+                None,
+                None,
+                now,
+                1.0,
+                true,
+            );
+        }
+        // A learned sentence must cross exact scattered characters by total score.
+        let candidates = engine.query_all_candidates_contextual(
+            "nishinilaoshi",
+            SchemaKind::RimeIce,
+            OpenCcMode::Simplified,
+            None,
+            Some(&preference),
+            None,
+            None,
+            true,
+        );
+        assert_eq!(candidates[0].canonical, "你是李老师", "{candidates:?}");
+        engine.fuzzy_pinyin = false;
+        let mut retention = RetentionEngine::default();
+        retention.register_typed_phrase("云璃", "yun li", "yyli", RetentionEngine::now_epoch_ms());
+        for code in ["yunlishurufa", "yun'li'shurufa"] {
+            let candidates = engine.query_all_candidates_contextual(
+                code,
+                SchemaKind::RimeIce,
+                OpenCcMode::Simplified,
+                None,
+                Some(&retention),
+                None,
+                None,
+                true,
+            );
+            assert!(
+                candidates
+                    .iter()
+                    .take(5)
+                    .any(|c| c.canonical == "云璃输入法" && c.consumed_len == code.len()),
+                "{code}: {candidates:?}"
+            );
+        }
+        retention.erase_word("云璃");
+        let erased = decode_quanpin_context(
+            "yunlishurufa",
+            engine.get_corpus(),
+            engine.get_gram(),
+            None,
+            Some(&retention),
+            40,
+            false,
+            false,
+            "",
+        );
+        assert!(!erased
+            .iter()
+            .any(|c| c.segments.iter().any(|word| word == "云璃")));
+    }
 
     #[test]
     fn merged_syllables_win_by_default_and_split_mode_forces_zero_initial_boundaries() {
@@ -1486,7 +1573,7 @@ mod device_tests {
         }
     }
     #[test]
-    fn personal_candidates_keep_priority_over_sentence_diversity() {
+    fn personal_partial_candidates_follow_full_sentences() {
         let engine = PureRustEngine::new(None);
         let mut retention = RetentionEngine::default();
         retention.pin_word("握");
@@ -1509,7 +1596,20 @@ mod device_tests {
             None,
             true,
         );
-        assert_eq!(candidates[0].canonical, "握");
-        assert_eq!(candidates[1].canonical, "我要");
+        assert!(candidates
+            .iter()
+            .take(2)
+            .all(|c| c.consumed_len == "woyaoquka".len()));
+        for word in ["握", "我要"] {
+            assert!(candidates.iter().position(|c| c.canonical == word).unwrap() >= 2);
+        }
+        assert!(
+            candidates
+                .iter()
+                .find(|c| c.canonical == "握")
+                .unwrap()
+                .item
+                .pinned
+        );
     }
 }

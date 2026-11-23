@@ -984,6 +984,13 @@ private:
         hide();
         return;
       }
+      if (history_->isVisible()) {
+        const auto generation = generation_;
+        request("clipboard-state", {}, [this, generation](auto r) {
+          if (generation == generation_ && history_->isVisible())
+            renderHistory(r);
+        });
+      }
       int tick = state["activity"].toInt();
       if (tick != tick_) {
         tick_ = tick;
@@ -1054,6 +1061,9 @@ private:
   }
 
   void renderHistory(const QJsonObject &state) {
+    if (state == historyState_)
+      return;
+    historyState_ = state;
     while (auto *item = historyEntries_->takeAt(0)) {
       if (item->widget()) {
         item->widget()->hide();
@@ -1258,6 +1268,7 @@ private:
   bool editing_ = false;
   QList<QToolButton *> extras_;
   QWidget *board_ = nullptr, *history_ = nullptr;
+  QJsonObject historyState_;
   QVBoxLayout *historyEntries_ = nullptr;
   QLabel *captionLabel_ = nullptr, *hwHintLabel_ = nullptr,
          *clipCountLabel_ = nullptr;

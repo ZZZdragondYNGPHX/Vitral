@@ -30,6 +30,7 @@ pub struct ClipboardEntry {
     pub source_device: String,
     pub timestamp_ms: u64,
     pub pinned: bool,
+    #[serde(default, deserialize_with = "deserialize_shortcut")]
     pub shortcut_code: Option<String>,
 }
 
@@ -100,6 +101,26 @@ impl RingChanges {
 pub struct ClipboardCurrent {
     pub current_copy: Option<ClipboardEntry>,
     pub dismissed_copy_id: Option<String>,
+}
+
+fn normalize_shortcut(code: Option<&str>) -> Result<Option<String>, VitralError> {
+    let code = code.unwrap_or("").trim().to_ascii_lowercase();
+    if code.is_empty() {
+        return Ok(None);
+    }
+    if code.len() > 16 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err(VitralError::InvalidArgument(
+            "shortcut_code must contain 1..=16 ASCII letters".into(),
+        ));
+    }
+    Ok(Some(code))
+}
+
+fn deserialize_shortcut<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let code = Option::<String>::deserialize(deserializer)?;
+    Ok(normalize_shortcut(code.as_deref()).ok().flatten())
 }
 
 pub fn copy_order(entry: &ClipboardEntry) -> (u64, &str) {
@@ -200,7 +221,8 @@ impl ClipboardManager {
         }
     }
 
-    fn push_ring_entry(&mut self, entry: ClipboardEntry) {
+    fn push_ring_entry(&mut self, mut entry: ClipboardEntry) {
+        entry.shortcut_code = normalize_shortcut(entry.shortcut_code.as_deref()).ok().flatten();
         if self.ring.iter().any(|e| e.id == entry.id) {
             return;
         }
@@ -229,7 +251,8 @@ impl ClipboardManager {
             self.current.dismissed_copy_id.as_deref() != Some(e.id.as_str()));
     }
 
-    pub fn observe_current(&mut self, entry: ClipboardEntry) {
+    pub fn observe_current(&mut self, mut entry: ClipboardEntry) {
+        entry.shortcut_code = normalize_shortcut(entry.shortcut_code.as_deref()).ok().flatten();
         if self.current.current_copy.as_ref().is_none_or(|old| copy_order(&entry) > copy_order(old)) {
             self.current.current_copy = Some(entry);
             self.current.dismissed_copy_id = None;
@@ -296,14 +319,7 @@ impl ClipboardManager {
         item_id: &str,
         shortcut_code: Option<&str>,
     ) -> Result<ClipboardState, VitralError> {
-        let normalized_code = shortcut_code.and_then(|s| {
-            let t = s.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.to_string())
-            }
-        });
+        let normalized_code = normalize_shortcut(shortcut_code)?;
         let item = self
             .ring
             .iter_mut()

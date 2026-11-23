@@ -328,7 +328,11 @@ impl<'a> ScoreCtx<'a> {
         let mut delta = 0.0f32;
         let frec = self.retention.decayed_score_at(w_str, self.now_ms);
         if frec > 0.0 {
-            delta += 1.5 * (frec as f32);
+            delta += if chars.len() >= 2 {
+                ((1.0 + frec).ln() as f32 * 1.2).min(3.5)
+            } else {
+                ((1.0 + frec).ln() as f32 * 0.6).min(1.5)
+            };
         }
         if self.retention.pinned_words.contains(w_str) {
             delta += 3.0;
@@ -1846,4 +1850,40 @@ fn run_tier1_dyn(
     }
 
     (best_hyp.chosen_indices, best_hyp.chars)
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    #[test]
+    fn retention_frequency_gain_is_logarithmic_and_bounded() {
+        let imported = ImportedLexiconIndex::new(None);
+        let mut caches = FastCaches::new();
+        for frequency in [0.0, 1.0, 100.0, 1_000_000.0] {
+            let mut retention = RetentionEngine::default();
+            let now = RetentionEngine::now_epoch_ms();
+            for word in ["的", "输入"] {
+                retention.record_selection_at(word, now, frequency);
+            }
+            let mut ctx = ScoreCtx::new(&imported, None, &retention, &mut caches);
+            ctx.now_ms = now;
+            for (chars, scale, cap) in [(vec!['的'], 0.6, 1.5), (vec!['输', '入'], 1.2, 3.5)] {
+                let delta = ctx.retention_delta(&chars);
+                assert_eq!(delta, ((1.0 + frequency).ln() as f32 * scale).min(cap));
+                assert!(delta <= cap);
+            }
+        }
+        let mut retention = RetentionEngine::default();
+        retention.pin_word("的");
+        assert_eq!(
+            ScoreCtx::new(&imported, None, &retention, &mut caches).retention_delta(&['的']),
+            3.0
+        );
+        retention.erase_word("输入");
+        assert_eq!(
+            ScoreCtx::new(&imported, None, &retention, &mut caches).retention_delta(&['输', '入']),
+            -5.0
+        );
+    }
 }

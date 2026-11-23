@@ -370,7 +370,6 @@ enum CandidateOrigin {
     Rime {
         features: [f64; 9],
         canonical: String,
-        commit_text: String,
         rime_page_idx: usize,
     },
     PureRust {
@@ -422,6 +421,7 @@ pub struct EngineState {
     pub last_committed_char: Option<char>,
     pub regret_backspaces: usize,
     last_commit_context: Option<String>,
+    last_commit_window: Vec<char>,
     context_window: Vec<char>,
     cached_context_vec: Option<[i8; 32]>,
     cached_mlm_priors: HashMap<char, f32>,
@@ -511,6 +511,7 @@ impl EngineState {
             last_committed_char: None,
             regret_backspaces: 0,
             last_commit_context: None,
+            last_commit_window: Vec::new(),
             context_window: Vec::new(),
             cached_context_vec: None,
             cached_mlm_priors: HashMap::new(),
@@ -584,7 +585,18 @@ impl EngineState {
         self.last_committed_word = None;
         self.last_committed_code = None;
         self.last_commit_context = None;
+        self.last_commit_window.clear();
         self.regret_backspaces = 0;
+    }
+
+    /// Host deletion feedback counts Unicode characters, including whole-word deletion.
+    pub fn notify_deleted_chars(&mut self, count: usize) {
+        if self.raw_input.is_empty()
+            && self.last_committed_word.is_some()
+            && RetentionEngine::now_epoch_ms().saturating_sub(self.last_committed_ms) <= 5000
+        {
+            self.regret_backspaces = self.regret_backspaces.saturating_add(count);
+        }
     }
 
     fn previous_context(&self, now_ms: u64) -> Option<&str> {
@@ -626,18 +638,29 @@ impl EngineState {
         retention: &mut RetentionEngine,
         now_ms: u64,
     ) {
-        let prev = self.previous_context(now_ms).map(str::to_string);
-        if prev.is_none() {
-            self.context_window.clear();
-        }
+        let fully_deleted =
+            self.last_committed_word.as_ref().is_some_and(|w| {
+                self.regret_backspaces == w.chars().count() && self.regret_backspaces > 0
+            }) && now_ms.saturating_sub(self.last_committed_ms) <= 6000;
         let correction = self.config.adaptive_learning
-            && self.regret_backspaces > 0
+            && fully_deleted
             && self.last_committed_code.as_deref() == Some(code)
             && self
                 .last_committed_word
                 .as_deref()
-                .is_some_and(|w| w != canonical)
-            && now_ms.saturating_sub(self.last_committed_ms) <= 6000;
+                .is_some_and(|w| w != canonical);
+        let prev = if fully_deleted {
+            self.context_window.clone_from(&self.last_commit_window);
+            self.refresh_semantic_context();
+            self.last_commit_context.clone()
+        } else {
+            self.previous_context(now_ms).map(str::to_string)
+        };
+        if prev.is_none() {
+            self.context_window.clear();
+        }
+        let before_window = self.context_window.clone();
+        let feedback = if fully_deleted { None } else { feedback };
         let chosen = feedback.map(|f| f.0).unwrap_or_else(|| {
             retention.extract_candidate_features(
                 canonical,
@@ -691,6 +714,7 @@ impl EngineState {
                 self.config.adaptive_learning,
             );
             if self.config.adaptive_learning
+                && self.pending_phrase_selections == 0
                 && self.regret_backspaces == 0
                 && now_ms.saturating_sub(self.last_committed_ms) <= 4500
             {
@@ -704,12 +728,7 @@ impl EngineState {
                         )
                         .annotate_text(&combined);
                         let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
-                        retention.observe_phrase_composition(
-                            &combined,
-                            &xiaohe,
-                            &ann.untoned,
-                            now_ms,
-                        );
+                        retention.observe_phrase_composition(&combined, &xiaohe, &ann.untoned, now_ms);
                     }
                 }
             }
@@ -728,9 +747,8 @@ impl EngineState {
             let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
             retention.register_typed_phrase(canonical, &ann.untoned, &xiaohe, now_ms);
         }
-        if !correction {
-            self.last_commit_context = prev;
-        }
+        self.last_commit_context = prev;
+        self.last_commit_window = before_window;
         self.last_committed_word = Some(canonical.to_string());
         self.last_committed_code = Some(code.to_string());
         self.last_committed_ms = now_ms;
@@ -907,6 +925,7 @@ impl EngineState {
         &self.raw_input[..consumed_len]
     }
 
+    #[cfg(test)]
     pub(crate) fn canonical_at(&self, index: usize) -> Option<&str> {
         self.candidate_origins.get(index).map(CandidateOrigin::canonical)
     }
@@ -925,7 +944,7 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) {
-        if !self.config.adaptive_learning || !canonical.chars().all(crate::ret::is_cjk) {
+        if canonical.is_empty() || !canonical.chars().all(crate::ret::is_cjk) {
             self.clear_pending_phrase();
             return;
         }
@@ -937,6 +956,7 @@ impl EngineState {
         self.pending_phrase_code.push_str(code);
         self.pending_phrase_selections += 1;
         if finished
+            && self.config.adaptive_learning
             && self.pending_phrase_selections >= 2
             && (2..=8).contains(&self.pending_phrase_text.chars().count())
         {
@@ -949,19 +969,25 @@ impl EngineState {
             .annotate_text(&word);
             let (quanpin, xiaohe) = if self.schema == SchemaKind::RimeIce {
                 (
-                    code.clone(),
+                    if ann.untoned.split_whitespace().collect::<String>()
+                        == code.replace(['\'', ' '], "")
+                    {
+                        ann.untoned.clone()
+                    } else {
+                        code.replace('\'', " ")
+                    },
                     crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned),
                 )
             } else {
                 (ann.untoned, code.clone())
             };
-            self.record_candidate_commit(&word, &code, None, imported, retention, now);
             retention.register_typed_phrase(&word, &quanpin, &xiaohe, now);
         }
     }
 
     pub(crate) fn clear_composition_state(&mut self) {
         self.clear_pending_phrase();
+        self.pure_rust.confirmed_prefix.clear();
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             self.rime_first_page.clear();
@@ -1189,19 +1215,12 @@ impl EngineState {
             0xff1b => 0x1b,
             _ => keycode,
         };
-        let now_ms = RetentionEngine::now_epoch_ms();
         if matches!(keycode, 0x08 | 0x1b) { self.clear_pending_phrase(); }
         if keycode == 0x1b {
             self.reset_commit_context();
             self.last_committed_char = None;
         }
-        if keycode == 0x08
-            && self.raw_input.is_empty()
-            && self.last_committed_word.is_some()
-            && now_ms.saturating_sub(self.last_committed_ms) <= 5000
-        {
-            self.regret_backspaces = self.regret_backspaces.saturating_add(1);
-        }
+        if keycode == 0x08 { self.notify_deleted_chars(1); }
         if keycode == 0x0d {
             if self.config.adaptive_learning {
                 retention.record_english_casing(&self.raw_input);
@@ -1463,9 +1482,13 @@ impl EngineState {
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
     fn sync_raw_input_from_preedit(&mut self, raw_preedit: &str) {
         if raw_preedit.is_ascii() {
+            self.pure_rust.confirmed_prefix.clear();
             return;
         }
-        let confirmed_chars = raw_preedit.chars().take_while(|c| !c.is_ascii()).count();
+        let previous_confirmed = self.pure_rust.confirmed_prefix.chars().count();
+        self.pure_rust.confirmed_prefix = raw_preedit.chars().take_while(|c| !c.is_ascii()).collect();
+        let newly_confirmed = self.pure_rust.confirmed_prefix.chars().count()
+            .saturating_sub(previous_confirmed);
         let tail_start = raw_preedit
             .char_indices()
             .find(|(_, c)| c.is_ascii())
@@ -1490,7 +1513,7 @@ impl EngineState {
                 if !xh_tail.is_empty() && compact_raw.ends_with(&xh_tail) {
                     self.raw_input = xh_tail;
                 } else {
-                    let drop_n = (confirmed_chars * 2).min(compact_raw.len());
+                    let drop_n = (newly_confirmed * 2).min(compact_raw.len());
                     self.raw_input = compact_raw[drop_n..].to_string();
                 }
             }
@@ -1569,7 +1592,6 @@ impl EngineState {
                 let origin = CandidateOrigin::Rime {
                     features: [0.0; 9],
                     canonical: c.text,
-                    commit_text: converted,
                     rime_page_idx: rime_idx,
                 };
                 (item, origin, rime_idx * 2)
@@ -1654,13 +1676,17 @@ impl EngineState {
                     },
                 ) in pr.into_iter().enumerate()
                 {
-                    if retention.erased_words.contains(&canonical) {
+                    if consumed_len != self.raw_input.len()
+                        || retention.erased_words.contains(&canonical)
+                    {
                         continue;
                     }
                     let frec = self.contextual_score(retention, &canonical, now_ms);
                     let pinned = retention.pinned_words.contains(&canonical);
                     let is_full_alt =
-                        need_full_span_alt && added_full_alt == 0 && canonical.chars().count() >= max_rime_len;
+                        need_full_span_alt && added_full_alt == 0 && canonical.chars().count() >= max_rime_len
+                            && (self.schema == SchemaKind::DoublePinyinFlypy
+                                || pr_item.comment.split_whitespace().collect::<String>() == self.raw_input.replace(['\'', ' '], ""));
                     if frec <= 0.0 && !pinned && !is_full_alt {
                         continue;
                     }
@@ -1793,25 +1819,11 @@ impl EngineState {
                     self.score_pair(item, origin, retention, now_ms, *rank);
                 }
             }
-            let mut pinned_base = Vec::new();
-            let mut normal_base = Vec::new();
-            for pair in base_pairs.drain(..) {
-                if pair.0.pinned {
-                    pinned_base.push(pair);
-                } else {
-                    normal_base.push(pair);
-                }
-            }
-            pinned_base.sort_by(|a, b| {
-                b.0.frecency_score
-                    .max(0.0)
-                    .total_cmp(&a.0.frecency_score.max(0.0))
-                    .then_with(|| a.2.cmp(&b.2))
-            });
-            normal_base.sort_by(|a, b| {
+            base_pairs.sort_by(|a, b| {
                 full_span
                     .contains(b.1.canonical())
                     .cmp(&full_span.contains(a.1.canonical()))
+                    .then_with(|| b.0.pinned.cmp(&a.0.pinned))
                     .then_with(|| {
                         b.0.frecency_score
                             .max(0.0)
@@ -1820,7 +1832,7 @@ impl EngineState {
                     .then_with(|| a.2.cmp(&b.2))
             });
 
-            for (c, orig, _) in pinned_base.into_iter().chain(normal_base) {
+            for (c, orig, _) in base_pairs {
                 if seen.insert(c.text.clone()) {
                     priority_overlay.push((c, orig));
                 }
@@ -2052,10 +2064,6 @@ impl EngineState {
             None
         };
         if let Some(index) = selection.filter(|i| *i < self.candidate_origins.len()) {
-            if !self.is_clipboard_candidate(index) {
-                let canonical = self.candidate_origins[index].canonical().to_string();
-                self.learn_current_candidate(&canonical, index, imported, retention);
-            }
             let committed =
                 self.select_candidate_on_backend(index, clipboard, imported, retention)?;
             return Ok(self.empty_action(committed));
@@ -2122,10 +2130,7 @@ impl EngineState {
             return Ok(self.empty_action(None));
         } else if keycode == 0x20 {
             if !self.raw_input.is_empty() {
-                if let Some(origin) = self.candidate_origins.first().cloned() {
-                    if !self.is_clipboard_candidate(0) {
-                        self.learn_current_candidate(origin.canonical(), 0, imported, retention);
-                    }
+                if !self.candidate_origins.is_empty() {
                     let committed =
                         self.select_candidate_on_backend(0, clipboard, imported, retention)?;
                     return Ok(self.empty_action(committed));
@@ -2160,23 +2165,6 @@ impl EngineState {
                 if (1..=page_size.min(9)).contains(&digit)
                     && self.current_candidates.get(digit - 1).is_some()
                 {
-                    if let Some(origin) = self.candidate_origins.get(digit - 1).cloned() {
-                        let is_clip = matches!(
-                            origin,
-                            CandidateOrigin::Overlay {
-                                is_clipboard: true,
-                                ..
-                            }
-                        );
-                        if !is_clip {
-                            self.learn_current_candidate(
-                                origin.canonical(),
-                                digit - 1,
-                                imported,
-                                retention,
-                            );
-                        }
-                    }
                     let committed = self.select_candidate_on_backend(
                         digit - 1,
                         clipboard,
@@ -2188,10 +2176,7 @@ impl EngineState {
             } else if let Some(punctuation) = map_zh_punctuation(ch) {
                 let mut text = if self.raw_input.is_empty() {
                     String::new()
-                } else if let Some(origin) = self.candidate_origins.first().cloned() {
-                    if !self.is_clipboard_candidate(0) {
-                        self.learn_current_candidate(origin.canonical(), 0, imported, retention);
-                    }
+                } else if !self.candidate_origins.is_empty() {
                     self.select_candidate_on_backend(0, clipboard, imported, retention)?
                         .unwrap_or_default()
                 } else {
@@ -2271,29 +2256,95 @@ impl EngineState {
             }
         }
 
-        merged.sort_by(|a, b| {
-            // Negative personal scores remove a boost; dictionary order remains the tie-breaker.
+        let candidate_group = |origin: &CandidateOrigin| match origin {
             // Functional commands, macros and explicit paste shortcuts retain their order.
-            let priority = |origin: &CandidateOrigin| {
-                matches!(
-                    origin,
-                    CandidateOrigin::Overlay {
-                        is_clipboard: true,
-                        ..
-                    }
-                )
-            };
-            match (priority(&a.1), priority(&b.1)) {
-                (true, true) => std::cmp::Ordering::Equal,
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                (false, false) => b.0.pinned.cmp(&a.0.pinned).then_with(|| {
-                    b.0.frecency_score
-                        .max(0.0)
-                        .total_cmp(&a.0.frecency_score.max(0.0))
-                }),
+            CandidateOrigin::Overlay {
+                is_clipboard: true, ..
+            } => 0,
+            CandidateOrigin::PureRust { consumed_len, .. }
+                if *consumed_len < self.raw_input.len() =>
+            {
+                2
             }
+            _ => 1,
+        };
+        merged.sort_by(|a, b| {
+            let group = candidate_group(&a.1);
+            group.cmp(&candidate_group(&b.1)).then_with(|| {
+                if group == 1 {
+                    // Negative personal scores remove a boost; dictionary order breaks ties.
+                    b.0.pinned.cmp(&a.0.pinned).then_with(|| {
+                        b.0.frecency_score
+                            .max(0.0)
+                            .total_cmp(&a.0.frecency_score.max(0.0))
+                    })
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
         });
+        let has_sentence = merged.iter().any(|(item, origin)| {
+            matches!(origin, CandidateOrigin::PureRust { consumed_len, .. }
+                if *consumed_len == self.raw_input.len())
+                && item.comment.split_whitespace().count() > 1
+                && (self.schema == SchemaKind::DoublePinyinFlypy
+                    || item
+                        .comment
+                        .chars()
+                        .filter(|ch| !ch.is_whitespace())
+                        .eq(self.raw_input.chars().filter(|ch| ch.is_ascii_alphabetic())))
+        });
+        if has_sentence {
+            if let Some(partial_at) = merged
+                .iter()
+                .position(|(_, origin)| candidate_group(origin) == 2)
+            {
+                let priority_count = merged
+                    .iter()
+                    .take_while(|(_, origin)| candidate_group(origin) == 0)
+                    .count();
+                let personal_count = merged[priority_count..partial_at]
+                    .iter()
+                    .take_while(|(item, origin)| {
+                        item.pinned
+                            || origin.features()[..6].iter().any(|&v| v > 0.0)
+                            || origin.features()[7] > 0.0
+                    })
+                    .count();
+                // Keep every personal full match and at least two full matches ahead of prefixes.
+                let head_count = (priority_count + personal_count.max(2)).min(partial_at);
+                let partials = merged.split_off(partial_at);
+                let rest_full = merged.split_off(head_count);
+                let mut prefixes = Vec::new();
+                let mut singles = Vec::new();
+                let mut remaining = Vec::new();
+                let mut lengths = HashSet::new();
+                for pair in partials {
+                    let CandidateOrigin::PureRust {
+                        consumed_len,
+                        canonical,
+                        ..
+                    } = &pair.1
+                    else {
+                        unreachable!();
+                    };
+                    if canonical.chars().count() > 1 && lengths.insert(*consumed_len) {
+                        prefixes.push(pair);
+                    } else if canonical.chars().count() == 1
+                        && pair.0.comment.split_whitespace().count() == 1
+                        && singles.len() < 2
+                    {
+                        singles.push(pair);
+                    } else {
+                        remaining.push(pair);
+                    }
+                }
+                merged.extend(prefixes);
+                merged.extend(singles);
+                merged.extend(rest_full);
+                merged.extend(remaining);
+            }
+        }
         if let Some((word, score)) = contextual_prediction {
             self.promote_prefix_prediction(&mut merged, &word, score, retention, now_ms);
         }
@@ -2367,9 +2418,11 @@ impl EngineState {
             return false;
         }
         let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
-        if retention.user_phrases.get(word).is_some_and(|p| {
-            (if flypy { &p.xiaohe } else { &p.quanpin }) == code || p.acronym == code
-        }) {
+        if retention
+            .user_phrases
+            .get(word)
+            .is_some_and(|p| p.matches_code(code, flypy) || p.acronym == code)
+        {
             return true;
         }
         let imported_matches = if flypy {
@@ -2384,16 +2437,21 @@ impl EngineState {
             if flypy {
                 crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin) == code
             } else {
-                pinyin.split_whitespace().collect::<String>() == code
+                crate::imp::xiaohe::matches_quanpin_reading(
+                    &pinyin
+                        .split_whitespace()
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                    code,
+                )
             }
         };
         if let Some((syllables, _)) = imported.corpus().word_readings.get(word) {
             return matches(&syllables.join(" "));
         }
-        let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
-            imported.corpus(),
-        ))
-        .annotate_text(word);
+        let ann =
+            crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(imported.corpus()))
+                .annotate_text(word);
         matches(&ann.untoned)
     }
 
@@ -2403,8 +2461,9 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &RetentionEngine,
     ) -> Option<(CandidateItem, CandidateOrigin)> {
-        if !self.config.adaptive_learning
-            || self.raw_input.len() < 4
+        if self.raw_input.len() < 4
+            || (self.schema == SchemaKind::RimeIce
+                && crate::imp::xiaohe::canonical_syllable_set().contains(self.raw_input.as_str()))
             || !self.raw_input.bytes().all(|b| b.is_ascii_lowercase())
             || current_words
                 .into_iter()
@@ -2412,34 +2471,23 @@ impl EngineState {
         {
             return None;
         }
-        let mut swapped = self.raw_input.as_bytes().to_vec();
         let mut best: Option<(CandidateItem, String, f64)> = None;
-        let mut attempts = 0;
-        for i in 0..swapped.len() - 1 {
-            if swapped[i] == swapped[i + 1] {
-                continue;
-            }
-            if attempts == 12 {
-                break;
-            }
-            attempts += 1;
-            swapped.swap(i, i + 1);
-            // All bytes are lowercase ASCII, including after the swap.
-            let code = std::str::from_utf8(&swapped).expect("ASCII pinyin");
+        for code in quanpin::correction_codes(
+            &self.raw_input,
+            self.schema == SchemaKind::DoublePinyinFlypy,
+        ) {
             let recovered = self
                 .pure_rust
-                .query_correction_candidates(code, self.schema, imported, retention)
+                .query_correction_candidates(&code, self.schema, imported, retention)
                 .into_iter()
                 .next();
             if let Some((item, canonical, score)) = recovered {
                 if best.as_ref().is_none_or(|(old, _, old_score)| {
-                    (item.pinned && !old.pinned)
-                        || (item.pinned == old.pinned && score > *old_score)
+                    (item.pinned && !old.pinned) || (item.pinned == old.pinned && score > *old_score)
                 }) {
                     best = Some((item, canonical, score));
                 }
             }
-            swapped.swap(i, i + 1);
         }
         best.map(|(mut item, canonical, _)| {
             let commit_text = self.convert_opencc(&canonical);
@@ -2574,8 +2622,9 @@ impl EngineState {
                 .filter(|c| c.is_ascii_alphabetic())
                 .collect();
             let now_ms = RetentionEngine::now_epoch_ms();
-            let phrases = retention
-                .query_user_phrases(&compact, self.schema == SchemaKind::DoublePinyinFlypy);
+            let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
+            let full_code = if flypy { &compact } else { &self.raw_input };
+            let phrases = retention.query_user_phrases(full_code, flypy);
             let mut learned: Vec<_> = phrases
                 .into_iter()
                 .map(|p| {
@@ -2588,12 +2637,14 @@ impl EngineState {
                     )
                 })
                 .collect();
-            for phrase in retention.query_acronym_phrases(&compact) {
-                learned.push((
-                    phrase.word.as_str(),
-                    "简拼",
-                    self.contextual_score(retention, &phrase.word, now_ms) + 1.0,
-                ));
+            if flypy || !crate::imp::xiaohe::canonical_syllable_set().contains(compact.as_str()) {
+                for phrase in retention.query_acronym_phrases(&compact) {
+                    learned.push((
+                        phrase.word.as_str(),
+                        "简拼",
+                        self.contextual_score(retention, &phrase.word, now_ms) + 1.0,
+                    ));
+                }
             }
             let continuations = self
                 .previous_context(now_ms)
@@ -2751,7 +2802,8 @@ impl EngineState {
                     OpenCcMode::Simplified,
                     Some(imported),
                     Some(retention),
-                    self.prefix_prediction_context(RetentionEngine::now_epoch_ms()).as_deref(),
+                    self.prefix_prediction_context(RetentionEngine::now_epoch_ms())
+                        .as_deref(),
                     self.active_app_id.as_deref(),
                     self.config.adaptive_learning,
                 );
@@ -2798,6 +2850,46 @@ impl EngineState {
         (overlay, seen)
     }
 
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    fn apply_rime_selection(
+        &mut self,
+        snapshot: rime_ffi::RimeSnapshot,
+        canonical: &str,
+        index: usize,
+        clipboard: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Option<String> {
+        let before = self.raw_input.clone();
+        if let Some(committed) = snapshot.commit_text {
+            let code = format!("{}{before}", self.pending_phrase_code);
+            let feedback = (self.pending_phrase_selections == 0 && canonical == committed)
+                .then(|| self.selection_feedback(index))
+                .flatten();
+            self.record_candidate_commit(
+                &committed, &code, feedback, imported, retention, RetentionEngine::now_epoch_ms(),
+            );
+            self.track_phrase_selection(canonical, &before, true, imported, retention);
+            self.clear_composition_state();
+            return Some(self.convert_opencc(&committed));
+        }
+        if !snapshot.preedit.is_empty() || !snapshot.candidates.is_empty() {
+            let confirmed = self.pure_rust.confirmed_prefix.len();
+            self.apply_rime_snapshot(snapshot, false, false, clipboard, imported, retention);
+            if self.pure_rust.confirmed_prefix.len() > confirmed {
+                let compact = |code: &str| code.replace(['\'', ' '], "");
+                let before = compact(&before);
+                let tail = compact(&self.raw_input);
+                if let Some(consumed) = before.strip_suffix(&tail).filter(|s| !s.is_empty()) {
+                    self.track_phrase_selection(canonical, consumed, false, imported, retention);
+                }
+            }
+        } else {
+            self.clear_composition_state();
+        }
+        None
+    }
+
     pub(crate) fn select_candidate_on_backend(
         &mut self,
         index: usize,
@@ -2823,6 +2915,7 @@ impl EngineState {
                     commit_text
                 };
                 if !is_clipboard {
+                    self.learn_current_candidate(&canonical, index, imported, retention);
                     let code = self.raw_input.clone();
                     self.track_phrase_selection(&canonical, &code, true, imported, retention);
                 }
@@ -2832,42 +2925,21 @@ impl EngineState {
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             CandidateOrigin::Rime {
                 rime_page_idx,
-                commit_text,
                 canonical,
                 ..
             } => {
-                if let (Some(sid), Some(ref assets_dir)) =
+                let (Some(sid), Some(assets_dir)) =
                     (self.rime_session_id, &self.resolved_assets_dir)
-                {
-                    let snap = rime_ffi::with_runtime(
-                        assets_dir,
-                        &self.config.cache_dir,
-                        &self.config.data_dir,
-                        |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
-                    )?;
-                    if let Some(committed) = snap.commit_text {
-                        let code = self.raw_input.clone();
-                        self.track_phrase_selection(&canonical, &code, true, imported, retention);
-                        self.clear_composition_state();
-                        return Ok(Some(self.convert_opencc(&committed)));
-                    }
-                    if !snap.preedit.is_empty() || !snap.candidates.is_empty() {
-                        let before = self.raw_input.clone();
-                        let _ = self.apply_rime_snapshot(
-                            snap, false, false, clipboard, imported, retention,
-                        );
-                        if let Some(consumed) = before.strip_suffix(&self.raw_input) {
-                            if !consumed.is_empty() {
-                                self.track_phrase_selection(
-                                    &canonical, consumed, false, imported, retention,
-                                );
-                            }
-                        }
-                        return Ok(None);
-                    }
-                }
-                self.clear_composition_state();
-                Ok(Some(commit_text))
+                else {
+                    return Ok(None);
+                };
+                let snapshot = rime_ffi::with_runtime(
+                    assets_dir,
+                    &self.config.cache_dir,
+                    &self.config.data_dir,
+                    |rt| rt.select_candidate_on_current_page(sid, rime_page_idx),
+                )?;
+                Ok(self.apply_rime_selection(snapshot, &canonical, index, clipboard, imported, retention))
             }
             CandidateOrigin::PureRust {
                 commit_text,
@@ -2875,6 +2947,7 @@ impl EngineState {
                 canonical,
                 ..
             } => {
+                self.learn_current_candidate(&canonical, index, imported, retention);
                 let prefix = self.confirmed_non_ascii_prefix();
                 let final_commit = if !prefix.is_empty() {
                     format!("{}{}", self.convert_opencc(&prefix), commit_text)
@@ -2892,6 +2965,7 @@ impl EngineState {
                     imported,
                     retention,
                 );
+                let confirmed = format!("{}{}", self.pure_rust.confirmed_prefix, canonical);
                 let pending = (
                     std::mem::take(&mut self.pending_phrase_text),
                     std::mem::take(&mut self.pending_phrase_code),
@@ -2899,6 +2973,7 @@ impl EngineState {
                 );
                 self.clear_composition_state();
                 if !remaining.is_empty() {
+                    self.pure_rust.confirmed_prefix = confirmed;
                     (
                         self.pending_phrase_text,
                         self.pending_phrase_code,
@@ -3093,6 +3168,522 @@ mod personalization_tests {
                 commit_text: word.into(),
             },
         )]);
+    }
+
+    #[test]
+    fn partial_selection_keeps_canonical_context_without_duplicate_commits() {
+        for keyboard in [false, true] {
+            let (mut e, clip, imp, mut r) = fixture();
+            offer(&mut e, "云", "yunli");
+            if let CandidateOrigin::PureRust { consumed_len, .. } = &mut e.candidate_origins[0] {
+                *consumed_len = 3;
+            }
+            let first = if keyboard {
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap()
+                    .commit_text
+            } else {
+                e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                    .unwrap()
+            };
+            assert_eq!(first.as_deref(), Some("云"));
+            assert_eq!(e.raw_input, "li");
+            assert_eq!(e.pure_rust.confirmed_prefix, "云");
+            offer(&mut e, "璃", "li");
+            if keyboard {
+                e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)
+                    .unwrap();
+            } else {
+                e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                    .unwrap();
+            }
+            assert_eq!(e.speech_context_before(), "云璃");
+            assert!(!r
+                .context_bigrams
+                .get("璃")
+                .is_some_and(|b| b.contains_key("云璃")));
+            assert_eq!(r.user_phrases["云璃"].count, 1);
+            assert!(e.pure_rust.confirmed_prefix.is_empty());
+            offer(&mut e, "云", "yunli");
+            if let CandidateOrigin::PureRust { consumed_len, .. } = &mut e.candidate_origins[0] {
+                *consumed_len = 3;
+            }
+            e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                .unwrap();
+            offer(&mut e, "璃", "li");
+            e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                .unwrap();
+            assert_eq!(r.user_phrases["云璃"].count, 2);
+        }
+        let (mut e, clip, imp, mut r) = fixture();
+        e.config.adaptive_learning = false;
+        offer(&mut e, "我要", "woyaoquchifan");
+        if let CandidateOrigin::PureRust { consumed_len, .. } = &mut e.candidate_origins[0] {
+            *consumed_len = 5;
+        }
+        e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+            .unwrap();
+        assert_eq!(e.raw_input, "quchifan");
+        assert_eq!(e.pure_rust.confirmed_prefix, "我要");
+        e.last_committed_ms = 0;
+        e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+        assert_eq!(e.pure_rust.confirmed_prefix, "我要");
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_confirmed_prefix_retracts_when_preedit_returns_to_pinyin() {
+        let (mut e, _, _, _) = fixture();
+        e.sync_raw_input_from_preedit("我要quchifan");
+        assert_eq!(e.pure_rust.confirmed_prefix, "我要");
+        e.sync_raw_input_from_preedit("woyaoquchifan");
+        assert!(e.pure_rust.confirmed_prefix.is_empty());
+    }
+
+    #[test]
+    fn multi_character_regret_requires_exact_deletion_and_restores_context() {
+        for deleted in [1, 2, 3] {
+            let (mut e, clip, imp, mut r) = fixture();
+            for (word, code) in [("请", "qing"), ("指导", "zhidao")] {
+                offer(&mut e, word, code);
+                e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                    .unwrap();
+            }
+            e.notify_deleted_chars(deleted);
+            offer(&mut e, "知道", "zhidao");
+            e.select_candidate_on_backend(0, &clip, &imp, &mut r)
+                .unwrap();
+            if deleted == 2 {
+                assert_eq!(e.speech_context_before(), "请知道");
+                assert!(r.context_bigrams["请"].contains_key("知道"));
+                assert!(!r
+                    .context_bigrams
+                    .get("指导")
+                    .is_some_and(|b| b.contains_key("知道")));
+                assert!(r.frecency["指导"] <= 0.5);
+            } else {
+                assert!(r.frecency["指导"] > 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn frequent_polyphones_keep_priority_only_for_the_learned_reading() {
+        let (mut e, clip, imp, _) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        for (word, learned, other) in [
+            ("的", "de", "di"),
+            ("会", "hui", "kuai"),
+            ("说", "shuo", "shui"),
+            ("了", "le", "liao"),
+        ] {
+            let mut r = RetentionEngine::default();
+            let now = RetentionEngine::now_epoch_ms();
+            for _ in 0..30 {
+                r.record_contextual_selection(word, learned, None, None, now, 1.0, true);
+            }
+            for (code, matches) in [(other, false), (learned, true)] {
+                e.clear_composition_state();
+                e.raw_input = code.into();
+                let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+                assert!(!action.candidates.is_empty());
+                assert_eq!(
+                    action.candidates[0].text == word,
+                    matches,
+                    "{code}: {:?}",
+                    action.candidates
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rarely_selected_polyphone_reading_keeps_dictionary_priority_in_both_schemas() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let (mut engine, clipboard, imported, mut ret) = fixture();
+            engine.schema = schema;
+            let encode = |pinyin: &str| {
+                if schema == SchemaKind::RimeIce {
+                    pinyin.to_string()
+                } else {
+                    crate::imp::xiaohe::syllable_to_xiaohe(pinyin)
+                }
+            };
+            let now = RetentionEngine::now_epoch_ms();
+            let hui = encode("hui");
+            let kuai = encode("kuai");
+            for _ in 0..100 {
+                ret.record_contextual_selection("会", &hui, None, None, now, 1.0, true);
+            }
+            ret.record_contextual_selection("会", &kuai, None, None, now, 1.0, true);
+            assert!(ret.reading_frecency_at("会", "hui", schema == SchemaKind::RimeIce, now) > 90.0);
+            assert_eq!(ret.reading_frecency_at("会", "kuai", schema == SchemaKind::RimeIce, now), 0.0);
+            engine.raw_input = kuai;
+            let action = engine.process_key_pure_rust(0, &clipboard, &imported, &mut ret).unwrap();
+            assert_eq!(action.candidates[0].text, "快", "{schema:?}");
+        }
+    }
+
+    #[test]
+    fn real_phrase_selection_cannot_override_a_complete_syllable_with_its_acronym() {
+        let (mut engine, clipboard, imported, mut ret) = fixture();
+        for _ in 0..2 {
+            engine.raw_input = "fangan".into();
+            let action = engine.process_key_pure_rust(0, &clipboard, &imported, &mut ret).unwrap();
+            let index = action.candidates.iter().position(|c| c.text == "方案").unwrap();
+            assert_eq!(
+                engine.select_candidate_on_backend(index, &clipboard, &imported, &mut ret).unwrap().as_deref(),
+                Some("方案"),
+            );
+            engine.reset_commit_context();
+        }
+        assert_eq!(ret.query_acronym_phrases("fa")[0].word, "方案");
+        engine.raw_input = "fa".into();
+        let action = engine.process_key_pure_rust(0, &clipboard, &imported, &mut ret).unwrap();
+        assert_eq!(action.candidates[0].text.chars().count(), 1);
+        assert!(action.candidates.iter().all(|c| c.text != "方案"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_selection_learns_only_after_commit_and_tracks_the_consumed_prefix() {
+        let (mut engine, clipboard, imported, mut ret) = fixture();
+        let snapshot = |preedit: &str, commit_text: Option<&str>| rime_ffi::RimeSnapshot {
+            commit_text: commit_text.map(str::to_owned),
+            preedit: preedit.into(),
+            cursor_utf8: preedit.len(),
+            page_index: 0,
+            page_size: 5,
+            has_prev: false,
+            has_next: false,
+            candidates: Vec::new(),
+        };
+        for commit in [false, true] {
+            engine.raw_input = "ni'hao".into();
+            assert_eq!(
+                engine.apply_rime_selection(snapshot("你hao", None), "你", 0, &clipboard, &imported, &mut ret),
+                None,
+            );
+            assert_eq!(engine.raw_input, "hao");
+            assert_eq!(engine.pending_phrase_code, "ni");
+            assert!(engine.speech_context_before().is_empty());
+            assert!(ret.code_preferences.is_empty());
+            if commit {
+                assert_eq!(
+                    engine.apply_rime_selection(snapshot("", Some("你好")), "好", 0, &clipboard, &imported, &mut ret).as_deref(),
+                    Some("你好"),
+                );
+            } else {
+                engine.process_key(27, 0, SwipeDir::None, &clipboard, &imported, &mut ret).unwrap();
+                assert!(engine.pending_phrase_code.is_empty());
+                assert!(ret.frecency.is_empty());
+            }
+        }
+        assert_eq!(engine.speech_context_before(), "你好");
+        assert!(ret.code_preferences["nihao"].contains_key("你好"));
+        assert!(!ret.code_preferences.contains_key("hao"));
+    }
+
+    #[test]
+    fn frequent_abbreviations_do_not_override_legal_syllables() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        let now = RetentionEngine::now_epoch_ms();
+        for (word, code) in [
+            ("方案", "fangan"),
+            ("平安", "pingan"),
+            ("答案", "daan"),
+            ("第二", "dier"),
+            ("公安", "gongan"),
+        ] {
+            for _ in 0..30 {
+                r.record_contextual_selection(word, code, None, None, now, 1.0, true);
+            }
+        }
+        for (code, excluded) in [
+            ("fa", "方案"),
+            ("pa", "平安"),
+            ("da", "答案"),
+            ("de", "第二"),
+            ("ga", "公安"),
+        ] {
+            e.clear_composition_state();
+            e.raw_input = code.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            assert_eq!(
+                action.candidates[0].text.chars().count(),
+                1,
+                "{code}: {:?}",
+                action.candidates
+            );
+            assert_ne!(action.candidates[0].text, excluded);
+        }
+        for code in ["nh", "srf", "wsm"] {
+            e.clear_composition_state();
+            e.raw_input = code.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            assert!(
+                action.candidates.iter().any(|c| {
+                    c.text.chars().count() >= 2
+                        && c.comment.split_whitespace().filter_map(|s| s.chars().next()).collect::<String>() == code
+                }),
+                "{code}: {:?}",
+                action.candidates
+            );
+        }
+    }
+
+    #[test]
+    fn nonpersonal_priors_preserve_selectable_sentence_prefixes() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        for prior in [6, 8] {
+            e.clear_composition_state();
+            r.reranker.weights[8] = if prior == 8 { 1.0 } else { 0.0 };
+            if prior == 6 {
+                e.cached_mlm_priors = e
+                    .pure_rust
+                    .get_corpus()
+                    .char_readings
+                    .keys()
+                    .map(|&ch| (ch, 0.5))
+                    .collect();
+            }
+            e.raw_input = "woyaoquka".into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            assert!(e.candidate_origins.iter().take(2).all(|origin| matches!(
+                origin,
+                CandidateOrigin::PureRust {
+                    consumed_len: 9,
+                    ..
+                }
+            )));
+            for features in e.candidate_features.iter().take(2) {
+                assert!(features[prior] > 0.0);
+                assert_eq!(&features[..6], &[0.0; 6]);
+                assert_eq!(features[7], 0.0);
+            }
+            assert_eq!(
+                action.candidates[2].text, "我要去",
+                "prior={prior}: {:?}",
+                action.candidates
+            );
+            assert!(
+                matches!(e.candidate_origins[2], CandidateOrigin::PureRust { consumed_len, .. } if consumed_len < e.raw_input.len())
+            );
+        }
+    }
+
+    #[test]
+    fn late_homophones_are_reachable_on_portable_candidate_pages() {
+        let (mut e, clip, _, mut r) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        let imp = ImportedLexiconIndex::new(Some(&assets));
+        for (schema, code, syllable) in [
+            (SchemaKind::RimeIce, "shi", "shi"),
+            (SchemaKind::RimeIce, "yi", "yi"),
+            (SchemaKind::DoublePinyinFlypy, "ui", "shi"),
+        ] {
+            let bucket = &e.pure_rust.get_corpus().spaced_pinyin_to_words[syllable];
+            assert!(bucket.len() > 48);
+            let late_word = bucket[48].0.clone();
+            e.clear_composition_state();
+            e.schema = schema;
+            e.raw_input = code.into();
+            let mut action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            let mut seen = HashSet::new();
+            loop {
+                seen.extend(action.candidates.iter().map(|c| c.text.clone()));
+                if !action.page.has_next {
+                    break;
+                }
+                assert!(action.page.page_index < 60);
+                action = e
+                    .process_key_pure_rust(0xFF56, &clip, &imp, &mut r)
+                    .unwrap();
+            }
+            assert!(seen.len() > 48, "{code}: {}", seen.len());
+            assert!(seen.contains(&late_word), "{code}: missing {late_word}");
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_merge_keeps_personal_prefixes_behind_full_readings() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let imp = ImportedLexiconIndex::new(Some(&assets));
+        for (schema, code, prefix, prefix_code, full, native_prefix) in [
+            (SchemaKind::RimeIce, "dibu", "地", "di", "底部", Some("地")),
+            (
+                SchemaKind::DoublePinyinFlypy,
+                "woycquka",
+                "我要",
+                "woyc",
+                "我要去卡",
+                None,
+            ),
+        ] {
+            let (mut e, clip, _, mut r) = fixture();
+            e.schema = schema;
+            e.pure_rust = PureRustEngine::new(Some(&assets));
+            e.raw_input = code.into();
+            let now = RetentionEngine::now_epoch_ms();
+            r.record_contextual_selection(prefix, prefix_code, None, None, now, 100.0, true);
+            r.pin_word(prefix);
+            let mut candidates = vec![rime_ffi::RimeRawCandidate {
+                text: full.into(),
+                comment: String::new(),
+            }];
+            if let Some(word) = native_prefix {
+                candidates.push(rime_ffi::RimeRawCandidate {
+                    text: word.into(),
+                    comment: String::new(),
+                });
+            }
+            let snapshot = rime_ffi::RimeSnapshot {
+                commit_text: None,
+                preedit: code.into(),
+                cursor_utf8: code.len(),
+                page_index: 0,
+                page_size: 5,
+                has_prev: false,
+                has_next: false,
+                candidates,
+            };
+            let action = e.apply_rime_snapshot(snapshot, false, false, &clip, &imp, &r);
+            assert_eq!(
+                action.candidates[0].text, full,
+                "{code}: {:?}",
+                action.candidates
+            );
+            assert!(!e.candidate_origins.iter().any(|origin| matches!(origin, CandidateOrigin::PureRust { consumed_len, .. } if *consumed_len < code.len())));
+            if native_prefix.is_none() {
+                assert!(!action.candidates.iter().any(|c| c.text == prefix));
+            } else {
+                assert!(action
+                    .candidates
+                    .iter()
+                    .any(|c| c.text == prefix && c.pinned));
+            }
+        }
+    }
+
+    #[test]
+    fn personal_single_characters_do_not_displace_dibu_words() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        e.config.platform = "android".into();
+        let now = RetentionEngine::now_epoch_ms();
+        for (word, code, count) in [("的", "de", 30), ("地", "di", 10), ("不", "bu", 20)] {
+            for _ in 0..count {
+                r.record_contextual_selection(word, code, None, None, now, 1.0, true);
+            }
+        }
+        for pinned in [false, true] {
+            if pinned {
+                r.pin_word("的");
+            }
+            e.raw_input = "dibu".into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            let words: Vec<_> = action.candidates.iter().map(|c| c.text.as_str()).collect();
+            assert_eq!(words[0], "底部", "pinned={pinned}: {words:?}");
+            for word in ["底部", "地步"] {
+                let rank = words.iter().position(|w| *w == word).unwrap();
+                for other in ["的", "地", "的不", "的部", "的步"] {
+                    if let Some(other_rank) = words.iter().position(|w| *w == other) {
+                        assert!(rank < other_rank, "pinned={pinned}: {words:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn personal_prefixes_do_not_displace_full_sentences_or_typo_corrections() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        let now = RetentionEngine::now_epoch_ms();
+        for (word, code, count) in [("似乎", "sihu", 10), ("时", "shi", 15)] {
+            for _ in 0..count {
+                r.record_contextual_selection(word, code, None, None, now, 1.0, true);
+            }
+        }
+        for code in ["sihuyoudianwenti", "sihuyoudianwrnti"] {
+            e.raw_input = code.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            assert_eq!(
+                action.candidates[0].text, "似乎有点问题",
+                "{code}: {:?}",
+                action.candidates
+            );
+            assert!(matches!(
+                e.candidate_origins[0],
+                CandidateOrigin::PureRust { consumed_len, .. } if consumed_len == code.len()
+            ));
+        }
+    }
+
+    #[test]
+    fn personal_full_matches_preserve_selectable_sentence_prefixes() {
+        let (mut e, clip, imp, _) = fixture();
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        e.pure_rust = PureRustEngine::new(Some(&assets));
+        e.config.platform = "android".into();
+        let code = "woyaoquka";
+        let full_words: Vec<_> = e
+            .pure_rust
+            .query_all_candidates_contextual(
+                code,
+                e.schema,
+                e.opencc_mode,
+                Some(&imp),
+                None,
+                None,
+                None,
+                true,
+            )
+            .into_iter()
+            .filter(|c| c.consumed_len == code.len())
+            .take(3)
+            .map(|c| c.canonical)
+            .collect();
+        assert_eq!(full_words.len(), 3);
+        for personal_count in [0, 1, 3] {
+            let mut r = RetentionEngine::default();
+            let now = RetentionEngine::now_epoch_ms();
+            r.record_selection_at("我要", now, 10.0);
+            r.record_selection_at("我", now, 15.0);
+            r.pin_word("我");
+            for word in full_words.iter().take(personal_count) {
+                r.record_selection_at(word, now, 5.0);
+            }
+            e.raw_input = code.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
+            let head_count = personal_count.max(2);
+            assert!(e.candidate_origins.iter().take(head_count).all(|origin| matches!(
+                origin, CandidateOrigin::PureRust { consumed_len, .. } if *consumed_len == code.len()
+            )), "personal_count={personal_count}: {:?}", action.candidates);
+            for word in full_words.iter().take(personal_count) {
+                assert!(action
+                    .candidates
+                    .iter()
+                    .take(head_count)
+                    .any(|c| &c.text == word));
+            }
+            for word in ["我要去", "我要", "我", "握"] {
+                assert!(
+                    action.candidates.iter().any(|c| c.text == word),
+                    "personal_count={personal_count}: {:?}",
+                    action.candidates
+                );
+            }
+        }
     }
 
     #[test]
@@ -3604,7 +4195,16 @@ mod personalization_tests {
         e.clear_composition_state();
         e.config.adaptive_learning = false;
         type_code(&mut e, "nihoa", &clip, &imp, &mut r);
-        assert!(!e.current_candidates.iter().any(|c| c.comment == "纠错"));
+        assert!(!e.current_candidates.iter().any(|c| c.text == "你好"));
+        e.clear_composition_state();
+        let mut fresh = RetentionEngine::default();
+        type_code(&mut e, "nihoa", &clip, &imp, &mut fresh);
+        assert!(e.current_candidates.iter().any(|c| c.text == "你好"));
+        e.clear_composition_state();
+        e.schema = SchemaKind::DoublePinyinFlypy;
+        e.raw_input = "nich".into();
+        let recovered = e.recover_transposition(std::iter::empty(), &imp, &fresh).unwrap();
+        assert_eq!(recovered.1.canonical(), "你好");
     }
 
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
@@ -3932,7 +4532,7 @@ mod personalization_tests {
             .clone();
         assert_eq!(p.source, "typed");
         for (schema, code) in [
-            (SchemaKind::RimeIce, p.quanpin),
+            (SchemaKind::RimeIce, p.quanpin.replace(' ', "")),
             (SchemaKind::DoublePinyinFlypy, p.xiaohe),
         ] {
             e.set_schema(schema);
