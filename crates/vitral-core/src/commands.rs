@@ -32,8 +32,13 @@ fn keycode(key: &str) -> Result<u32> {
         "Return" | "Enter" => 13,
         "Escape" => 27,
         "BackSpace" | "Backspace" => 8,
+        "Home" => 0xff50,
+        "Left" => 0xff51,
+        "Right" => 0xff53,
         "Page_Up" | "PageUp" => 0xff55,
         "Page_Down" | "PageDown" => 0xff56,
+        "End" => 0xff57,
+        "Delete" => 0xffff,
         "" => 0,
         key if key
             .strip_prefix('F')
@@ -121,6 +126,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         }
         "shortcut-key" => to_value(core.shortcut_key(string(v, "key")?)?)?,
         "set-syllable-split" => to_value(core.set_syllable_split(arg(v, "enabled")?)?)?,
+        "set-preedit-cursor" => to_value(core.set_preedit_cursor(arg(v, "cursor_utf8")?)?)?,
         "candidate-state" => to_value(core.candidate_state()?)?,
         "select-candidate" => to_value(core.select_candidate(arg(v, "idx")?)?)?,
         "pin-candidate" => to_value(core.pin_candidate(arg(v, "idx")?)?)?,
@@ -171,6 +177,8 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "clipboard-state" => to_value(core.clipboard_state())?,
         "poll-services" => to_value(core.poll_services()?)?,
         "clipboard-poll" => to_value(core.poll_clipboard()?)?,
+        "clipboard-poll-current" => to_value(core.poll_clipboard_current()?)?,
+        "clipboard-lan-revision" => json!(core.clipboard_lan_revision()),
         "hide-quick-paste-for-input" => { core.hide_quick_paste_for_input(); to_value(core.quick_paste_state())? },
         "quick-paste-state" => to_value(core.quick_paste_state())?,
         "consume-quick-paste" => to_value(core.consume_quick_paste())?,

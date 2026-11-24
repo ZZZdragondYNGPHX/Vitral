@@ -23,6 +23,20 @@ use vitral_tokens::TOKENS;
 pub const MOD_LANG_TOGGLE: u32 = 1 << 30;
 pub const MOD_VOICE_HOLD: u32 = 1 << 29;
 
+const KEY_HOME: u32 = 0xff50;
+const KEY_LEFT: u32 = 0xff51;
+const KEY_RIGHT: u32 = 0xff53;
+const KEY_END: u32 = 0xff57;
+const KEY_DELETE: u32 = 0xffff;
+
+fn clamp_cursor(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor -= 1;
+    }
+    cursor
+}
+
 fn map_zh_punctuation(ch: char) -> Option<&'static str> {
     match ch {
         ',' | '，' => Some("，"),
@@ -78,6 +92,15 @@ pub enum SwipeDir {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum TypoCorrectionLevel {
+    Off,
+    Conservative,
+    #[default]
+    Standard,
+    Aggressive,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct EngineConfig {
     #[serde(default = "default_enabled")]
@@ -94,6 +117,8 @@ pub struct EngineConfig {
     pub adaptive_learning: bool,
     #[serde(default)]
     pub fuzzy_pinyin: bool,
+    #[serde(default = "default_typo_correction_level")]
+    pub typo_correction_level: String,
     #[serde(default)]
     pub syllable_split: bool,
     #[serde(default = "default_enabled")]
@@ -159,6 +184,18 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    pub(crate) fn validated_typo_correction_level(&self) -> Result<TypoCorrectionLevel, VitralError> {
+        match self.typo_correction_level.as_str() {
+            "off" => Ok(TypoCorrectionLevel::Off),
+            "conservative" => Ok(TypoCorrectionLevel::Conservative),
+            "standard" => Ok(TypoCorrectionLevel::Standard),
+            "aggressive" => Ok(TypoCorrectionLevel::Aggressive),
+            _ => Err(VitralError::InvalidArgument(
+                "typo_correction_level must be off, conservative, standard or aggressive".into(),
+            )),
+        }
+    }
+
     pub fn validate_prediction(&self) -> Result<(), VitralError> {
         if !(150..=2000).contains(&self.prediction_delay_ms) {
             return Err(VitralError::InvalidArgument("prediction_delay_ms must be 150..2000".into()));
@@ -183,6 +220,7 @@ impl EngineConfig {
         let config: Self = serde_json::from_value(value).map_err(|e| VitralError::Parse(e.to_string()))?;
         if let Some(url) = config.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { crate::models::validate_url(url)?; }
         config.validate_prediction()?;
+        config.validated_typo_correction_level()?;
         Ok(config)
     }
 }
@@ -197,6 +235,7 @@ impl std::fmt::Debug for EngineConfig {
             .field("state_dir", &self.state_dir)
             .field("schema", &self.schema)
             .field("opencc_mode", &self.opencc_mode)
+            .field("typo_correction_level", &self.typo_correction_level)
             .field("pure_offline", &self.pure_offline)
             .field("device_id", &self.device_id)
             .field("device_name", &self.device_name)
@@ -220,6 +259,10 @@ impl std::fmt::Debug for EngineConfig {
 }
 
 fn default_prediction_delay() -> u64 { 380 }
+
+fn default_typo_correction_level() -> String {
+    "standard".into()
+}
 
 fn default_enabled() -> bool { true }
 
@@ -252,6 +295,7 @@ impl Default for EngineConfig {
             linux_english_mode: true,
             adaptive_learning: true,
             fuzzy_pinyin: false,
+            typo_correction_level: default_typo_correction_level(),
             syllable_split: false,
             learn_from_clipboard: true,
             data_dir: String::new(),
@@ -432,6 +476,7 @@ pub struct EngineState {
     pub app_lang_memory: HashMap<String, LangMode>,
     pub composing: String,
     pub raw_input: String,
+    raw_cursor: usize,
     pending_phrase_text: String,
     pending_phrase_code: String,
     pending_phrase_selections: usize,
@@ -449,6 +494,8 @@ pub struct EngineState {
     rime_first_has_next: bool,
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
     rime_session_id: Option<rime_ffi::RimeSessionId>,
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    rime_input_start: Option<usize>,
 }
 
 impl std::fmt::Debug for EngineState {
@@ -501,6 +548,7 @@ impl EngineState {
             (!config.data_dir.is_empty()).then(|| Path::new(&config.data_dir)),
         );
         pure_rust.fuzzy_pinyin = config.fuzzy_pinyin;
+        pure_rust.typo_correction_level = config.validated_typo_correction_level().unwrap_or_default();
         pure_rust.syllable_split = config.syllable_split;
         let mut engine = Self {
             schema: config.schema,
@@ -529,6 +577,7 @@ impl EngineState {
             app_lang_memory: HashMap::new(),
             composing: String::new(),
             raw_input: String::new(),
+            raw_cursor: 0,
             pending_phrase_text: String::new(),
             pending_phrase_code: String::new(),
             pending_phrase_selections: 0,
@@ -551,6 +600,8 @@ impl EngineState {
             rime_first_has_next: false,
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             rime_session_id: None,
+            #[cfg(all(target_os = "linux", feature = "native-rime"))]
+            rime_input_start: None,
         };
         engine.current_page.page_size = engine.candidate_page_size();
         engine
@@ -573,11 +624,13 @@ impl EngineState {
             self.set_current_candidates(pairs.into_iter().filter(|(c, _)| c.quick_paste_id.is_some()).collect());
             return Ok(self.empty_action(None));
         }
-        if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
-            return self.process_key_pure_rust(0, clipboard, imported, retention);
+        if self.is_passthrough_active() {
+            return Ok(self.build_passthrough_action());
         }
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        if let (Some(sid), Some(assets)) = (self.rime_session_id, self.resolved_assets_dir.clone()) {
+        if let (Some(sid), Some(assets), Some(_)) = (
+            self.rime_session_id, self.resolved_assets_dir.clone(), self.rime_input_start,
+        ) {
             let snap = rime_ffi::with_runtime(&assets, &self.config.cache_dir, &self.config.data_dir, |rt| rt.snapshot(sid))?;
             return Ok(self.apply_rime_snapshot(snap, false, false, clipboard, imported, retention));
         }
@@ -998,6 +1051,9 @@ impl EngineState {
             return;
         }
         self.pending_phrase_text.push_str(canonical);
+        if self.pending_phrase_selections > 0 {
+            self.pending_phrase_code.push(' ');
+        }
         self.pending_phrase_code.push_str(code);
         self.pending_phrase_selections += 1;
         if finished
@@ -1006,25 +1062,45 @@ impl EngineState {
             && (2..=8).contains(&self.pending_phrase_text.chars().count())
         {
             let word = self.pending_phrase_text.clone();
-            let code = self.pending_phrase_code.clone();
+            let code = &self.pending_phrase_code;
+            let compact = code.replace(['\'', ' '], "");
             let now = RetentionEngine::now_epoch_ms();
             let ann = crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(
                 imported.corpus(),
             ))
             .annotate_text(&word);
+            let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned);
+            let acronym = crate::ret::UserPhrase::derive_acronym(&word, &ann.untoned, &xiaohe);
+            let syllables: Vec<_> = ann.untoned.split_whitespace().collect();
+            let parts: Vec<_> = code.split(['\'', ' ']).filter(|part| !part.is_empty()).collect();
+            let full_code = if self.schema == SchemaKind::RimeIce {
+                syllables.concat()
+            } else {
+                xiaohe.clone()
+            };
+            let used_acronym = !acronym.is_empty() && compact != full_code
+                && (compact == acronym
+                    || (parts.len() == word.chars().count() && parts.len() == syllables.len()
+                        && parts.iter().zip(&syllables).all(|(part, syllable)| {
+                            (part.len() == 1 || matches!(*part, "zh" | "ch" | "sh"))
+                                && syllable.starts_with(part)
+                        })));
+            if used_acronym {
+                retention.register_typed_phrase(&word, &ann.untoned, &xiaohe, now);
+                retention.record_acronym_selection(&word, &acronym, &compact, now);
+                return;
+            }
             let (quanpin, xiaohe) = if self.schema == SchemaKind::RimeIce {
                 (
-                    if ann.untoned.split_whitespace().collect::<String>()
-                        == code.replace(['\'', ' '], "")
-                    {
-                        ann.untoned.clone()
+                    if full_code == compact {
+                        ann.untoned
                     } else {
                         code.replace('\'', " ")
                     },
-                    crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned),
+                    xiaohe,
                 )
             } else {
-                (ann.untoned, code.clone())
+                (ann.untoned, compact)
             };
             retention.register_typed_phrase(&word, &quanpin, &xiaohe, now);
         }
@@ -1033,13 +1109,16 @@ impl EngineState {
     pub(crate) fn clear_composition_state(&mut self) {
         self.clear_pending_phrase();
         self.pure_rust.confirmed_prefix.clear();
+        self.pure_rust.confirming_initials = false;
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             self.rime_first_page.clear();
             self.rime_overlay_page = 0;
+            self.rime_input_start = None;
         }
         self.composing.clear();
         self.raw_input.clear();
+        self.raw_cursor = 0;
         self.cursor_utf8 = 0;
         self.current_candidates.clear();
         self.candidate_origins.clear();
@@ -1141,6 +1220,7 @@ impl EngineState {
                 .filter(|p| p.join("rime").is_dir())
             {
                 let sid = self.ensure_rime_session(&assets)?;
+                let restore = !enabled && !self.raw_input.is_empty() && !self.is_passthrough_active();
                 rime_ffi::with_runtime(
                     &assets,
                     &self.config.cache_dir,
@@ -1148,14 +1228,16 @@ impl EngineState {
                     |rt| {
                         rt.clear_composition(sid);
                         // Restore native input before switching back, without committing or learning.
-                        if !enabled {
+                        if restore {
                             for ch in self.raw_input.chars() {
                                 rt.process_key(sid, ch as u32, 0)?;
                             }
+                            rt.set_caret_pos(sid, self.raw_cursor)?;
                         }
                         Ok(())
                     },
                 )?;
+                self.rime_input_start = restore.then_some(0);
             }
             self.rime_first_page.clear();
             self.rime_overlay_page = 0;
@@ -1259,6 +1341,7 @@ impl EngineState {
             0xff1b => 0x1b,
             _ => keycode,
         };
+        let is_cursor_key = matches!(keycode, KEY_LEFT | KEY_RIGHT | KEY_HOME | KEY_END | KEY_DELETE);
         if matches!(keycode, 0x08 | 0x1b) { self.clear_pending_phrase(); }
         if keycode == 0x1b {
             self.reset_commit_context();
@@ -1271,7 +1354,7 @@ impl EngineState {
             }
             self.reset_commit_context();
         }
-        if char::from_u32(keycode).is_some_and(|c| {
+        if !is_cursor_key && char::from_u32(keycode).is_some_and(|c| {
             !c.is_control() && !c.is_ascii_alphanumeric() && c != '\'' && !crate::ret::is_cjk(c)
         }) && (keycode != 0x20 || self.raw_input.is_empty())
         {
@@ -1279,6 +1362,9 @@ impl EngineState {
         }
         if modifiers & MOD_LANG_TOGGLE != 0 {
             self.toggle_lang_mode();
+            return Ok(self.empty_action(None));
+        }
+        if is_cursor_key && self.raw_input.is_empty() && self.composing.is_empty() {
             return Ok(self.empty_action(None));
         }
 
@@ -1319,7 +1405,7 @@ impl EngineState {
             {
                 self.clear_composition_state();
             }
-            if let Some(ch) = char::from_u32(keycode) {
+            if let Some(ch) = char::from_u32(keycode).filter(|_| !is_cursor_key) {
                 if !ch.is_control() {
                     return Ok(self.empty_action(Some(ch.to_string())));
                 }
@@ -1345,7 +1431,9 @@ impl EngineState {
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             if let Some(assets_dir) = self.resolved_assets_dir.clone() {
-                if assets_dir.join("rime").is_dir() {
+                if assets_dir.join("rime").is_dir()
+                    && (self.rime_input_start.is_some() || self.raw_input.is_empty())
+                {
                     return self.process_key_native_rime(
                         &assets_dir,
                         keycode,
@@ -1361,6 +1449,71 @@ impl EngineState {
         self.process_key_pure_rust(keycode, clipboard, imported, retention)
     }
 
+    pub fn set_preedit_cursor(
+        &mut self,
+        cursor_utf8: usize,
+        clipboard: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Result<InputAction, VitralError> {
+        let cursor = clamp_cursor(&self.composing, cursor_utf8);
+        if cursor == self.cursor_utf8 {
+            return Ok(self.empty_action(None));
+        }
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if let (Some(sid), Some(assets), Some(start)) = (
+            self.rime_session_id, &self.resolved_assets_dir, self.rime_input_start,
+        ) {
+            let target = start + self.raw_cursor_for_rime_preedit(cursor);
+            let snap = rime_ffi::with_runtime(
+                assets, &self.config.cache_dir, &self.config.data_dir,
+                |rt| rt.set_caret_pos(sid, target),
+            )?;
+            return Ok(self.apply_rime_snapshot(snap, false, false, clipboard, imported, retention));
+        }
+        #[cfg(not(all(target_os = "linux", feature = "native-rime")))]
+        let _ = (clipboard, imported, retention);
+        self.raw_cursor = clamp_cursor(&self.raw_input, cursor);
+        self.cursor_utf8 = self.raw_cursor;
+        Ok(self.empty_action(None))
+    }
+
+    fn move_raw_cursor(&mut self, keycode: u32) -> bool {
+        self.raw_cursor = match keycode {
+            KEY_LEFT => self.previous_raw_boundary(),
+            KEY_RIGHT => self.raw_input[self.raw_cursor..]
+                .chars().next().map_or(self.raw_cursor, |ch| self.raw_cursor + ch.len_utf8()),
+            KEY_HOME => 0,
+            KEY_END => self.raw_input.len(),
+            _ => return false,
+        };
+        self.cursor_utf8 = self.raw_cursor;
+        true
+    }
+
+    fn previous_raw_boundary(&self) -> usize {
+        self.raw_input[..self.raw_cursor].char_indices().next_back().map_or(0, |(index, _)| index)
+    }
+
+    fn insert_raw_char(&mut self, ch: char) {
+        self.raw_input.insert(self.raw_cursor, ch);
+        self.raw_cursor += ch.len_utf8();
+    }
+
+    fn delete_raw_char(&mut self, backward: bool) -> bool {
+        if backward {
+            if self.raw_cursor == 0 {
+                return false;
+            }
+            self.raw_cursor = self.previous_raw_boundary();
+        }
+        if self.raw_cursor == self.raw_input.len() {
+            return false;
+        }
+        self.raw_input.remove(self.raw_cursor);
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn process_key_pure_rust_for_test(
         &mut self,
@@ -1373,7 +1526,7 @@ impl EngineState {
         self.process_key_pure_rust(keycode, clipboard, imported, &mut cloned)
     }
 
-    fn is_passthrough_active(&self) -> bool {
+    pub(crate) fn is_passthrough_active(&self) -> bool {
         self.raw_input.chars().any(|c| {
             c.is_ascii_uppercase() || matches!(c, ':' | '/' | '@' | '_' | '?' | '.')
         }) || self
@@ -1409,7 +1562,7 @@ impl EngineState {
     fn build_passthrough_action(&mut self) -> InputAction {
         let page_size = self.candidate_page_size();
         self.composing = self.raw_input.clone();
-        self.cursor_utf8 = self.composing.len();
+        self.cursor_utf8 = self.raw_cursor;
         let token = self.raw_input.clone();
         let item = CandidateItem {
             index: 0,
@@ -1448,12 +1601,17 @@ impl EngineState {
         let is_return = keycode == 0x0D || keycode == 0xFF0D;
 
         if self.is_passthrough_active() {
+            if self.move_raw_cursor(keycode) {
+                return Ok(Some(self.empty_action(None)));
+            }
             if is_escape {
                 self.clear_composition_state();
                 return Ok(Some(self.empty_action(None)));
             }
-            if is_backspace {
-                self.raw_input.pop();
+            if is_backspace || keycode == KEY_DELETE {
+                if !self.delete_raw_char(is_backspace) {
+                    return Ok(Some(self.empty_action(None)));
+                }
                 if self.raw_input.is_empty() {
                     self.clear_composition_state();
                     return Ok(Some(self.empty_action(None)));
@@ -1467,16 +1625,18 @@ impl EngineState {
             }
             if let Some(ch) = char::from_u32(keycode) {
                 if !ch.is_control() {
-                    self.raw_input.push(ch);
+                    self.insert_raw_char(ch);
                     return Ok(Some(self.build_passthrough_action()));
                 }
             }
             return Ok(Some(self.build_passthrough_action()));
         }
 
-        if let Some(ch) = char::from_u32(keycode) {
+        if let Some(ch) = char::from_u32(keycode)
+            .filter(|_| !matches!(keycode, KEY_LEFT | KEY_RIGHT | KEY_HOME | KEY_END | KEY_DELETE))
+        {
             if !ch.is_control() && self.should_enter_passthrough(ch) {
-                self.raw_input.push(ch);
+                self.insert_raw_char(ch);
                 #[cfg(all(target_os = "linux", feature = "native-rime"))]
                 if let (Some(sid), Some(ref assets_dir)) =
                     (self.rime_session_id, &self.resolved_assets_dir)
@@ -1490,6 +1650,10 @@ impl EngineState {
                             Ok(())
                         },
                     );
+                }
+                #[cfg(all(target_os = "linux", feature = "native-rime"))]
+                {
+                    self.rime_input_start = None;
                 }
                 return Ok(Some(self.build_passthrough_action()));
             }
@@ -1524,44 +1688,85 @@ impl EngineState {
     }
 
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
-    fn sync_raw_input_from_preedit(&mut self, raw_preedit: &str) {
-        if raw_preedit.is_ascii() {
-            self.pure_rust.confirmed_prefix.clear();
-            return;
-        }
-        let previous_confirmed = self.pure_rust.confirmed_prefix.chars().count();
-        self.pure_rust.confirmed_prefix = raw_preedit.chars().take_while(|c| !c.is_ascii()).collect();
-        let newly_confirmed = self.pure_rust.confirmed_prefix.chars().count()
-            .saturating_sub(previous_confirmed);
-        let tail_start = raw_preedit
-            .char_indices()
-            .find(|(_, c)| c.is_ascii())
-            .map(|(idx, _)| idx)
-            .unwrap_or(raw_preedit.len());
-        let tail_ascii = &raw_preedit[tail_start..];
-        match self.schema {
-            SchemaKind::RimeIce => {
-                self.raw_input = tail_ascii
-                    .chars()
-                    .filter(|c| c.is_ascii_alphabetic() || *c == '\'')
-                    .map(|c| c.to_ascii_lowercase())
-                    .collect();
+    fn rime_cursor_in_raw_prefix(&self, raw: &str, mut display: &str, target: usize) -> usize {
+        // Work back from Rime's caret. Spaces may be added for display and
+        // each expanded Xiaohe syllable may correspond to just two raw bytes.
+        let mut end = raw.len();
+        while target < display.len() {
+            let remaining = &raw[..end];
+            if display.ends_with([' ', '\'']) {
+                if remaining.ends_with([' ', '\'']) {
+                    end -= 1;
+                }
+                display = &display[..display.len() - 1];
+                continue;
             }
-            SchemaKind::DoublePinyinFlypy => {
-                let xh_tail = crate::imp::xiaohe::pinyin_phrase_to_xiaohe(tail_ascii);
-                let compact_raw: String = self
-                    .raw_input
-                    .chars()
-                    .filter(|c| c.is_ascii_alphabetic())
-                    .collect();
-                if !xh_tail.is_empty() && compact_raw.ends_with(&xh_tail) {
-                    self.raw_input = xh_tail;
-                } else {
-                    let drop_n = (newly_confirmed * 2).min(compact_raw.len());
-                    self.raw_input = compact_raw[drop_n..].to_string();
+
+            let start = display.rfind([' ', '\'']).map_or(0, |index| index + 1);
+            let syllable = &display[start..];
+            let mut width = syllable.len();
+            if self.schema == SchemaKind::DoublePinyinFlypy {
+                let code = crate::imp::xiaohe::syllable_to_xiaohe(syllable);
+                if !code.is_empty() && remaining.ends_with(&code) {
+                    width = code.len();
                 }
             }
+            let raw_start = clamp_cursor(raw, end.saturating_sub(width));
+            if target >= start {
+                return clamp_cursor(raw, raw_start + (target - start).min((end - raw_start).saturating_sub(1)));
+            }
+            end = raw_start;
+            display = &display[..start];
         }
+        end
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    fn raw_cursor_for_rime_preedit(&self, cursor: usize) -> usize {
+        let prefix_end = self.composing.find(|c: char| c.is_ascii()).unwrap_or(self.composing.len());
+        if cursor <= prefix_end {
+            return 0;
+        }
+        if cursor >= self.cursor_utf8 {
+            // librime appends the untranslated raw suffix after the caret.
+            return clamp_cursor(&self.raw_input, self.raw_cursor + cursor - self.cursor_utf8);
+        }
+        self.rime_cursor_in_raw_prefix(
+            &self.raw_input[..self.raw_cursor], &self.composing[prefix_end..self.cursor_utf8],
+            cursor - prefix_end,
+        )
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    fn sync_rime_preedit(&mut self, snap: &rime_ffi::RimeSnapshot) {
+        let (preedit, cursor) = if snap.preedit.is_empty() {
+            (&snap.raw_input, snap.raw_cursor)
+        } else {
+            (&snap.preedit, snap.cursor_utf8)
+        };
+        let cursor = clamp_cursor(preedit, cursor);
+        let caret = clamp_cursor(&snap.raw_input, snap.raw_cursor);
+        let prefix_end = preedit.find(|c: char| c.is_ascii()).unwrap_or(preedit.len());
+        let (prefix, tail) = preedit.split_at(prefix_end);
+        let start = if prefix.is_empty() {
+            0
+        } else {
+            self.rime_cursor_in_raw_prefix(&snap.raw_input[..caret], &tail[..cursor.saturating_sub(prefix_end)], 0)
+        };
+        self.rime_input_start = Some(start);
+        self.raw_input = snap.raw_input[start..].to_owned();
+        self.raw_cursor = caret - start;
+        self.pure_rust.confirming_initials = false;
+        self.pure_rust.confirmed_prefix = prefix.to_owned();
+
+        let converted = self.convert_opencc(prefix);
+        self.cursor_utf8 = if cursor < prefix_end {
+            let chars = prefix[..cursor].chars().count();
+            converted.char_indices().nth(chars).map_or(converted.len(), |(index, _)| index)
+        } else {
+            converted.len() + cursor - prefix_end
+        };
+        self.composing = converted + tail;
     }
 
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
@@ -1585,31 +1790,13 @@ impl EngineState {
         }
 
         if is_escape
-            || (snap.preedit.is_empty() && snap.candidates.is_empty() && self.raw_input.is_empty())
+            || (snap.preedit.is_empty() && snap.candidates.is_empty() && snap.raw_input.is_empty())
         {
             self.clear_composition_state();
             return self.empty_action(None);
         }
 
-        let raw_preedit = if snap.preedit.is_empty() {
-            self.raw_input.clone()
-        } else {
-            snap.preedit
-        };
-        self.sync_raw_input_from_preedit(&raw_preedit);
-
-        // Convert only any leading confirmed CJK prefix in preedit so ASCII pinyin stays verbatim
-        self.composing = if let Some(ascii_idx) = raw_preedit.find(|c: char| c.is_ascii()) {
-            let (prefix, rest) = raw_preedit.split_at(ascii_idx);
-            if prefix.is_empty() {
-                raw_preedit.clone()
-            } else {
-                format!("{}{}", self.convert_opencc(prefix), rest)
-            }
-        } else {
-            self.convert_opencc(&raw_preedit)
-        };
-        self.cursor_utf8 = snap.cursor_utf8.min(self.composing.len());
+        self.sync_rime_preedit(&snap);
 
         let page_size = TOKENS.ergonomics.desktop_candidate_page_size as usize;
         let now_ms = RetentionEngine::now_epoch_ms();
@@ -1679,25 +1866,6 @@ impl EngineState {
                     true
                 }
             });
-            if let Some((mut item, mut origin)) = self.recover_transposition(
-                base_pairs
-                    .iter()
-                    .map(|(_, origin, _)| origin.canonical())
-                    .chain(
-                        priority_overlay
-                            .iter()
-                            .map(|(_, origin)| origin.canonical()),
-                    ),
-                imported,
-                retention,
-            ) {
-                self.score_pair(&mut item, &mut origin, retention, now_ms, 0);
-                base_pairs.retain(|(_, other, _)| other.canonical() != origin.canonical());
-                priority_overlay.retain(|(_, other)| other.canonical() != origin.canonical());
-                seen.insert(item.text.clone());
-                priority_overlay.push((item, origin));
-            }
-
             // Inject retention-boosted / pinned PureRust matches on page 0 so Mode-2 HW
             // confirmations (e.g. "手写中文") participate in shared Frecency ranking, and
             // ensure at least one full-span alternative exists if Rime only surfaced one.
@@ -1868,6 +2036,13 @@ impl EngineState {
                         p.2 = n;
                     }
                     full_span.extend(scores.into_keys());
+                    // The learned overlay already matched the whole input code.
+                    // Its recorded reading can differ from the dictionary annotation.
+                    full_span.extend(
+                        base_pairs.iter()
+                            .filter(|(item, _, _)| item.comment == "习惯")
+                            .map(|(_, origin, _)| origin.canonical().to_owned()),
+                    );
                 }
             }
 
@@ -1889,11 +2064,20 @@ impl EngineState {
                     .then_with(|| a.2.cmp(&b.2))
             });
 
+            let (abbreviations, mut merged): (Vec<_>, Vec<_>) = priority_overlay
+                .into_iter()
+                .partition(|(item, _)| item.comment == "简拼");
             for (c, orig, _) in base_pairs {
                 if seen.insert(c.text.clone()) {
-                    priority_overlay.push((c, orig));
+                    merged.push((c, orig));
                 }
             }
+            let abbreviation_at = merged.iter().take_while(|(item, origin)| {
+                item.pinned || item.frecency_score > 0.0
+                    || matches!(origin, CandidateOrigin::Overlay { .. })
+            }).count();
+            merged.splice(abbreviation_at..abbreviation_at, abbreviations);
+            let mut priority_overlay = merged;
             if (self.config.fuzzy_pinyin && self.schema == SchemaKind::RimeIce)
                 || pure_rust::mixed_english(&self.raw_input, Some(retention)).is_some()
             {
@@ -1950,6 +2134,7 @@ impl EngineState {
                     }
                 }
             }
+            self.insert_corrections(&mut priority_overlay, imported, retention, now_ms);
             if let Some(context) = context.as_deref() {
                 let active = if self.opencc_mode == OpenCcMode::Simplified { &simplified } else { &converted };
                 // If no other branch decoded, first check for a prefix worth ranking.
@@ -1985,8 +2170,12 @@ impl EngineState {
                 }
             }
 
-            // Keep the existing first-page ranking, plus the word displaced by Quick Paste.
-            priority_overlay.truncate(page_size + priority_overlay.iter().filter(|(c, _)| c.quick_paste_id.is_some() || c.function_action.is_some()).count());
+            // Keep words displaced by the added first-page candidates available for paging.
+            let extra = priority_overlay.iter().filter(|(item, _)| {
+                item.quick_paste_id.is_some() || item.function_action.is_some()
+                    || matches!(item.comment.as_str(), "简拼" | "纠错")
+            }).count();
+            priority_overlay.truncate(page_size + extra);
             self.rime_first_page = priority_overlay;
             self.rime_overlay_page = 0;
             self.rime_first_has_next = snap.has_next;
@@ -2087,7 +2276,6 @@ impl EngineState {
             }
         }
         let returning_to_first = backward && self.current_page.page_index == last_overlay + 1;
-        let is_backspace = keycode == 0x08 || keycode == 0xFF08;
         let is_escape = keycode == 0x1B || keycode == 0xFF1B;
         let is_space = keycode == 0x20;
         let is_return = keycode == 0x0D || keycode == 0xFF0D;
@@ -2109,14 +2297,10 @@ impl EngineState {
             return Ok(self.empty_action(committed));
         }
 
-        if is_backspace {
-            self.raw_input.pop();
-        } else if is_escape {
-            self.raw_input.clear();
-        } else if let Some(ch) = char::from_u32(keycode) {
-            if ch.is_ascii_alphabetic() || ch == '\'' {
-                self.raw_input.push(ch.to_ascii_lowercase());
-            } else if !ch.is_control() && self.raw_input.is_empty() && self.composing.is_empty() {
+        if self.raw_input.is_empty() && self.composing.is_empty() {
+            if let Some(ch) = char::from_u32(keycode).filter(|ch| {
+                !ch.is_control() && !ch.is_ascii_alphabetic() && *ch != '\''
+            }) {
                 let snap = rime_ffi::with_runtime(
                     assets_dir,
                     &self.config.cache_dir,
@@ -2160,10 +2344,16 @@ impl EngineState {
         retention: &mut RetentionEngine,
     ) -> Result<InputAction, VitralError> {
         let page_size = self.candidate_page_size();
+        self.raw_cursor = clamp_cursor(&self.raw_input, self.raw_cursor);
+        if self.move_raw_cursor(keycode) {
+            return Ok(self.empty_action(None));
+        }
 
         // process_key normalizes X11 Escape; U+FF1B here is the Chinese semicolon.
-        if keycode == 0x08 || keycode == 0xFF08 {
-            self.raw_input.pop();
+        if matches!(keycode, 0x08 | 0xff08 | KEY_DELETE) {
+            if !self.delete_raw_char(keycode != KEY_DELETE) {
+                return Ok(self.empty_action(None));
+            }
             self.pure_rust.page_index = 0;
         } else if keycode == 0x1B {
             self.clear_composition_state();
@@ -2198,7 +2388,7 @@ impl EngineState {
             }
         } else if let Some(ch) = char::from_u32(keycode) {
             if ch.is_ascii_alphabetic() || ch == '\'' {
-                self.raw_input.push(ch.to_ascii_lowercase());
+                self.insert_raw_char(ch.to_ascii_lowercase());
                 self.pure_rust.page_index = 0;
             } else if ch.is_ascii_digit() && !self.raw_input.is_empty() {
                 let digit = ch.to_digit(10).unwrap_or(0) as usize;
@@ -2322,16 +2512,17 @@ impl EngineState {
                     .iter()
                     .take_while(|(_, origin)| candidate_group(origin) == 0)
                     .count();
-                let personal_count = merged[priority_count..partial_at]
+                let priority_words = merged[priority_count..partial_at]
                     .iter()
                     .take_while(|(item, origin)| {
                         item.pinned
+                            || item.comment == "简拼"
                             || origin.features()[..6].iter().any(|&v| v > 0.0)
                             || origin.features()[7] > 0.0
                     })
                     .count();
-                // Keep every personal full match and at least two full matches ahead of prefixes.
-                let head_count = (priority_count + personal_count.max(2)).min(partial_at);
+                // Keep personal matches and abbreviations ahead of selectable prefixes.
+                let head_count = (priority_count + priority_words.max(2)).min(partial_at);
                 let partials = merged.split_off(partial_at);
                 let rest_full = merged.split_off(head_count);
                 let mut prefixes = Vec::new();
@@ -2364,9 +2555,6 @@ impl EngineState {
                 merged.extend(remaining);
             }
         }
-        if let Some((word, score)) = contextual_prediction {
-            self.promote_prefix_prediction(&mut merged, &word, score, retention, now_ms);
-        }
         if let Some(at) = english_at {
             if let Some(index) = merged.iter().position(|(c, _)| c.comment == "英文") {
                 let english = merged.remove(index);
@@ -2381,26 +2569,9 @@ impl EngineState {
                 merged.insert((priority + at).min(merged.len()), english);
             }
         }
-        if let Some(mut pair) = self.recover_transposition(
-            merged.iter().map(|(_, origin)| origin.canonical()),
-            imported,
-            retention,
-        ) {
-            self.score_pair(&mut pair.0, &mut pair.1, retention, now_ms, 0);
-            merged.retain(|(_, origin)| origin.canonical() != pair.1.canonical());
-            let first_word = merged
-                .iter()
-                .take_while(|(_, origin)| {
-                    matches!(
-                        origin,
-                        CandidateOrigin::Overlay {
-                            is_clipboard: true,
-                            ..
-                        }
-                    )
-                })
-                .count();
-            merged.insert(first_word, pair);
+        self.insert_corrections(&mut merged, imported, retention, now_ms);
+        if let Some((word, score)) = contextual_prediction {
+            self.promote_prefix_prediction(&mut merged, &word, score, retention, now_ms);
         }
         let total_pages = merged.len().div_ceil(page_size).max(1);
         if self.pure_rust.page_index >= total_pages {
@@ -2412,7 +2583,7 @@ impl EngineState {
             merged.into_iter().skip(start).take(end - start).collect();
 
         self.composing = self.raw_input.clone();
-        self.cursor_utf8 = self.composing.len();
+        self.cursor_utf8 = self.raw_cursor;
         self.set_current_candidates(page_pairs);
         self.current_page = PageInfo {
             page_index: self.pure_rust.page_index,
@@ -2423,96 +2594,59 @@ impl EngineState {
         Ok(self.empty_action(None))
     }
 
-    fn matches_full_reading(
+    fn recover_transposition(
         &self,
-        word: &str,
-        code: &str,
         imported: &ImportedLexiconIndex,
         retention: &RetentionEngine,
-    ) -> bool {
-        if word.chars().count() < 2
-            || !word.chars().all(crate::ret::is_cjk)
-            || !imported.matches_reading(word, code, self.schema == SchemaKind::DoublePinyinFlypy)
-        {
-            return false;
-        }
+    ) -> Vec<(CandidateItem, CandidateOrigin)> {
+        let level = self.pure_rust.typo_correction_level;
         let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
-        if retention
-            .user_phrases
-            .get(word)
-            .is_some_and(|p| p.matches_code(code, flypy) || p.acronym == code)
-        {
-            return true;
+        if !quanpin::can_correct(&self.raw_input, flypy, level) {
+            return Vec::new();
         }
-        let imported_matches = if flypy {
-            imported.query_xiaohe(code)
-        } else {
-            imported.query_quanpin(code)
-        };
-        if imported_matches.iter().any(|p| p.text == word) {
-            return true;
+        let corpus = imported.corpus();
+        let exact = quanpin::exact_word_match(&self.raw_input, flypy, corpus, Some(imported), Some(retention));
+        if !exact.allows(level) {
+            return Vec::new();
         }
-        let matches = |pinyin: &str| {
-            if flypy {
-                crate::imp::xiaohe::pinyin_phrase_to_xiaohe(pinyin) == code
-            } else {
-                crate::imp::xiaohe::matches_quanpin_reading(
-                    &pinyin
-                        .split_whitespace()
-                        .map(str::to_string)
-                        .collect::<Vec<_>>(),
-                    code,
-                )
-            }
-        };
-        if let Some((syllables, _)) = imported.corpus().word_reading(word) {
-            return matches(&syllables.collect::<Vec<_>>().join(" "));
+        let mut exact_words = HashSet::new();
+        if exact.weight > 0 {
+            quanpin::visit_exact_words(&self.raw_input, flypy, corpus, Some(imported), Some(retention),
+                |word, _, _, _| { exact_words.insert(word.to_owned()); });
         }
-        let ann =
-            crate::imp::polyphone::PolyphoneAnnotator::new(std::sync::Arc::clone(imported.corpus()))
-                .annotate_text(word);
-        matches(&ann.untoned)
-    }
-
-    fn recover_transposition<'a>(
-        &self,
-        current_words: impl Iterator<Item = &'a str>,
-        imported: &ImportedLexiconIndex,
-        retention: &RetentionEngine,
-    ) -> Option<(CandidateItem, CandidateOrigin)> {
-        if self.raw_input.len() < 4
-            || (self.schema == SchemaKind::RimeIce
-                && crate::imp::xiaohe::canonical_syllable_set().contains(self.raw_input.as_str()))
-            || !self.raw_input.bytes().all(|b| b.is_ascii_lowercase())
-            || current_words
-                .into_iter()
-                .any(|word| self.matches_full_reading(word, &self.raw_input, imported, retention))
-        {
-            return None;
-        }
-        let mut best: Option<(CandidateItem, String, f64)> = None;
-        for code in quanpin::correction_codes(
-            &self.raw_input,
-            self.schema == SchemaKind::DoublePinyinFlypy,
-        ) {
-            let recovered = self
-                .pure_rust
-                .query_correction_candidates(&code, self.schema, imported, retention)
-                .into_iter()
-                .next();
-            if let Some((item, canonical, score)) = recovered {
-                if best.as_ref().is_none_or(|(old, _, old_score)| {
-                    (item.pinned && !old.pinned) || (item.pinned == old.pinned && score > *old_score)
-                }) {
-                    best = Some((item, canonical, score));
+        let mut ranked = Vec::new();
+        let odd_flypy = flypy && self.raw_input.bytes().filter(u8::is_ascii_lowercase).count() % 2 != 0;
+        for (quality, code) in quanpin::correction_codes(&self.raw_input, flypy, level) {
+            for (item, canonical, weight) in self.pure_rust.query_correction_candidates(
+                &code, self.schema, imported, retention,
+            ) {
+                if exact_words.contains(&canonical) || !exact.supports(level, quality, weight) {
+                    continue;
                 }
+                let whole_phrase = odd_flypy && canonical.chars().count() > 1;
+                // For a missing or extra key, favor edits that preserve the first key.
+                let leading_edit = odd_flypy && code.as_bytes().first() != self.raw_input.as_bytes().first();
+                let score = item.frecency_score + (weight as f64).ln_1p()
+                    - f64::from(quality) - if leading_edit { 0.30 } else { 0.0 };
+                ranked.push((item, canonical, score, whole_phrase, quality));
             }
         }
-        best.map(|(mut item, canonical, _)| {
+        ranked.sort_by(|a, b| {
+            b.0.pinned.cmp(&a.0.pinned)
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| if exact.weight == 0 { a.4.cmp(&b.4) } else { std::cmp::Ordering::Equal })
+                .then_with(|| b.2.total_cmp(&a.2))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let mut seen = HashSet::new();
+        ranked.into_iter().filter_map(|(mut item, canonical, _, _, _)| {
             let commit_text = self.convert_opencc(&canonical);
+            if !seen.insert(commit_text.clone()) {
+                return None;
+            }
             item.text = commit_text.clone();
             item.comment = "纠错".into();
-            (
+            Some((
                 item,
                 CandidateOrigin::PureRust {
                     consumed_len: self.raw_input.len(),
@@ -2520,8 +2654,47 @@ impl EngineState {
                     commit_text,
                     features: [0.0; 9],
                 },
-            )
-        })
+            ))
+        }).take(2).collect()
+    }
+
+    fn insert_corrections(
+        &self,
+        merged: &mut Vec<(CandidateItem, CandidateOrigin)>,
+        imported: &ImportedLexiconIndex,
+        retention: &RetentionEngine,
+        now_ms: u64,
+    ) {
+        let mut recovered = self.recover_transposition(imported, retention);
+        recovered.retain(|(correction, _)| {
+            !merged.iter().any(|(item, origin)| {
+                matches!(origin, CandidateOrigin::Overlay { is_clipboard: true, .. })
+                    && item.text == correction.text
+            })
+        });
+        if recovered.is_empty() {
+            return;
+        }
+        merged.retain(|(item, origin)| {
+            matches!(origin, CandidateOrigin::Overlay { is_clipboard: true, .. })
+                || !recovered.iter().any(|(correction, _)| correction.text == item.text)
+        });
+        let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
+        let mut exact_words = HashSet::new();
+        quanpin::visit_exact_words(&self.raw_input, flypy, imported.corpus(), Some(imported), Some(retention),
+            |word, _, _, _| { exact_words.insert(word.to_owned()); });
+        let first_word = merged.iter().take_while(|(item, origin)| {
+            item.pinned || item.frecency_score > 0.0 || item.comment == "简拼"
+                || matches!(origin, CandidateOrigin::Overlay { is_clipboard: true, .. })
+        }).count();
+        // Keep a valid exact word ahead of optional corrections.
+        let at = merged[first_word..].iter()
+            .position(|(_, origin)| exact_words.contains(origin.canonical()))
+            .map_or(first_word, |index| first_word + index + 1);
+        for (rank, (item, origin)) in recovered.iter_mut().enumerate() {
+            self.score_pair(item, origin, retention, now_ms, at + rank);
+        }
+        merged.splice(at..at, recovered);
     }
 
     fn build_overlay_candidates(
@@ -2632,14 +2805,18 @@ impl EngineState {
             }
         }
 
+        let compact = self.raw_input.replace(['\'', ' '], "");
+        let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
+        let allow_abbreviation = if flypy {
+            !matches!(compact.len(), 2 | 4)
+                || quanpin::exact_word_match(
+                    &self.raw_input, true, imported.corpus(), Some(imported), Some(retention),
+                ).weight < quanpin::HIGH_DICTIONARY_WEIGHT
+        } else {
+            !crate::imp::xiaohe::canonical_syllable_set().contains(compact.as_str())
+        };
+        let now_ms = RetentionEngine::now_epoch_ms();
         if self.config.adaptive_learning {
-            let compact: String = self
-                .raw_input
-                .chars()
-                .filter(|c| c.is_ascii_alphabetic())
-                .collect();
-            let now_ms = RetentionEngine::now_epoch_ms();
-            let flypy = self.schema == SchemaKind::DoublePinyinFlypy;
             let full_code = if flypy { &compact } else { &self.raw_input };
             let phrases = retention.query_user_phrases(full_code, flypy);
             let mut learned: Vec<_> = phrases
@@ -2654,7 +2831,7 @@ impl EngineState {
                     )
                 })
                 .collect();
-            if flypy || !crate::imp::xiaohe::canonical_syllable_set().contains(compact.as_str()) {
+            if allow_abbreviation {
                 for phrase in retention.query_acronym_phrases(&compact) {
                     learned.push((
                         phrase.word.as_str(),
@@ -2665,6 +2842,7 @@ impl EngineState {
             }
             let continuations = self
                 .previous_context(now_ms)
+                .filter(|_| !self.pure_rust.confirming_initials)
                 .map(|previous| {
                     retention.query_context_continuations(
                         previous,
@@ -2718,6 +2896,35 @@ impl EngineState {
                             canonical: canonical.to_string(),
                             commit_text: text,
                             is_clipboard: false,
+                        },
+                    ));
+                }
+            }
+        }
+
+        if (include_embedded_sentence || flypy) && allow_abbreviation && (2..=4).contains(&compact.len()) {
+            for (word, _) in quanpin::ranked_abbreviations(
+                &compact, imported.corpus(), self.pure_rust.get_gram(), Some(retention),
+            ) {
+                let text = self.convert_opencc(word);
+                if seen.insert(text.clone()) {
+                    overlay.push((
+                        CandidateItem {
+                            index: 0,
+                            text: text.clone(),
+                            comment: "简拼".into(),
+                            pinned: retention.pinned_words.contains(word),
+                            frecency_score: self.contextual_score(retention, word, now_ms),
+                            is_clipboard_shortcut: false,
+                            shortcut_code: None,
+                            quick_paste_id: None,
+                            function_action: None,
+                        },
+                        CandidateOrigin::PureRust {
+                            consumed_len: self.raw_input.len(),
+                            features: [0.0; 9],
+                            canonical: word.to_owned(),
+                            commit_text: text,
                         },
                     ));
                 }
@@ -2879,7 +3086,7 @@ impl EngineState {
     ) -> Option<String> {
         let before = self.raw_input.clone();
         if let Some(committed) = snapshot.commit_text {
-            let code = format!("{}{before}", self.pending_phrase_code);
+            let code = format!("{}{before}", self.pending_phrase_code.replace(' ', ""));
             let feedback = (self.pending_phrase_selections == 0 && canonical == committed)
                 .then(|| self.selection_feedback(index))
                 .flatten();
@@ -2975,6 +3182,9 @@ impl EngineState {
                     .trim_start_matches(['\'', ' '])
                     .to_string();
                 let code = self.raw_input[..consumed_len].to_string();
+                let confirming_initials = quanpin::is_initial_token(&code)
+                    && (self.pure_rust.confirming_initials
+                        || quanpin::is_initial_sequence(&self.raw_input));
                 self.track_phrase_selection(
                     &canonical,
                     &code,
@@ -2991,12 +3201,14 @@ impl EngineState {
                 self.clear_composition_state();
                 if !remaining.is_empty() {
                     self.pure_rust.confirmed_prefix = confirmed;
+                    self.pure_rust.confirming_initials = confirming_initials;
                     (
                         self.pending_phrase_text,
                         self.pending_phrase_code,
                         self.pending_phrase_selections,
                     ) = pending;
                     self.raw_input = remaining;
+                    self.raw_cursor = self.raw_input.len();
                     self.process_key_pure_rust(0, clipboard, imported, retention)?;
                 }
                 Ok(Some(final_commit))
@@ -3113,7 +3325,7 @@ impl EngineState {
             schema: self.schema.as_str().to_string(),
             preedit: PreeditState {
                 text: self.composing.clone(),
-                cursor_utf8: self.cursor_utf8.min(self.composing.len()),
+                cursor_utf8: clamp_cursor(&self.composing, self.cursor_utf8),
                 retroactive_slots: Vec::new(),
             },
             commit_text,
@@ -3162,6 +3374,113 @@ mod personalization_tests {
                 .process_key(ch as u32, 0, SwipeDir::None, clip, imported, r)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn pure_rust_edits_in_place_and_decodes_the_corrected_spelling() {
+        for (schema, typo, tail) in [
+            (SchemaKind::RimeIce, "nixxao", "ao"),
+            (SchemaKind::DoublePinyinFlypy, "nixxc", "c"),
+        ] {
+            let (mut e, clip, imp, mut ret) = fixture();
+            e.schema = schema;
+            e.pure_rust.typo_correction_level = TypoCorrectionLevel::Off;
+            let mut key = |key| e.process_key(key, 0, SwipeDir::None, &clip, &imp, &mut ret).unwrap();
+            let typed = typo.bytes().map(|ch| key(ch.into())).last().unwrap();
+            assert_eq!(typed.preedit.cursor_utf8, typo.len());
+            assert_eq!(key(KEY_HOME).preedit.cursor_utf8, 0);
+            assert_eq!(key(0xff08).preedit.text, typo);
+            assert_eq!(key(KEY_END).preedit.cursor_utf8, typo.len());
+            let moved = (0..=tail.len()).map(|_| key(KEY_LEFT)).last().unwrap();
+            assert_eq!(moved.preedit.cursor_utf8, 3);
+            assert_eq!(moved.preedit.text, typo);
+            assert_eq!(
+                moved.candidates.iter().map(|c| &c.text).collect::<Vec<_>>(),
+                typed.candidates.iter().map(|c| &c.text).collect::<Vec<_>>(),
+            );
+
+            let backspaced = key(0x08);
+            assert_eq!(backspaced.preedit.text, format!("nix{tail}"));
+            assert_eq!(backspaced.preedit.cursor_utf8, 2);
+            let deleted = key(KEY_DELETE);
+            assert_eq!(deleted.preedit.text, format!("ni{tail}"));
+            assert_eq!(deleted.preedit.cursor_utf8, 2);
+            let fixed = key('h' as u32);
+            assert_eq!(fixed.preedit.text, format!("nih{tail}"));
+            assert_eq!(fixed.preedit.cursor_utf8, 3);
+            assert_eq!(fixed.candidates[0].text, "你好");
+            assert_eq!(key(0x20).commit_text.as_deref(), Some("你好"));
+        }
+    }
+
+    #[test]
+    fn passthrough_cursor_and_edits_stay_on_utf8_boundaries() {
+        let (mut e, clip, imp, mut ret) = fixture();
+        type_code(&mut e, "A猫B", &clip, &imp, &mut ret);
+        let action = e.set_preedit_cursor(2, &clip, &imp, &mut ret).unwrap();
+        assert_eq!(action.preedit.cursor_utf8, 1);
+        assert_eq!(action.candidates[0].comment, "En/Token");
+        assert_eq!(e.set_preedit_cursor(usize::MAX, &clip, &imp, &mut ret).unwrap().preedit.cursor_utf8, 5);
+
+        let mut key = |key| e.process_key(key, 0, SwipeDir::None, &clip, &imp, &mut ret).unwrap();
+        assert_eq!(key(KEY_LEFT).preedit.cursor_utf8, 4);
+        assert_eq!(key(KEY_LEFT).preedit.cursor_utf8, 1);
+        let inserted = key('é' as u32);
+        assert_eq!(inserted.preedit.cursor_utf8, 3);
+        assert_eq!(inserted.candidates[0].text, "Aé猫B");
+        let deleted = key(KEY_DELETE);
+        assert_eq!(deleted.preedit.cursor_utf8, 3);
+        assert_eq!(deleted.preedit.text, "AéB");
+        assert_eq!(key(0xff08).preedit.text, "AB");
+        assert_eq!(key(KEY_RIGHT).preedit.cursor_utf8, 2);
+        assert_eq!(key(KEY_DELETE).preedit.text, "AB");
+        assert_eq!(key(KEY_HOME).preedit.cursor_utf8, 0);
+        assert_eq!(key(KEY_DELETE).preedit.text, "B");
+        let empty = key(KEY_DELETE);
+        assert_eq!(empty.preedit.cursor_utf8, 0);
+        assert!(empty.preedit.text.is_empty() && empty.candidates.is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn native_rime_cursor_edits_raw_input_and_matches_preedit() {
+        let (mut e, clip, imp, mut ret) = fixture();
+        e.resolved_assets_dir = Some(resolve_assets_dir("").unwrap());
+        type_code(&mut e, "nixao", &clip, &imp, &mut ret);
+        assert!(e.rime_input_start.is_some());
+        let key = |e: &mut EngineState, key, ret: &mut RetentionEngine| {
+            e.process_key(key, 0, SwipeDir::None, &clip, &imp, ret).unwrap()
+        };
+        key(&mut e, KEY_LEFT, &mut ret);
+        assert_eq!((e.raw_input.as_str(), e.raw_cursor), ("nixao", 4));
+        assert_eq!(e.cursor_utf8, e.composing.len() - 1);
+        key(&mut e, KEY_HOME, &mut ret);
+        assert_eq!(e.cursor_utf8, 0);
+        assert_eq!(key(&mut e, KEY_END, &mut ret).preedit.cursor_utf8, e.composing.len());
+
+        let jumped = e.set_preedit_cursor(2, &clip, &imp, &mut ret).unwrap();
+        assert_eq!(e.raw_cursor, 2);
+        assert_eq!(&jumped.preedit.text[jumped.preedit.cursor_utf8..], "xao");
+        key(&mut e, KEY_RIGHT, &mut ret);
+        assert_eq!(e.raw_cursor, 3);
+        key(&mut e, KEY_LEFT, &mut ret);
+        let deleted = key(&mut e, KEY_DELETE, &mut ret);
+        assert_eq!((e.raw_input.as_str(), e.raw_cursor), ("niao", 2));
+        assert_eq!(&deleted.preedit.text[deleted.preedit.cursor_utf8..], "ao");
+        let inserted = key(&mut e, 'h' as u32, &mut ret);
+        assert_eq!((e.raw_input.as_str(), e.raw_cursor), ("nihao", 3));
+        assert_eq!(&inserted.preedit.text[inserted.preedit.cursor_utf8..], "ao");
+        let finished = key(&mut e, KEY_END, &mut ret);
+        assert_eq!(finished.preedit.cursor_utf8, finished.preedit.text.len());
+        assert!(finished.candidates.iter().any(|c| c.text == "你好"));
+        key(&mut e, 0x1b, &mut ret);
+
+        e.set_schema(SchemaKind::DoublePinyinFlypy);
+        type_code(&mut e, "nihc", &clip, &imp, &mut ret);
+        let display = e.composing.find("hao").unwrap() + 1;
+        let jumped = e.set_preedit_cursor(display, &clip, &imp, &mut ret).unwrap();
+        assert_eq!((e.raw_input.as_str(), e.raw_cursor), ("nihc", 3));
+        assert_eq!(&jumped.preedit.text[jumped.preedit.cursor_utf8..], "c");
     }
 
     fn offer(engine: &mut EngineState, word: &str, code: &str) {
@@ -3251,10 +3570,30 @@ mod personalization_tests {
     #[test]
     fn native_confirmed_prefix_retracts_when_preedit_returns_to_pinyin() {
         let (mut e, _, _, _) = fixture();
-        e.sync_raw_input_from_preedit("我要quchifan");
+        let mut snap = rime_ffi::RimeSnapshot {
+            commit_text: None,
+            preedit: "我要qu chi fan".into(),
+            cursor_utf8: "我要qu chi fan".len(),
+            raw_input: "woyaoquchifan".into(),
+            raw_cursor: "woyaoquchifan".len(),
+            page_index: 0,
+            page_size: 5,
+            has_prev: false,
+            has_next: false,
+            candidates: Vec::new(),
+        };
+        e.sync_rime_preedit(&snap);
         assert_eq!(e.pure_rust.confirmed_prefix, "我要");
-        e.sync_raw_input_from_preedit("woyaoquchifan");
+        assert_eq!(e.raw_input, "quchifan");
+        assert_eq!(e.raw_cursor, 8);
+        assert_eq!(e.raw_cursor_for_rime_preedit("我要qu ".len()), 2);
+        snap.preedit = "woyaoquchifan".into();
+        snap.cursor_utf8 = 2;
+        snap.raw_cursor = 2;
+        e.sync_rime_preedit(&snap);
         assert!(e.pure_rust.confirmed_prefix.is_empty());
+        assert_eq!(e.raw_input, "woyaoquchifan");
+        assert_eq!(e.raw_cursor, 2);
     }
 
     #[test]
@@ -3370,6 +3709,8 @@ mod personalization_tests {
             commit_text: commit_text.map(str::to_owned),
             preedit: preedit.into(),
             cursor_utf8: preedit.len(),
+            raw_input: "ni'hao".into(),
+            raw_cursor: "ni'hao".len(),
             page_index: 0,
             page_size: 5,
             has_prev: false,
@@ -3566,6 +3907,8 @@ mod personalization_tests {
                 commit_text: None,
                 preedit: code.into(),
                 cursor_utf8: code.len(),
+                raw_input: code.into(),
+                raw_cursor: code.len(),
                 page_index: 0,
                 page_size: 5,
                 has_prev: false,
@@ -4003,6 +4346,8 @@ mod personalization_tests {
                 commit_text: None,
                 preedit: acronym.into(),
                 cursor_utf8: acronym.len(),
+                raw_input: acronym.into(),
+                raw_cursor: acronym.len(),
                 page_index: 0,
                 page_size: 5,
                 has_prev: false,
@@ -4249,6 +4594,166 @@ mod personalization_tests {
     }
 
     #[test]
+    fn correction_levels_keep_exact_words_and_offer_distinct_alternatives() {
+        let (mut e, clip, imp, mut ret) = fixture();
+        for (level, raw, exact, expected) in [
+            (TypoCorrectionLevel::Off, "nuhao", "怒号", false),
+            (TypoCorrectionLevel::Conservative, "nuhao", "怒号", false),
+            (TypoCorrectionLevel::Standard, "nuhao", "怒号", true),
+            (TypoCorrectionLevel::Standard, "nigao", "你搞", false),
+            (TypoCorrectionLevel::Aggressive, "nigao", "你搞", true),
+        ] {
+            e.clear_composition_state();
+            e.pure_rust.typo_correction_level = level;
+            e.raw_input = raw.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut ret).unwrap();
+            let corrections = action.candidates.iter().filter(|item| item.comment == "纠错");
+            assert_eq!(action.candidates[0].text, exact, "{level:?}: {:?}", action.candidates);
+            assert_eq!(corrections.clone().any(|item| item.text == "你好"), expected,
+                "{level:?}: {:?}", action.candidates);
+            assert!(corrections.count() <= 2);
+        }
+        ret.pin_word("怒号");
+        e.raw_input = "nuhao".into();
+        assert!(e.recover_transposition(&imp, &ret).is_empty());
+
+        e.pure_rust.typo_correction_level = TypoCorrectionLevel::Conservative;
+        e.raw_input = "nihoa".into();
+        let alternatives = e.recover_transposition(&imp, &ret);
+        assert_eq!(alternatives.len(), 2);
+        assert_ne!(alternatives[0].0.text, alternatives[1].0.text);
+    }
+
+    #[test]
+    fn short_quanpin_and_odd_xiaohe_codes_can_be_corrected() {
+        for (schema, raw, corrected) in [
+            (SchemaKind::RimeIce, "tna", "谈"),
+            (SchemaKind::RimeIce, "nui", "牛"),
+            (SchemaKind::DoublePinyinFlypy, "nhc", "你好"),
+            (SchemaKind::DoublePinyinFlypy, "nixhc", "你好"),
+        ] {
+            let (mut e, clip, imp, mut ret) = fixture();
+            e.schema = schema;
+            e.raw_input = raw.into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut ret).unwrap();
+            assert!(action.candidates.iter().any(|item| item.text == corrected && item.comment == "纠错"),
+                "{raw}: {:?}", action.candidates);
+            e.pure_rust.typo_correction_level = TypoCorrectionLevel::Off;
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut ret).unwrap();
+            assert!(action.candidates.iter().all(|item| item.comment != "纠错"));
+        }
+    }
+
+    #[test]
+    fn bundled_abbreviations_stay_on_the_first_page_in_both_schemas() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let (mut e, clip, imp, mut ret) = fixture();
+            e.schema = schema;
+            e.config.adaptive_learning = false;
+            e.raw_input = "zsh".into();
+            let action = e.process_key_pure_rust(0, &clip, &imp, &mut ret).unwrap();
+            assert!(action.candidates.iter().take(3).any(|item| item.text == "早上好"),
+                "{schema:?}: {:?}; abbreviation scores: {:?}", action.candidates,
+                quanpin::ranked_abbreviations("zsh", imp.corpus(), e.pure_rust.get_gram(), None));
+        }
+    }
+
+    #[test]
+    fn segmented_abbreviation_selection_immediately_learns_the_full_reading() {
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "z's'h"),
+            (SchemaKind::DoublePinyinFlypy, "z's'h"),
+            (SchemaKind::RimeIce, "zsh"),
+            (SchemaKind::DoublePinyinFlypy, "zsh"),
+        ] {
+            let (mut e, clip, imp, mut ret) = fixture();
+            e.schema = schema;
+            type_code(&mut e, code, &clip, &imp, &mut ret);
+            for word in ["早", "上", "好"] {
+                let selected = loop {
+                    if let Some(index) = e.current_candidates.iter().position(|item| {
+                        item.text == word && e.candidate_code_at(item.index).len() == 1
+                    }) {
+                        break Some(index);
+                    }
+                    if !e.current_page.has_next {
+                        break None;
+                    }
+                    e.process_key_pure_rust('=' as u32, &clip, &imp, &mut ret).unwrap();
+                };
+                let index = selected.unwrap_or_else(|| panic!("{schema:?} {}: missing {word}; {:?}",
+                    e.raw_input, e.current_candidates));
+                let commit = e.select_candidate_on_backend(index, &clip, &imp, &mut ret).unwrap();
+                assert_eq!(commit.as_deref(), Some(word));
+            }
+            let learned = &ret.user_phrases["早上好"];
+            assert_eq!(learned.quanpin, "zao shang hao");
+            assert_eq!(learned.xiaohe, "zcuhhc");
+            assert_eq!(learned.acronym, "zsh");
+            assert_eq!(ret.code_preferences["zsh"]["早上好"], 1.0);
+            assert_eq!(ret.query_acronym_phrases("zsh")[0].word, "早上好");
+            type_code(&mut e, "zsh", &clip, &imp, &mut ret);
+            assert_eq!(e.canonical_at(0), Some("早上好"));
+            assert_eq!(e.current_candidates[0].comment, "简拼");
+        }
+    }
+
+    #[test]
+    fn flypy_segmented_initials_digraph_recall_and_clipboard_shortcut_survive_correction() {
+        // High #1: Flypy z's keeps initial selection on remaining 's' (shang's flypy is uh).
+        let (mut e, mut clip, imp, mut ret) = fixture();
+        e.schema = SchemaKind::DoublePinyinFlypy;
+        type_code(&mut e, "z's", &clip, &imp, &mut ret);
+        for word in ["早", "上"] {
+            let index = loop {
+                if let Some(i) = e.current_candidates.iter().position(|item| {
+                    item.text == word && e.candidate_code_at(item.index).len() == 1
+                }) {
+                    break i;
+                }
+                assert!(e.current_page.has_next, "missing {word} in {:?}", e.current_candidates);
+                e.process_key_pure_rust('=' as u32, &clip, &imp, &mut ret).unwrap();
+            };
+            assert_eq!(e.select_candidate_on_backend(index, &clip, &imp, &mut ret).unwrap().as_deref(), Some(word));
+        }
+
+        // Low #1: z'sh'h learned preference recalls on zshh as well as zsh.
+        e.schema = SchemaKind::RimeIce;
+        type_code(&mut e, "z'sh'h", &clip, &imp, &mut ret);
+        for word in ["早", "上", "好"] {
+            let index = loop {
+                if let Some(i) = e.current_candidates.iter().position(|item| item.text == word) {
+                    break i;
+                }
+                assert!(e.current_page.has_next, "missing {word} in {:?}", e.current_candidates);
+                e.process_key_pure_rust('=' as u32, &clip, &imp, &mut ret).unwrap();
+            };
+            assert_eq!(e.select_candidate_on_backend(index, &clip, &imp, &mut ret).unwrap().as_deref(), Some(word));
+        }
+        assert!(ret.query_acronym_phrases("zshh").iter().any(|p| p.word == "早上好"));
+
+        // High #2: clipboard shortcut matching a typo correction keeps its shortcut identity.
+        let pushed = clip.push(crate::clip::ClipboardPayload {
+            id: Some("clip-tan".into()),
+            content: "谈".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 1000,
+        });
+        clip.pin(&pushed.ring[0].id, Some("tna")).unwrap();
+        type_code(&mut e, "tna", &clip, &imp, &mut ret);
+        let first = &e.current_candidates[0];
+        assert_eq!(first.text, "谈");
+        assert!(first.is_clipboard_shortcut);
+        assert_eq!(first.shortcut_code.as_deref(), Some("tna"));
+
+        // Low #2: aggressive typo correction is a superset of standard for low-weight exact words.
+        let low_exact = quanpin::ExactWordMatch { weight: 100, personal: false };
+        assert!(low_exact.supports(TypoCorrectionLevel::Standard, 1, 50));
+        assert!(low_exact.supports(TypoCorrectionLevel::Aggressive, 1, 50));
+    }
+
+    #[test]
     fn adjacent_transposition_recovers_complete_words_but_preserves_valid_input() {
         let (mut e, clip, imp, mut r) = fixture();
         type_code(&mut e, "nihoa", &clip, &imp, &mut r);
@@ -4282,7 +4787,7 @@ mod personalization_tests {
         e.clear_composition_state();
         e.schema = SchemaKind::DoublePinyinFlypy;
         e.raw_input = "nich".into();
-        let recovered = e.recover_transposition(std::iter::empty(), &imp, &fresh).unwrap();
+        let recovered = e.recover_transposition(&imp, &fresh).remove(0);
         assert_eq!(recovered.1.canonical(), "你好");
     }
 
@@ -4314,6 +4819,8 @@ mod personalization_tests {
                 commit_text: None,
                 preedit: "q".into(),
                 cursor_utf8: 1,
+                raw_input: "q".into(),
+                raw_cursor: 1,
                 page_index: 0,
                 page_size: 5,
                 has_prev: false,
@@ -4348,6 +4855,8 @@ mod personalization_tests {
             commit_text: None,
             preedit: "nihoa".into(),
             cursor_utf8: 5,
+            raw_input: "nihoa".into(),
+            raw_cursor: 5,
             page_index: 0,
             page_size: 5,
             has_prev: false,
@@ -4419,16 +4928,7 @@ mod personalization_tests {
         e.last_committed_ms = now;
         // Warm dictionary/model caches before measuring the added candidate work.
         e.raw_input = "nihoa".into();
-        let fragments = e.pure_rust.query_all_candidates_with_canonical(
-            &e.raw_input,
-            e.schema,
-            OpenCcMode::Simplified,
-            Some(&imp),
-            Some(&r),
-        );
-        assert!(e
-            .recover_transposition(fragments.iter().map(|(_, word)| word.as_str()), &imp, &r)
-            .is_some());
+        assert!(!e.recover_transposition(&imp, &r).is_empty());
         let measure = |query: &mut dyn FnMut()| {
             let start = std::time::Instant::now();
             for _ in 0..100 {
@@ -4437,11 +4937,7 @@ mod personalization_tests {
             start.elapsed() / 100
         };
         let typo = measure(&mut || {
-            std::hint::black_box(e.recover_transposition(
-                fragments.iter().map(|(_, word)| word.as_str()),
-                &imp,
-                &r,
-            ));
+            std::hint::black_box(e.recover_transposition(&imp, &r));
         });
         e.raw_input = "d".into();
         let continuation = measure(&mut || {

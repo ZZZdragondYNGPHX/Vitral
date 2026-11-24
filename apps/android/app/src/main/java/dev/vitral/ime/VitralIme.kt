@@ -1,6 +1,7 @@
 package dev.vitral.ime
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,16 +9,31 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.Icon
 import android.inputmethodservice.InputMethodService
 import android.os.Build
+import android.os.Bundle
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
+import android.text.style.StyleSpan
+import android.util.Size
 import android.view.*
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InlineSuggestionsRequest
+import android.view.inputmethod.InlineSuggestionsResponse
 import android.view.inputmethod.InputMethodManager
 import android.widget.*
+import android.widget.inline.InlinePresentationSpec
+import androidx.autofill.inline.UiVersions
+import androidx.autofill.inline.common.ImageViewStyle
+import androidx.autofill.inline.common.TextViewStyle
+import androidx.autofill.inline.common.ViewStyle
+import androidx.autofill.inline.v1.InlineSuggestionUi
 import dev.vitral.ime.core.*
 import dev.vitral.ime.theme.VitralTokens as T
 import org.json.JSONArray
@@ -62,8 +78,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var detectedAeviouEnv = AeviouEnv.MIXED
     private var manualLangOverride = false
     private var numbers = false
-    private var symbolPage = false
-    private var mode = "keys" // keys | tools | lookup | continuous | clipboard | clipboard_shortcut | candidates | emoji
+    private var mode = "keys" // keys | tools | lookup | continuous | clipboard | clipboard_shortcut | candidates | emoji | symbols
     private var clipboardItems: List<ClipboardItemSnapshot>? = null
     private var clipboardMutationSeq = 0
     private var clipboardScrollY = 0
@@ -85,8 +100,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var lastDeletedText = ""
     private var lastDeletedAtMs = 0L
     private var emojiCategory = 0
+    private var symbolCategory = 0
     private var composing = false
     private var preeditText = ""
+    private var preeditCursorUtf8 = 0
     private var passwordEditor = false
     private var enterLabel = "↵"
     private var themePref = "system" // system | dark | light
@@ -98,7 +115,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var predictionId = 0L
     private var predictionActive = false
     private var predictionText = ""
+    private var predictionCandidates: List<String> = emptyList()
     private var predictionContext = ""
+    private var predictionContextAfter = ""
     private var predictionTask: Runnable? = null
     private var idleStripSignature: String? = null
     private var surroundingBeforeValid = false
@@ -124,6 +143,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var composingStripDark: Boolean? = null
     private var composingStripFont = 0f
     private var stripPreeditView: TextView? = null
+    private var stripDelimiterView: TextView? = null
     private var stripSplitView: TextView? = null
     private var stripSplitActive: Boolean? = null
     private var stripCandidatesContainer: LinearLayout? = null
@@ -134,6 +154,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var pasteId = ""
     private var hasPreviousPage = false
     private var hasNextPage = false
+    private var inlineSuggestionEpoch = 0
+    private val inlineSuggestionViews = ArrayList<View>()
+    private val inlinePinnedViews = ArrayList<View>()
+    private var inlineSuggestionsActive = false
     private var shown = JSONArray()
     private var lastInkResult: JSONObject? = null
     private var hwModelReady: Boolean? = null
@@ -150,6 +174,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var offsetY = 0
     private var systemCopyId = ""
     private var clipboardRevision = 0
+    private var lastPushedClipText = ""
+    private var pollServiceTick = 0
     private var pasteVisible = false
     private val copyMarker = "dev.vitral.copy_id"
     private val microphone = Microphone()
@@ -176,7 +202,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 if (!alive) return
                 if (active) onPrimaryClipChanged()
                 val revision = clipboardRevision
-                Core.call(this@VitralIme, "poll-services", background = true) { result ->
+                val fullSync = pollServiceTick == 0 || pollServiceTick % 6 == 0
+                pollServiceTick += 1
+                val cmd = if (fullSync) "poll-services" else "clipboard-poll-current"
+                Core.call(this@VitralIme, cmd, background = true) { result ->
                     if (alive) {
                         if (revision == clipboardRevision) {
                             result
@@ -185,7 +214,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                                 }
                                 .onFailure { reconcileClipboard() }
                         }
-                        main.postDelayed(this, 3000)
+                        main.postDelayed(this, if (active) 1500 else 3000)
                     }
                 }
             }
@@ -203,11 +232,141 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     override fun onDestroy() {
         alive = false
+        clearInlineSuggestions(refreshBar = false)
         main.removeCallbacks(pollClipboard)
         invalidateEditor()
         clipboard.removePrimaryClipChangedListener(this)
         getSharedPreferences("vitral", 0).unregisterOnSharedPreferenceChangeListener(preferencesListener)
         super.onDestroy()
+    }
+
+    private fun clearInlineSuggestions(refreshBar: Boolean = false) {
+        inlineSuggestionEpoch += 1
+        inlineSuggestionViews.forEach { (it.parent as? ViewGroup)?.removeView(it) }
+        inlinePinnedViews.forEach { (it.parent as? ViewGroup)?.removeView(it) }
+        inlineSuggestionViews.clear()
+        inlinePinnedViews.clear()
+        val hadAny = inlineSuggestionsActive
+        inlineSuggestionsActive = false
+        idleStripSignature = null
+        if (refreshBar && hadAny && alive && active && ::bar.isInitialized && mode == "keys" && !composing) {
+            candidates()
+        }
+    }
+
+    @SuppressLint("RestrictedApi")
+    override fun onCreateInlineSuggestionsRequest(uiExtras: Bundle): InlineSuggestionsRequest? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        val dark = isDarkTheme
+        val chipBg =
+            Icon.createWithResource(
+                this,
+                if (dark) R.drawable.inline_autofill_chip_dark else R.drawable.inline_autofill_chip_light,
+            )
+        val titleColor = (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb).toInt()
+        val subtitleColor = (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
+        val style =
+            InlineSuggestionUi.newStyleBuilder()
+                .setSingleIconChipStyle(
+                    ViewStyle.Builder()
+                        .setBackground(chipBg)
+                        .setPadding(dp(8), 0, dp(8), 0)
+                        .setLayoutMargin(dp(2), dp(2), dp(2), dp(2))
+                        .build()
+                )
+                .setChipStyle(
+                    ViewStyle.Builder()
+                        .setBackground(chipBg)
+                        .setPadding(dp(10), 0, dp(10), 0)
+                        .setLayoutMargin(dp(3), dp(2), dp(3), dp(2))
+                        .build()
+                )
+                .setStartIconStyle(
+                    ImageViewStyle.Builder()
+                        .setMaxWidth(dp(20))
+                        .setMaxHeight(dp(20))
+                        .setLayoutMargin(0, 0, dp(6), 0)
+                        .build()
+                )
+                .setTitleStyle(
+                    TextViewStyle.Builder()
+                        .setTextColor(titleColor)
+                        .setTextSize(13f)
+                        .setTypeface("sans-serif-medium", Typeface.NORMAL)
+                        .build()
+                )
+                .setSubtitleStyle(
+                    TextViewStyle.Builder()
+                        .setTextColor(subtitleColor)
+                        .setTextSize(11.5f)
+                        .setLayoutMargin(dp(4), 0, 0, 0)
+                        .build()
+                )
+                .setEndIconStyle(
+                    ImageViewStyle.Builder()
+                        .setMaxWidth(dp(18))
+                        .setMaxHeight(dp(18))
+                        .setLayoutMargin(dp(6), 0, 0, 0)
+                        .build()
+                )
+                .build()
+        val stylesBundle = UiVersions.newStylesBuilder().addStyle(style).build()
+        val maxChipWidth = (resources.displayMetrics.widthPixels * 3 / 4).coerceAtLeast(dp(180))
+        val spec =
+            InlinePresentationSpec.Builder(Size(dp(36), dp(28)), Size(maxChipWidth, dp(36)))
+                .setStyle(stylesBundle)
+                .build()
+        return InlineSuggestionsRequest.Builder(listOf(spec))
+            .setMaxSuggestionCount(6)
+            .build()
+    }
+
+    override fun onInlineSuggestionsResponse(response: InlineSuggestionsResponse): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return false
+        val suggestions = response.inlineSuggestions.take(6)
+        val epoch = ++inlineSuggestionEpoch
+        inlineSuggestionViews.forEach { (it.parent as? ViewGroup)?.removeView(it) }
+        inlinePinnedViews.forEach { (it.parent as? ViewGroup)?.removeView(it) }
+        inlineSuggestionViews.clear()
+        inlinePinnedViews.clear()
+        inlineSuggestionsActive = false
+        idleStripSignature = null
+        if (suggestions.isEmpty()) {
+            if (alive && active && ::bar.isInitialized && mode == "keys" && !composing) {
+                candidates()
+            }
+            return true
+        }
+        val inflated = arrayOfNulls<View>(suggestions.size)
+        val pinned = BooleanArray(suggestions.size)
+        val size = Size(ViewGroup.LayoutParams.WRAP_CONTENT, dp(34))
+        suggestions.forEachIndexed { idx, suggestion ->
+            pinned[idx] = suggestion.info.isPinned
+            try {
+                suggestion.inflate(this, size, mainExecutor) { contentView ->
+                    if (!alive || epoch != inlineSuggestionEpoch) return@inflate
+                    if (contentView != null) {
+                        contentView.setZOrderedOnTop(true)
+                        inflated[idx] = contentView
+                        inlineSuggestionViews.clear()
+                        inlinePinnedViews.clear()
+                        for (i in inflated.indices) {
+                            val v = inflated[i] ?: continue
+                            if (pinned[i]) inlinePinnedViews.add(v) else inlineSuggestionViews.add(v)
+                        }
+                        inlineSuggestionsActive =
+                            inlineSuggestionViews.isNotEmpty() || inlinePinnedViews.isNotEmpty()
+                        idleStripSignature = null
+                        if (active && ::bar.isInitialized && mode == "keys" && !composing) {
+                            candidates()
+                        }
+                    }
+                }
+            } catch (_: Throwable) {
+                // Ignore malformed remote inline suggestion from third-party provider
+            }
+        }
+        return true
     }
 
     override fun onCreateInputView(): View {
@@ -286,6 +445,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     override fun onStartInput(info: EditorInfo?, restarting: Boolean) {
         super.onStartInput(info, restarting)
+        if (!restarting) clearInlineSuggestions(refreshBar = false)
         startEditor(info)
     }
 
@@ -294,6 +454,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (!active) startEditor(info)
         layoutPanel()
         render()
+    }
+
+    override fun onWindowShown() {
+        super.onWindowShown()
+        // On Android 10+, primaryClip becomes readable once the IME window gains focus.
+        onPrimaryClipChanged()
     }
 
     private fun resolveEnterLabel(info: EditorInfo?): String {
@@ -343,7 +509,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         active = true
         mode = "keys"
         numbers = false
-        symbolPage = false
         shiftState = 0
         syllableSplit = false
         shown = JSONArray()
@@ -353,6 +518,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         composing = false
         hwComposing = false
         preeditText = ""
+        preeditCursorUtf8 = 0
         enterLabel = resolveEnterLabel(info)
         val inputType = info?.inputType ?: 0
         val inputClass = inputType and InputType.TYPE_MASK_CLASS
@@ -390,7 +556,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         fieldForceEnglish = passwordEditor
         numbers = fieldKind == "number"
-        symbolPage = false
         autoCapMode =
             when {
                 fieldKind != "text" -> 0
@@ -532,6 +697,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     override fun onFinishInput() {
+        clearInlineSuggestions(refreshBar = false)
         invalidateEditor()
         Core.call(this, "on-ime-close")
         super.onFinishInput()
@@ -572,9 +738,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         predictionEpoch++
         predictionTask?.let { main.removeCallbacks(it) }
         predictionTask = null
-        val visible = predictionText.isNotEmpty()
+        val visible = predictionText.isNotEmpty() || predictionCandidates.isNotEmpty()
         val hadRemote = predictionActive || predictionId != 0L || visible
         predictionText = ""
+        predictionCandidates = emptyList()
+        predictionContextAfter = ""
         predictionId = 0
         predictionActive = false
         if (hadRemote) Core.call(this, "predict-cancel", auxiliary = true)
@@ -590,14 +758,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor)
                 return@Runnable
             // Never request surrounding text from a password editor.
-            val before = currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
+            val ic = currentInputConnection
+            val before = ic?.getTextBeforeCursor(200, 0)?.toString().orEmpty()
+            val after = ic?.getTextAfterCursor(80, 0)?.toString().orEmpty()
             predictionContext = before
+            predictionContextAfter = after
             predictionActive = true
             call(
                 "predict-request",
                 json(
                     "app_id" to (currentInputEditorInfo?.packageName ?: "android"),
                     "context_before" to before,
+                    "context_after" to after,
                     "trigger" to trigger,
                     "is_composing" to false,
                     "is_password" to false,
@@ -609,6 +781,20 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
         predictionTask = task
         main.postDelayed(task, delay)
+    }
+
+    private fun parsePredictionCandidates(r: JSONObject): List<String> {
+        val list = ArrayList<String>(4)
+        val arr = r.optJSONArray("candidates")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val c = arr.optString(i)
+                if (c.isNotEmpty() && c !in list) list.add(c)
+            }
+        }
+        val primary = r.optString("text")
+        if (primary.isNotEmpty() && primary !in list) list.add(0, primary)
+        return list.take(4)
     }
 
     private fun receivePrediction(r: JSONObject, epoch: Int, session: Int, polls: Int) {
@@ -631,11 +817,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 main.postDelayed(task, 120)
             }
             "ready" -> {
-                if (currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext) {
+                val ic = currentInputConnection
+                if (
+                    ic?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext ||
+                        ic?.getTextAfterCursor(80, 0)?.toString().orEmpty() != predictionContextAfter
+                ) {
                     cancelPrediction()
                     return
                 }
-                predictionText = r.optString("text")
+                predictionCandidates = parsePredictionCandidates(r)
+                predictionText = predictionCandidates.firstOrNull().orEmpty()
                 predictionActive = predictionText.isNotEmpty()
                 candidates()
                 refreshAeviouContextHints()
@@ -646,27 +837,33 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
-    private fun acceptPrediction() {
-        if (passwordEditor || composing || predictionText.isEmpty()) return
+    private fun acceptPrediction(choice: String = predictionText) {
+        if (passwordEditor || composing || choice.isEmpty()) return
         val ic = currentInputConnection ?: return
-        if (ic.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext) {
+        if (
+            ic.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext ||
+                ic.getTextAfterCursor(80, 0)?.toString().orEmpty() != predictionContextAfter
+        ) {
             cancelPrediction()
             return
         }
-        val text = predictionText
+        val text = choice
         val id = predictionId
         val epoch = predictionEpoch
         call("predict-poll", json("id" to id), auxiliary = true) { current ->
             if (epoch != predictionEpoch || predictionId != id || passwordEditor || composing) return@call
+            val liveCandidates = parsePredictionCandidates(current)
+            val liveIc = currentInputConnection
             if (
                 current.optString("status") != "ready" ||
-                    current.optString("text") != text ||
-                    currentInputConnection?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext
+                    text !in liveCandidates ||
+                    liveIc?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext ||
+                    liveIc?.getTextAfterCursor(80, 0)?.toString().orEmpty() != predictionContextAfter
             ) {
                 cancelPrediction()
                 return@call
             }
-            if (currentInputConnection?.commitText(text, 1) != true) return@call
+            if (liveIc?.commitText(text, 1) != true) return@call
             invalidateSurroundingCache()
             Core.call(this, "predict-accept", json("id" to id, "text" to text), auxiliary = true)
             cancelPrediction()
@@ -761,6 +958,22 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         }
         if (!event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed && mode == "keys") {
+            if (composing) {
+                val navKey =
+                    when (keyCode) {
+                        KeyEvent.KEYCODE_DPAD_LEFT -> 0xff51
+                        KeyEvent.KEYCODE_DPAD_RIGHT -> 0xff53
+                        KeyEvent.KEYCODE_MOVE_HOME -> 0xff50
+                        KeyEvent.KEYCODE_MOVE_END -> 0xff57
+                        KeyEvent.KEYCODE_FORWARD_DEL -> 0xffff
+                        else -> null
+                    }
+                if (navKey != null) {
+                    processKeyDirect(navKey) { applyAction(it) }
+                    handledHardwareKeys.add(keyCode)
+                    return true
+                }
+            }
             val text =
                 when {
                     keyCode == KeyEvent.KEYCODE_DEL && (!english || composing || pasteVisible) -> "⌫"
@@ -994,14 +1207,17 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             systemCopyId = marker
             return
         }
-        val stamp = description.timestamp
+        val rawStamp = description.timestamp
         val prefs = getSharedPreferences("vitral", 0)
-        if (prefs.getLong("clipboard_stamp", -1L) == stamp) return
+        if (rawStamp > 0L && prefs.getLong("clipboard_stamp", -1L) == rawStamp) return
         val text = clip.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString() ?: return
         if (text.isEmpty()) return
+        if (rawStamp <= 0L && text == lastPushedClipText) return
+        val stamp = if (rawStamp > 0L) rawStamp else System.currentTimeMillis()
+        lastPushedClipText = text
         ++clipboardRevision
         val revision = clipboardRevision
-        prefs.edit().putLong("clipboard_stamp", stamp).apply()
+        if (rawStamp > 0L) prefs.edit().putLong("clipboard_stamp", rawStamp).apply()
         Core.call(
             this,
             "clipboard-push",
@@ -1389,7 +1605,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun keysTreeSignature(dark: Boolean): String {
         val aeviouEnvTag = if (!flypy && aeviouExperimental) effectiveAeviouEnv().name else ""
-        return "keys|$floating|$isLandscape|$dark|$flypy|$english|$numbers|$symbolPage|$aeviouExperimental|$aeviouLeftHanded|$aeviouEnvTag|$fieldKind|$enterLabel|$sublabelMode|$font"
+        return "keys|$floating|$isLandscape|$dark|$flypy|$english|$numbers|$aeviouExperimental|$aeviouLeftHanded|$aeviouEnvTag|$fieldKind|$enterLabel|$sublabelMode|$font"
     }
 
     private fun render() {
@@ -1517,7 +1733,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 setPadding(dp(4), dp(if (compactChrome) 2 else 3), dp(4), dp(if (compactChrome) 2 else 3))
             }
         scroll.addView(bar)
-        sheet.addView(scroll, -1, dp(if (compactChrome) 30 else 36))
+        sheet.addView(scroll, -1, dp(if (compactChrome) 34 else 40))
         candidates()
 
         // Row 3: Active Input Surface
@@ -1547,6 +1763,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             "tools" -> showToolsSheet()
             "candidates" -> showCandidateGrid()
             "emoji" -> showEmojiPanel()
+            "symbols" -> showSymbolPanel()
             "edit" -> showTextEditPanel()
             "lookup",
             "continuous" -> {
@@ -1857,6 +2074,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         composing = false
         hwComposing = false
         preeditText = ""
+        preeditCursorUtf8 = 0
         Core.run(this, operation = { unpack(VitralNative.processKey(it, 27, 0, 0)) })
         if (next == "lookup" || next == "continuous") {
             hwErrorMessage = ""
@@ -1940,11 +2158,24 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             stripSplitActive = null
 
             val preeditView = label("", mono = true) {}
+            bindEditablePreeditTap(preeditView)
             stripPreeditView = preeditView
             addBarItem(preeditView, marginHorizontalDp = 3)
 
+            val delimiterView =
+                label("分词'", subtle = true) {
+                    if (canInsertDelimiterAtCursor()) {
+                        processKeyDirect('\''.code) { applyAction(it) }
+                    }
+                }.apply {
+                    setPadding(dp(8), dp(2), dp(8), dp(2))
+                    contentDescription = "插入拼音分词符"
+                }
+            stripDelimiterView = delimiterView
+            addBarItem(delimiterView, marginHorizontalDp = 2)
+
             val splitView =
-                label("分词", subtle = true) {
+                label("拆音", subtle = true) {
                     syllableSplit = !syllableSplit
                     call("set-syllable-split", json("enabled" to syllableSplit)) {
                         applyAction(it)
@@ -1989,12 +2220,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val preeditView = stripPreeditView
         if (preeditView != null) {
             if (preeditText.isNotEmpty()) {
-                val formatted = displayPreedit()
-                if (preeditView.text != formatted) preeditView.text = formatted
+                preeditView.text = styledPreeditText()
+                preeditView.background = preeditPillBackground(dark)
                 preeditView.visibility = View.VISIBLE
             } else {
                 preeditView.visibility = View.GONE
             }
+        }
+
+        val delimiterView = stripDelimiterView
+        if (delimiterView != null) {
+            delimiterView.visibility =
+                if (preeditText.isNotEmpty() && !english) View.VISIBLE else View.GONE
         }
 
         val splitView = stripSplitView
@@ -2132,6 +2369,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val idleQuickPunc =
             mode == "keys" &&
                 !composing &&
+                !inlineSuggestionsActive &&
                 shown.length() == 0 &&
                 predictionText.isEmpty() &&
                 lastDeletedText.isEmpty()
@@ -2222,7 +2460,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
             return
         }
-        if (mode == "clipboard" || mode == "emoji" || mode == "edit") {
+        if (mode == "clipboard" || mode == "emoji" || mode == "symbols" || mode == "edit") {
             addBarItem(label("← 返回键盘", highlight = true) { switch("keys") })
             if (mode == "edit") {
                 addBarItem(
@@ -2244,11 +2482,28 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     )
                 }
             }
+            if (mode == "symbols") {
+                val cats = listOf("最近", "中文", "英文", "数学", "序号", "特殊")
+                cats.forEachIndexed { idx, title ->
+                    addBarItem(
+                        label(title, highlight = symbolCategory == idx, subtle = symbolCategory != idx) {
+                            symbolCategory = idx
+                            render()
+                        }
+                    )
+                }
+                addBarItem(label("☺", subtle = true) { switch("emoji") })
+            }
             return
         }
         if (mode == "candidates") {
             if (preeditText.isNotEmpty()) {
-                addBarItem(label(displayPreedit(), mono = true) {}, marginHorizontalDp = 3)
+                val preView = label("", mono = true) {}.apply {
+                    text = styledPreeditText()
+                    background = preeditPillBackground(isDarkTheme)
+                }
+                bindEditablePreeditTap(preView)
+                addBarItem(preView, marginHorizontalDp = 3)
             }
             addBarItem(
                 label("⌃ 收起", highlight = true) {
@@ -2277,10 +2532,28 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             return
         }
         if (composing && preeditText.isNotEmpty()) {
-            addBarItem(label(displayPreedit(), mono = true) {}, marginHorizontalDp = 3)
+            val preView = label("", mono = true) {}.apply {
+                text = styledPreeditText()
+                background = preeditPillBackground(isDarkTheme)
+            }
+            bindEditablePreeditTap(preView)
+            addBarItem(preView, marginHorizontalDp = 3)
+            if (!english) {
+                addBarItem(
+                    label("分词'", subtle = true) {
+                        if (canInsertDelimiterAtCursor()) {
+                            processKeyDirect('\''.code) { applyAction(it) }
+                        }
+                    }.apply {
+                        setPadding(dp(8), dp(2), dp(8), dp(2))
+                        contentDescription = "插入拼音分词符"
+                    },
+                    marginHorizontalDp = 2,
+                )
+            }
             if (!flypy && !english) {
                 addBarItem(
-                    label("分词", solidAccent = syllableSplit, subtle = !syllableSplit) {
+                    label("拆音", solidAccent = syllableSplit, subtle = !syllableSplit) {
                         syllableSplit = !syllableSplit
                         call("set-syllable-split", json("enabled" to syllableSplit)) {
                             applyAction(it)
@@ -2291,6 +2564,22 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     },
                     marginHorizontalDp = 2,
                 )
+            }
+        }
+        if (!composing && mode == "keys" && inlineSuggestionsActive) {
+            val inlineViews = inlineSuggestionViews + inlinePinnedViews
+            inlineViews.forEach { v ->
+                (v.parent as? ViewGroup)?.removeView(v)
+                val lp =
+                    LinearLayout.LayoutParams(
+                            LinearLayout.LayoutParams.WRAP_CONTENT,
+                            dp(34),
+                        )
+                        .apply {
+                            gravity = Gravity.CENTER_VERTICAL
+                            setMargins(dp(3), 0, dp(3), 0)
+                        }
+                bar.addView(v, lp)
             }
         }
         if (!composing && lastDeletedText.isNotEmpty()) {
@@ -2304,15 +2593,21 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 }
             )
         }
-        if (!composing && !passwordEditor && mode == "keys" && predictionText.isNotEmpty()) {
-            addBarItem(
-                label("✨ $predictionText", highlight = true) { acceptPrediction() }.apply {
-                    setSingleLine(true)
-                    maxWidth = resources.displayMetrics.widthPixels * 3 / 4
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    contentDescription = "预测补全：$predictionText"
-                }
-            )
+        if (!composing && !passwordEditor && mode == "keys" && predictionCandidates.isNotEmpty()) {
+            val maxChipW = resources.displayMetrics.widthPixels * 2 / 3
+            predictionCandidates.forEachIndexed { idx, choice ->
+                val chipText = if (idx == 0) "✨ $choice" else choice
+                addBarItem(
+                    label(chipText, highlight = idx == 0, subtle = idx > 0) {
+                        acceptPrediction(choice)
+                    }.apply {
+                        setSingleLine(true)
+                        maxWidth = maxChipW
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        contentDescription = "预测补全：$choice"
+                    }
+                )
+            }
         }
         for (i in 0 until shown.length()) {
             val item = shown.getJSONObject(i)
@@ -2377,19 +2672,35 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 }.apply { contentDescription = "展开候选词" }
             )
 
-        // When idle & empty, offer sleek quick-punctuation chips so the strip is genuinely useful
-        if (!composing && shown.length() == 0 && predictionText.isEmpty() && lastDeletedText.isEmpty()) {
-            val quickPunc =
+        // When idle & empty, offer sleek quick-punctuation chips prioritizing recently used symbols
+        if (
+            !composing &&
+                !inlineSuggestionsActive &&
+                shown.length() == 0 &&
+                predictionText.isEmpty() &&
+                lastDeletedText.isEmpty()
+        ) {
+            val basePunc =
                 when {
                     fieldKind == "email" && english -> listOf("@", ".", "_", "-", ".com", ".cn", "gmail.com")
                     fieldKind == "uri" && english -> listOf("https://", ".", "/", ":", "?", "=", "-", ".com")
                     english -> listOf(",", ".", "?", "!", "@", "/", "-", "_", ":", "#")
                     else -> listOf("，", "。", "？", "！", "、", "：", "……", "（）", "“”", "《》")
                 }
+            val quickPunc =
+                if (fieldKind == "text") {
+                    val recent = storedRecentSymbols().filter { sym ->
+                        if (english) sym.all { it.code < 128 } else true
+                    }
+                    (recent + basePunc).distinct().take(12)
+                } else {
+                    basePunc
+                }
             quickPunc.forEach { p ->
                 addBarItem(
                     label(p, subtle = true) {
                         commitSmartText(p)
+                        if (fieldKind == "text") recordSymbol(p)
                     }.apply {
                         setPadding(dp(12), dp(2), dp(12), dp(2))
                     },
@@ -2403,13 +2714,89 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val ic = currentInputConnection ?: return
         ic.commitText(text, 1)
         invalidateSurroundingCache()
-        if (text in setOf("（）", "“”", "《》", "「」", "『』", "【】", "()", "\"\"", "[]", "{}")) {
+        if (text in setOf("（）", "“”", "《》", "「」", "『』", "【】", "〈〉", "〔〕", "()", "\"\"", "[]", "{}")) {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_DPAD_LEFT)
         }
     }
 
-    private fun displayPreedit(): String =
-        formatPreedit(preeditText, shown.optJSONObject(0)?.optString("comment").orEmpty())
+    private fun currentPreeditDisplay(): PreeditDisplay =
+        buildPreeditDisplay(
+            preeditText,
+            shown.optJSONObject(0)?.optString("comment").orEmpty(),
+            preeditCursorUtf8,
+        )
+
+    private fun displayPreedit(): String = currentPreeditDisplay().text
+
+    private fun preeditEditingMidString(): Boolean =
+        preeditText.isNotEmpty() &&
+            preeditCursorUtf8 < preeditText.toByteArray(Charsets.UTF_8).size
+
+    private fun canInsertDelimiterAtCursor(): Boolean {
+        if (!composing || english || preeditText.isEmpty()) return false
+        val bytes = preeditText.toByteArray(Charsets.UTF_8)
+        val pos = preeditCursorUtf8.coerceIn(0, bytes.size)
+        if (pos == 0) return false
+        return bytes[pos - 1].toInt() != '\''.code
+    }
+
+    private fun preeditPillBackground(dark: Boolean): GradientDrawable? {
+        if (!preeditEditingMidString()) return null
+        return pillDrawable(
+            if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb,
+            T.Radius.candidateActivePillPx,
+            if (dark) 0x6638BDF8L else 0x550284C7L,
+        )
+    }
+
+    private fun styledPreeditText(): CharSequence {
+        val display = currentPreeditDisplay()
+        if (display.text.isEmpty()) return ""
+        val dark = isDarkTheme
+        val caretColor =
+            (if (dark) T.Dark.accentPrimaryArgb else T.Light.accentPrimaryArgb).toInt()
+        val caretPos = display.cursorIndex.coerceIn(0, display.text.length)
+        return SpannableStringBuilder(display.text).apply {
+            insert(caretPos, "|")
+            setSpan(
+                ForegroundColorSpan(caretColor),
+                caretPos,
+                caretPos + 1,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+            setSpan(
+                StyleSpan(Typeface.BOLD),
+                caretPos,
+                caretPos + 1,
+                Spanned.SPAN_EXCLUSIVE_EXCLUSIVE,
+            )
+        }
+    }
+
+    private fun bindEditablePreeditTap(view: TextView) {
+        view.contentDescription = "点击定位拼音光标"
+        view.setOnTouchListener { v, event ->
+            if (event.actionMasked == MotionEvent.ACTION_UP && composing && preeditText.isNotEmpty()) {
+                val tv = v as TextView
+                val tapOffset = tv.getOffsetForPosition(event.x, event.y)
+                val targetUtf8 =
+                    visualTapToRawByteOffset(currentPreeditDisplay(), tapOffset, hasCaret = true)
+                vibrator?.vibrate(
+                    VibrationEffect.createOneShot(
+                        T.Ergonomics.hapticLetterTickMs.toLong(),
+                        VibrationEffect.DEFAULT_AMPLITUDE,
+                    )
+                )
+                call("set-preedit-cursor", json("cursor_utf8" to targetUtf8)) {
+                    applyAction(it)
+                    if (mode == "candidates") showCandidateGrid()
+                }
+                true
+            } else {
+                event.actionMasked == MotionEvent.ACTION_DOWN
+            }
+        }
+    }
 
     private fun bindCandidateMenu(view: View, item: JSONObject) {
         if (item.has("quick_paste_id") || item.has("function_action")) return
@@ -2435,6 +2822,19 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
+    private fun candidateGridSpan(text: String): Int {
+        var units = 0
+        for (ch in text) {
+            units += if (ch.code > 127) 2 else 1
+        }
+        return when {
+            units <= 4 -> 1
+            units <= 10 -> 2
+            units <= 16 -> 3
+            else -> 4
+        }
+    }
+
     private fun showCandidateGrid() {
         val dark = isDarkTheme
         body.removeAllViews()
@@ -2449,46 +2849,55 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val cols = 4
         var idx = 0
         while (idx < shown.length()) {
-            val row = LinearLayout(this)
-            for (c in 0 until cols) {
-                if (idx < shown.length()) {
-                    val item = shown.getJSONObject(idx)
-                    val pos = idx
-                    val text = item.getString("text")
-                    val cell =
-                        label(text, highlight = pos == 0) {
-                            selectCandidateDirect(item.getInt("index")) { r ->
-                                applyAction(r)
-                                if (mode == "candidates") {
-                                    showCandidateGrid()
-                                }
-                            }
-                        }.apply {
-                            bindCandidateMenu(this, item)
-                            setSingleLine(true)
-                            ellipsize = android.text.TextUtils.TruncateAt.END
-                            background =
-                                pillDrawable(
-                                    if (pos == 0) {
-                                        if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb
-                                    } else {
-                                        if (dark) 0x12FFFFFFL else 0xE2FFFFFFL
-                                    },
-                                    10,
-                                    if (pos == 0) (if (dark) 0x450EA5E9L else 0x350284C7L)
-                                    else (if (dark) 0x16FFFFFFL else 0x120F172AL),
-                                )
-                        }
-                    row.addView(
-                        cell,
-                        LinearLayout.LayoutParams(0, dp(42), 1f).apply {
-                            setMargins(dp(3), dp(3), dp(3), dp(3))
-                        },
-                    )
-                    idx++
-                } else {
-                    row.addView(View(this), LinearLayout.LayoutParams(0, dp(42), 1f))
+            val row =
+                LinearLayout(this).apply {
+                    weightSum = cols.toFloat()
                 }
+            var usedCols = 0
+            while (idx < shown.length() && usedCols < cols) {
+                val item = shown.getJSONObject(idx)
+                val text = item.getString("text")
+                val span = candidateGridSpan(text).coerceAtMost(cols)
+                if (usedCols > 0 && usedCols + span > cols) break
+                val pos = idx
+                val isUser = item.optBoolean("is_user_phrase", false)
+                val displayText = if (isUser) "$text ·" else text
+                val cell =
+                    label(displayText, highlight = pos == 0) {
+                        selectCandidateDirect(item.getInt("index")) { r ->
+                            applyAction(r)
+                            if (mode == "candidates") {
+                                showCandidateGrid()
+                            }
+                        }
+                    }.apply {
+                        bindCandidateMenu(this, item)
+                        setSingleLine(true)
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                        contentDescription = if (isUser) "$text（自学习词）" else text
+                        background =
+                            pillDrawable(
+                                if (pos == 0) {
+                                    if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb
+                                } else {
+                                    if (dark) 0x12FFFFFFL else 0xE2FFFFFFL
+                                },
+                                10,
+                                if (pos == 0) (if (dark) 0x450EA5E9L else 0x350284C7L)
+                                else (if (dark) 0x16FFFFFFL else 0x120F172AL),
+                            )
+                    }
+                row.addView(
+                    cell,
+                    LinearLayout.LayoutParams(0, dp(42), span.toFloat()).apply {
+                        setMargins(dp(3), dp(3), dp(3), dp(3))
+                    },
+                )
+                usedCols += span
+                idx++
+            }
+            if (usedCols < cols) {
+                row.addView(View(this), LinearLayout.LayoutParams(0, dp(42), (cols - usedCols).toFloat()))
             }
             grid.addView(row, LinearLayout.LayoutParams(-1, -2))
         }
@@ -2519,6 +2928,130 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             )
         }
         grid.addView(pager, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    private fun storedRecentSymbols(): List<String> {
+        val raw = getSharedPreferences("vitral", 0).getString("recent_symbols", "").orEmpty()
+        return raw.split('\u001F').filter { it.isNotEmpty() }
+    }
+
+    private fun recentSymbols(): List<String> {
+        val stored = storedRecentSymbols()
+        val defaults =
+            if (english) {
+                listOf(
+                    ",", ".", "?", "!", ":", ";", "-", "_",
+                    "()", "\"\"", "'", "/", "@", "#", "$", "%",
+                    "&", "*", "+", "=", "[]", "{}", "<", ">",
+                )
+            } else {
+                listOf(
+                    "，", "。", "？", "！", "、", "：", "；", "……",
+                    "（）", "“”", "《》", "——", "【】", "「」", "~", "@",
+                    "#", "￥", "%", "+", "-", "×", "÷", "=",
+                )
+            }
+        return (stored + defaults).distinct().take(28)
+    }
+
+    private fun recordSymbol(sym: String) {
+        if (sym.isEmpty()) return
+        val next = (listOf(sym) + storedRecentSymbols().filter { it != sym }).take(28)
+        getSharedPreferences("vitral", 0)
+            .edit()
+            .putString("recent_symbols", next.joinToString("\u001F"))
+            .apply()
+        idleStripSignature = null
+    }
+
+    private fun showSymbolPanel() {
+        val dark = isDarkTheme
+        body.removeAllViews()
+        val list =
+            when (symbolCategory) {
+                1 ->
+                    listOf(
+                        "，", "。", "？", "！", "、", "：", "；",
+                        "（）", "“”", "《》", "【】", "「」", "『』", "……",
+                        "——", "‘", "’", "·", "～", "￥", "％",
+                        "〈〉", "〔〕", "—", "｜", "＼", "／", "＃",
+                    )
+                2 ->
+                    listOf(
+                        ",", ".", "?", "!", ":", ";", "'",
+                        "()", "\"\"", "[]", "{}", "<", ">", "-",
+                        "_", "/", "\\", "|", "@", "#", "$",
+                        "%", "^", "&", "*", "+", "=", "~",
+                    )
+                3 ->
+                    listOf(
+                        "+", "-", "×", "÷", "=", "≠", "≈",
+                        "<", ">", "≤", "≥", "±", "√", "∞",
+                        "%", "‰", "°", "℃", "π", "∑", "∫",
+                        "α", "β", "γ", "Δ", "λ", "μ", "Ω",
+                    )
+                4 ->
+                    listOf(
+                        "①", "②", "③", "④", "⑤", "⑥", "⑦",
+                        "⑧", "⑨", "⑩", "⑴", "⑵", "⑶", "⑷",
+                        "⑸", "⒈", "⒉", "⒊", "⒋", "⒌", "Ⅰ",
+                        "Ⅱ", "Ⅲ", "Ⅳ", "Ⅴ", "Ⅵ", "Ⅶ", "Ⅷ",
+                    )
+                5 ->
+                    listOf(
+                        "→", "←", "↑", "↓", "↔", "⇒", "⇔",
+                        "✓", "✗", "★", "☆", "●", "○", "■",
+                        "□", "▲", "△", "◆", "◇", "§", "※",
+                        "©", "®", "™", "℃", "℉", "€", "£",
+                    )
+                else -> recentSymbols()
+            }
+        val scroll = ScrollView(this).apply { isVerticalScrollBarEnabled = false }
+        val grid =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+            }
+        scroll.addView(grid)
+        body.addView(scroll, LinearLayout.LayoutParams(-1, -1))
+        val cols = 7
+        var i = 0
+        while (i < list.size) {
+            val row = LinearLayout(this)
+            for (c in 0 until cols) {
+                if (i < list.size) {
+                    val sym = list[i++]
+                    val tv =
+                        TextView(this).apply {
+                            text = sym
+                            textSize = if (sym.length >= 2) 15f else 17f
+                            gravity = Gravity.CENTER
+                            setTextColor(
+                                (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb).toInt()
+                            )
+                            background =
+                                pillDrawable(
+                                    if (dark) 0x12FFFFFFL else 0xE2FFFFFFL,
+                                    10,
+                                    if (dark) 0x16FFFFFFL else 0x120F172AL,
+                                )
+                            setOnClickListener {
+                                commitSmartText(sym)
+                                recordSymbol(sym)
+                            }
+                        }
+                    row.addView(
+                        tv,
+                        LinearLayout.LayoutParams(0, dp(42), 1f).apply {
+                            setMargins(dp(2), dp(2), dp(2), dp(2))
+                        },
+                    )
+                } else {
+                    row.addView(View(this), LinearLayout.LayoutParams(0, dp(42), 1f))
+                }
+            }
+            grid.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
     }
 
     private fun recentEmojis(): List<String> {
@@ -3352,7 +3885,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         darkOverride = dark,
                         sublabelMode = sublabelMode,
                         isComposing = { composing },
-                        canScrubSpace = { !composing },
+                        canScrubSpace = { true },
                     )
                 line.addView(key, LinearLayout.LayoutParams(0, -1, weightFn(s)))
             }
@@ -3362,35 +3895,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
 
         if (numbers) {
-            if (symbolPage) {
-                val symRows =
-                    if (english) {
-                        listOf(
-                            listOf("!", "@", "#", "$", "%", "^", "&", "*", "(", ")"),
-                            listOf("-", "_", "=", "+", "[", "]", "{", "}", "\\", "/"),
-                            listOf("123", ":", ";", "\"", "'", "<", ">", "?", "⌫"),
-                            listOf("ABC", ",", "空格", ".", "↵"),
-                        )
-                    } else {
-                        listOf(
-                            listOf("！", "？", "：", "；", "（）", "“”", "《》", "、", "……", "——"),
-                            listOf("【】", "「」", "『』", "‘", "’", "~", "@", "#", "￥", "%"),
-                            listOf("123", "+", "-", "×", "÷", "=", "/", "☺", "⌫"),
-                            listOf("ABC", "，", "空格", "。", "↵"),
-                        )
-                    }
-                symRows.forEachIndexed { idx, rowKeys ->
-                    addKeyRow(rowKeys) { s ->
-                        when {
-                            idx == 2 && (s == "123" || s == "⌫") -> 1.45f
-                            idx == 3 && s == "空格" -> 3.6f
-                            idx == 3 && (s == "ABC" || s == "↵") -> 1.45f
-                            else -> 1f
-                        }
-                    }
-                }
-                return
-            }
             addKeyRow(listOf("+", "1", "2", "3", "⌫")) { if (it == "+" || it == "⌫") 1.05f else 1.25f }
             addKeyRow(listOf("-", "4", "5", "6", "符号")) { if (it == "-" || it == "符号") 1.05f else 1.25f }
             addKeyRow(listOf("×", "7", "8", "9", ".")) { if (it == "×" || it == ".") 1.05f else 1.25f }
@@ -3447,6 +3951,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             listOf("123", leftPunct, "空格", rightPunct, "↵"),
             upperOverride = { s ->
                 when (s) {
+                    "123" -> "符号"
                     "，" -> "？"
                     "。" -> "！"
                     "," -> "?"
@@ -3548,21 +4053,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         when (label) {
             "123" -> {
                 numbers = true
-                symbolPage = false
                 layoutPanel()
                 render()
                 return
             }
             "符号" -> {
-                numbers = true
-                symbolPage = true
-                layoutPanel()
-                render()
+                numbers = false
+                symbolCategory = 0
+                switch("symbols")
                 return
             }
             "ABC" -> {
                 numbers = false
-                symbolPage = false
                 layoutPanel()
                 render()
                 return
@@ -3609,7 +4111,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
             "cursor-left",
             "cursor-right" -> {
-                if (composing) return
+                if (composing) {
+                    processKeyDirect(if (label == "cursor-left") 0xff51 else 0xff53) {
+                        applyAction(it)
+                    }
+                    return
+                }
                 sendDownUpKeyEvents(
                     if (label == "cursor-left") KeyEvent.KEYCODE_DPAD_LEFT
                     else KeyEvent.KEYCODE_DPAD_RIGHT
@@ -3841,6 +4348,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
         lastCommittedText = ""
         predictionText = ""
+        predictionCandidates = emptyList()
+        predictionContextAfter = ""
         invalidateSurroundingCache()
         if (composing) {
             processKeyDirect(27) {
@@ -4028,8 +4537,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             repeat((-delta).coerceAtMost(4)) { sendDownUpKeyEvents(KeyEvent.KEYCODE_DPAD_LEFT) }
             invalidateSurroundingCache()
         }
-        val pre = r.optJSONObject("preedit")?.optString("text").orEmpty()
+        val preObj = r.optJSONObject("preedit")
+        val pre = preObj?.optString("text").orEmpty()
         preeditText = pre
+        preeditCursorUtf8 =
+            if (pre.isNotEmpty()) {
+                preObj?.optInt("cursor_utf8", pre.toByteArray(Charsets.UTF_8).size)
+                    ?: pre.toByteArray(Charsets.UTF_8).size
+            } else {
+                0
+            }
         shown = r.optJSONArray("candidates") ?: JSONArray()
         if (pre.isNotEmpty()) ic.setComposingText(displayPreedit(), 1)
         else if (composing && committed.isEmpty()) ic.setComposingText("", 1)

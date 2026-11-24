@@ -122,4 +122,23 @@ class KeyboardInteractionTest {
         assertEquals("ni2hao", formatPreedit("ni2hao", "ni hao"))
         assertEquals("", formatPreedit("", "ni hao"))
     }
+
+    @Test
+    fun preeditDisplayMapsCursorAndTapOffsetsAcrossFormattedAndCjkPreedit() {
+        val d = buildPreeditDisplay("nihao", "ni hao", 2)
+        assertEquals("ni'hao", d.text)
+        // Byte 2 is at the boundary between "ni" and "hao"
+        assertEquals(3, d.cursorIndex)
+        assertEquals(0, visualTapToRawByteOffset(d, 0, hasCaret = true))
+        assertEquals(1, visualTapToRawByteOffset(d, 1, hasCaret = true))
+        assertEquals(2, visualTapToRawByteOffset(d, 2, hasCaret = true))
+        assertEquals(3, visualTapToRawByteOffset(d, 5, hasCaret = true))
+        assertEquals(5, visualTapToRawByteOffset(d, 7, hasCaret = true))
+
+        val cjk = buildPreeditDisplay("你好wo", "", 6)
+        assertEquals("你好wo", cjk.text)
+        assertEquals(2, cjk.cursorIndex)
+        assertEquals(3, visualTapToRawByteOffset(cjk, 1, hasCaret = true))
+        assertEquals(7, visualTapToRawByteOffset(cjk, 4, hasCaret = true))
+    }
 }

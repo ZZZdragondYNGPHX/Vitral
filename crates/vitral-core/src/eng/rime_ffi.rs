@@ -276,6 +276,8 @@ pub struct RimeSnapshot {
     pub commit_text: Option<String>,
     pub preedit: String,
     pub cursor_utf8: usize,
+    pub raw_input: String,
+    pub raw_cursor: usize,
     pub page_index: usize,
     pub page_size: usize,
     pub has_prev: bool,
@@ -718,6 +720,17 @@ impl RimeRuntime {
         self.snapshot(sid)
     }
 
+    pub fn set_caret_pos(
+        &mut self,
+        sid: RimeSessionId,
+        cursor: usize,
+    ) -> Result<RimeSnapshot, VitralError> {
+        let set_caret_pos = unsafe { (*self.api).set_caret_pos }
+            .ok_or_else(|| VitralError::Internal("librime set_caret_pos is unavailable".into()))?;
+        unsafe { set_caret_pos(sid, cursor) };
+        self.snapshot(sid)
+    }
+
     pub fn change_page(&mut self, sid: RimeSessionId, backward: bool) -> Result<RimeSnapshot, VitralError> {
         let api = unsafe { &*self.api };
         if let Some(cp) = api.change_page {
@@ -798,10 +811,22 @@ impl RimeRuntime {
             }
         }
 
+        let (raw_input, raw_cursor) = unsafe {
+            let input = api.get_input.map_or(std::ptr::null(), |get| get(sid));
+            let input = if input.is_null() {
+                String::new()
+            } else {
+                CStr::from_ptr(input).to_string_lossy().into_owned()
+            };
+            let cursor = api.get_caret_pos.map_or(input.len(), |get| get(sid));
+            (input, cursor)
+        };
         Ok(RimeSnapshot {
             commit_text,
             preedit,
             cursor_utf8,
+            raw_input,
+            raw_cursor,
             page_index,
             page_size,
             has_prev,

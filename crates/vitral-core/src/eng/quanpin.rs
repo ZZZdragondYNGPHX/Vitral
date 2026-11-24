@@ -1,4 +1,5 @@
 use crate::eng::gram::RimeGramDb;
+use crate::eng::TypoCorrectionLevel;
 use crate::imp::polyphone::RimeDictCorpus;
 use crate::imp::xiaohe::{canonical_syllable_set, xiaohe_reverse_map};
 use crate::imp::ImportedLexiconIndex;
@@ -342,7 +343,7 @@ fn build_quanpin_syllable_paths(raw_input: &str, syllable_split: bool) -> Syllab
 
 fn is_initial(s: &str) -> bool {
     matches!(s, "zh" | "ch" | "sh")
-        || (s.len() == 1 && b"bpmfdtnlgkhjqxrzcsyw".contains(&s.as_bytes()[0]))
+        || (s.len() == 1 && is_initial_byte(s.as_bytes()[0]))
 }
 
 fn exact_reading_end(edges: &[Vec<SyllableEdge>]) -> usize {
@@ -521,6 +522,7 @@ pub(super) fn decode_quanpin_with_fuzzy(
         fuzzy,
         syllable_split,
         "",
+        TypoCorrectionLevel::Standard,
     )
 }
 
@@ -535,6 +537,7 @@ pub(super) fn decode_quanpin_context(
     fuzzy: bool,
     syllable_split: bool,
     left_context: &str,
+    correction_level: TypoCorrectionLevel,
 ) -> Vec<QuanpinCandidate> {
     let mut dag = build_quanpin_syllable_paths(raw_input, syllable_split);
     if fuzzy {
@@ -562,101 +565,34 @@ pub(super) fn decode_quanpin_context(
         .map(|c| c.to_ascii_lowercase())
         .collect();
     if !canonical_syllable_set().contains(compact.as_str()) {
-        for (word, weight) in corpus.abbreviations(&compact) {
-            if retention.is_some_and(|r| r.erased_words.contains(word)) {
-                continue;
-            }
+        let ranked = if is_consonant_abbreviation(&compact) {
+            ranked_abbreviations(&compact, corpus, gram, retention)
+        } else {
+            Vec::new()
+        };
+        for (word, score) in ranked.iter().copied().chain(
+            corpus.abbreviations(&compact).filter_map(|(word, weight)| {
+                (!ranked.iter().any(|&(ranked, _)| ranked == word)
+                    && !retention.is_some_and(|r| r.erased_words.contains(word)))
+                    .then_some((word, (weight as f64).ln_1p() - 12.0))
+            }),
+        ) {
             let Some((syllables, _)) = corpus.word_reading(word) else {
                 continue;
             };
             candidates.push(QuanpinCandidate {
                 text: word.to_owned(),
-                score: (weight as f64 + 1.0).ln() - 12.0,
+                score,
                 consumed_len: dag.len,
                 syllables: syllables.map(str::to_owned).collect(),
                 segments: vec![word.to_owned()],
             });
         }
     }
-    let exact_end = dag.exact_end;
-    let tail = &compact[exact_end..];
-    let has_full_word = candidates.iter().any(|c| {
-        c.consumed_len == dag.len
-            && c.segments.len() == 1
-            && c.text.chars().count() >= 2
-            && c.text.chars().all(crate::ret::is_cjk)
-    });
-    let unfinished_vowel_tail =
-        !has_full_word && tail.len() >= 2 && tail.bytes().any(|b| b"aeiouv".contains(&b));
-    let reliable_exact_word = candidates.iter().any(|c| {
-        c.consumed_len == dag.len
-            && crate::imp::xiaohe::matches_quanpin_reading(&c.syllables, raw_input)
-            && c.segments.iter().any(|word| {
-                word.chars().count() >= 2
-                    && (corpus
-                        .word_weight(word)
-                        .is_some_and(|weight| weight >= 1000)
-                        || retention.is_some_and(|r| r.user_phrases.contains_key(word))
-                        || imported.is_some_and(|i| i.contains_hotword(word)))
-            })
-    });
-    let scattered = !canonical_syllable_set().contains(compact.as_str())
-        && exact_end == dag.len
-        && !reliable_exact_word;
-    let has_full_chinese = candidates
-        .iter()
-        .any(|c| c.consumed_len == dag.len && c.text.chars().all(crate::ret::is_cjk));
-    if scattered || unfinished_vowel_tail || !has_full_chinese {
-        let mut corrections = Vec::new();
-        // A long, readable prefix is already usable. Only revisit its spelling when
-        // a correction has support from a whole word.
-        let can_complete_tail = dag.edges.get(exact_end).is_some_and(|edges| {
-            edges
-                .iter()
-                .any(|(end, _, penalty)| *end == dag.len && *penalty == 2.0)
-        });
-        let word_only = scattered || (exact_end >= 8 && has_full_chinese && can_complete_tail);
-        let plan = correction_plan(raw_input, false);
-        let edits = correction_dags(&plan, syllable_split, corpus, imported, retention);
-        for edit in edits
-            .iter()
-            .filter(|edit| !word_only || edit.word_weight > 0)
-            .take(if word_only { 2 } else { 4 })
-        {
-            let mut recovered = decode_from_syllable_dag(
-                &edit.dag,
-                true,
-                syllable_split,
-                corpus,
-                gram,
-                imported,
-                retention,
-                DecodeTarget::Correction,
-                left_context,
-                &mut incoming,
-            );
-            recovered.retain(|c| {
-                c.consumed_len == edit.dag.len
-                    && c.text.chars().all(crate::ret::is_cjk)
-                    && crate::imp::xiaohe::matches_quanpin_reading(&c.syllables, edit.code)
-                    && (!scattered || (c.segments.len() == 1 && c.text.chars().count() >= 2))
-            });
-            for candidate in &mut recovered {
-                candidate.consumed_len = dag.len;
-                candidate.score -= 6.0;
-            }
-            let reliable = edit.quality <= 1 && edit.word_weight >= 1000 && !recovered.is_empty();
-            corrections.extend(recovered);
-            if reliable {
-                break;
-            }
-        }
-        if scattered {
-            corrections.sort_by(|a, b| b.score.total_cmp(&a.score));
-            corrections.truncate(3);
-        }
-        candidates.extend(corrections);
-    }
+    append_corrections(
+        &mut candidates, &dag, raw_input, false, syllable_split, corpus, gram, imported,
+        retention, left_context, correction_level, &mut incoming,
+    );
     if syllable_split {
         let forced_full_split = canonical_syllable_set().contains(compact.as_str())
             && can_zero_initial_split(&compact)
@@ -687,7 +623,9 @@ pub fn decode_xiaohe_long_context(
     retention: Option<&RetentionEngine>,
     top_k: usize,
 ) -> Vec<QuanpinCandidate> {
-    decode_xiaohe_context(raw_input, corpus, gram, imported, retention, top_k, "")
+    decode_xiaohe_context(
+        raw_input, corpus, gram, imported, retention, top_k, "", TypoCorrectionLevel::Standard,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -699,6 +637,7 @@ pub(super) fn decode_xiaohe_context(
     retention: Option<&RetentionEngine>,
     top_k: usize,
     left_context: &str,
+    correction_level: TypoCorrectionLevel,
 ) -> Vec<QuanpinCandidate> {
     let dag = build_xiaohe_syllable_paths(raw_input);
     if dag.len == 0 {
@@ -717,45 +656,10 @@ pub(super) fn decode_xiaohe_context(
         left_context,
         &mut incoming,
     );
-    if !candidates
-        .iter()
-        .any(|c| c.consumed_len == dag.len && c.segments.iter().any(|s| s.chars().count() >= 2))
-    {
-        let plan = correction_plan(raw_input, true);
-        for edit in correction_dags(&plan, false, corpus, imported, retention)
-            .iter()
-            .filter(|edit| edit.word_weight > 0)
-            .take(2)
-        {
-            let mut recovered = decode_from_syllable_dag(
-                &edit.dag,
-                false,
-                false,
-                corpus,
-                gram,
-                imported,
-                retention,
-                DecodeTarget::Correction,
-                left_context,
-                &mut incoming,
-            );
-            recovered.retain(|c| {
-                c.consumed_len == edit.dag.len
-                    && c.segments.len() == 1
-                    && c.text.chars().count() >= 2
-                    && c.text.chars().all(crate::ret::is_cjk)
-            });
-            for c in &mut recovered {
-                c.score -= 6.0;
-                c.consumed_len = dag.len;
-            }
-            let reliable = edit.quality <= 1 && edit.word_weight >= 1000 && !recovered.is_empty();
-            candidates.extend(recovered);
-            if reliable {
-                break;
-            }
-        }
-    }
+    append_corrections(
+        &mut candidates, &dag, raw_input, true, false, corpus, gram, imported,
+        retention, left_context, correction_level, &mut incoming,
+    );
     for candidate in &mut candidates {
         candidate.consumed_len = raw_offset(raw_input, candidate.consumed_len);
     }
@@ -1683,6 +1587,219 @@ struct Correction<'a> {
     dag: SyllableDag,
 }
 
+pub(super) const HIGH_DICTIONARY_WEIGHT: u64 = 5_000;
+
+#[derive(Default)]
+pub(super) struct ExactWordMatch {
+    pub weight: u64,
+    pub personal: bool,
+}
+
+impl ExactWordMatch {
+    pub(super) fn allows(&self, level: TypoCorrectionLevel) -> bool {
+        !self.personal
+            && match level {
+                TypoCorrectionLevel::Off => false,
+                TypoCorrectionLevel::Conservative => self.weight == 0,
+                TypoCorrectionLevel::Standard => self.weight < HIGH_DICTIONARY_WEIGHT,
+                TypoCorrectionLevel::Aggressive => true,
+            }
+    }
+
+    pub(super) fn supports(&self, level: TypoCorrectionLevel, quality: u8, weight: u64) -> bool {
+        self.weight == 0
+            || (weight > 0
+                && (self.weight < HIGH_DICTIONARY_WEIGHT
+                    || (level == TypoCorrectionLevel::Aggressive
+                        && quality <= 1
+                        && weight > self.weight)))
+    }
+}
+
+fn visit_exact_readings(dag: &SyllableDag, flypy: bool, mut visit: impl FnMut(&[&str])) {
+    if dag.len == 0 || dag.exact_end != dag.len {
+        return;
+    }
+    let mut stack = vec![(0, [""; 12], 0)];
+    for _ in 0..64 {
+        let Some((pos, syllables, len)) = stack.pop() else {
+            break;
+        };
+        if pos == dag.len {
+            visit(&syllables[..len]);
+        } else if len < syllables.len() {
+            for (next, syllable, penalty) in &dag.edges[pos] {
+                if (*penalty == 0.0 || (flypy && *penalty == 0.5))
+                    && (dag.len == 1 || !matches!(syllable.as_ref(), "m" | "n"))
+                {
+                    let mut reading = syllables;
+                    reading[len] = syllable;
+                    stack.push((*next, reading, len + 1));
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn visit_exact_words(
+    code: &str,
+    flypy: bool,
+    corpus: &RimeDictCorpus,
+    imported: Option<&ImportedLexiconIndex>,
+    retention: Option<&RetentionEngine>,
+    mut visit: impl FnMut(&str, &str, u64, u32),
+) {
+    let dag = if flypy {
+        build_xiaohe_syllable_paths(code)
+    } else {
+        build_quanpin_syllable_paths(code, false)
+    };
+    visit_dag_words(&dag, code, flypy, corpus, imported, retention, |word, reading, weight, count| {
+        visit(word, reading, weight, count);
+    });
+}
+
+fn visit_dag_words(
+    dag: &SyllableDag,
+    code: &str,
+    flypy: bool,
+    corpus: &RimeDictCorpus,
+    imported: Option<&ImportedLexiconIndex>,
+    retention: Option<&RetentionEngine>,
+    mut visit: impl FnMut(&str, &str, u64, u32),
+) {
+    let compact = code.replace(['\'', ' '], "");
+    let entries = imported.map_or(&[][..], |index| {
+        if flypy { index.xiaohe_entries(&compact) } else { index.quanpin_entries(&compact) }
+    });
+    let mut add = |word: &str, reading: &str, weight, count| {
+        if word.chars().all(crate::ret::is_cjk)
+            && !retention.is_some_and(|r| r.erased_words.contains(word))
+            && imported.is_none_or(|i| i.matches_reading(word, reading, false))
+        {
+            visit(word, reading, weight, count);
+        }
+    };
+    let mut spaced = String::new();
+    visit_exact_readings(dag, flypy, |syllables| {
+        write_spaced_reading(&mut spaced, syllables);
+        for entry in entries.iter().filter(|entry| entry.pinyin == spaced) {
+            add(&entry.text, &spaced, u64::from(entry.weight), 0);
+        }
+        if let Some(retention) = retention {
+            for phrase in retention.user_phrases_by_reading(&spaced) {
+                add(&phrase.word, &spaced, 0, phrase.count);
+            }
+        }
+        for (word, weight) in corpus.spaced_pinyin_words(&spaced).take(24) {
+            add(word, &spaced, weight, 0);
+        }
+    });
+}
+
+fn write_spaced_reading(output: &mut String, syllables: &[&str]) {
+    output.clear();
+    output.push_str(syllables[0]);
+    for syllable in &syllables[1..] {
+        output.push(' ');
+        output.push_str(syllable);
+    }
+}
+
+pub(super) fn exact_word_match(
+    code: &str,
+    flypy: bool,
+    corpus: &RimeDictCorpus,
+    imported: Option<&ImportedLexiconIndex>,
+    retention: Option<&RetentionEngine>,
+) -> ExactWordMatch {
+    let mut exact = ExactWordMatch::default();
+    visit_exact_words(code, flypy, corpus, imported, retention, |word, _, weight, count| {
+        exact.weight = exact.weight.max(weight).max(1 + u64::from(count));
+        exact.personal |= count >= 3 || retention.is_some_and(|r| {
+            r.pinned_words.contains(word) || r.frecency.get(word).is_some_and(|&score| score >= 3.0)
+        });
+    });
+    exact
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_corrections(
+    candidates: &mut Vec<QuanpinCandidate>,
+    dag: &SyllableDag,
+    raw_input: &str,
+    flypy: bool,
+    syllable_split: bool,
+    corpus: &RimeDictCorpus,
+    gram: Option<&RimeGramDb>,
+    imported: Option<&ImportedLexiconIndex>,
+    retention: Option<&RetentionEngine>,
+    left_context: &str,
+    level: TypoCorrectionLevel,
+    incoming: &mut Vec<Vec<BeamStep>>,
+) {
+    if !can_correct(raw_input, flypy, level) {
+        return;
+    }
+    let exact = exact_word_match(raw_input, flypy, corpus, imported, retention);
+    if !exact.allows(level) {
+        return;
+    }
+    let has_full_chinese = candidates.iter().any(|c| {
+        c.consumed_len == dag.len && c.text.chars().all(crate::ret::is_cjk)
+    });
+    let can_complete_tail = dag.edges.get(dag.exact_end).is_some_and(|edges| {
+        edges.iter().any(|(end, _, penalty)| *end == dag.len && *penalty == 2.0)
+    });
+    let word_only = flypy || exact.weight > 0
+        || (dag.exact_end >= 8 && has_full_chinese && can_complete_tail);
+    let require_evidence = dag.exact_end == dag.len;
+    let exact_score = candidates.iter()
+        .filter(|c| c.consumed_len == dag.len && c.segments.len() == 1
+            && matches_exact_reading(&c.syllables, raw_input, flypy))
+        .map(|c| c.score)
+        .max_by(f64::total_cmp);
+    let plan = correction_plan(raw_input, flypy, level);
+    let edits = correction_dags(&plan, syllable_split, corpus, imported, retention);
+    let mut seen = HashSet::new();
+    for edit in edits.iter()
+        .filter(|edit| (!word_only || edit.word_weight > 0)
+            && (!require_evidence || edit.word_weight.max(edit.tail_weight) > 0)
+            && exact.supports(level, edit.quality, edit.word_weight))
+        .take(4)
+    {
+        let recovered = decode_from_syllable_dag(
+            &edit.dag, !flypy, syllable_split, corpus, gram, imported, retention,
+            DecodeTarget::Correction, left_context, incoming,
+        );
+        for mut candidate in recovered {
+            if candidate.consumed_len != edit.dag.len
+                || (word_only && candidate.segments.len() != 1)
+                || !candidate.text.chars().all(crate::ret::is_cjk)
+                || !matches_exact_reading(&candidate.syllables, edit.code, flypy)
+                || !seen.insert(candidate.text.clone())
+            {
+                continue;
+            }
+            candidate.consumed_len = dag.len;
+            candidate.score -= 6.0;
+            if let Some(score) = exact_score {
+                candidate.score = candidate.score.min(score - 0.1);
+            }
+            candidates.push(candidate);
+        }
+    }
+}
+
+pub(super) fn matches_exact_reading(syllables: &[String], code: &str, flypy: bool) -> bool {
+    if flypy {
+        crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&syllables.join(" "))
+            == code.replace(['\'', ' '], "")
+    } else {
+        crate::imp::xiaohe::matches_quanpin_reading(syllables, code)
+    }
+}
+
 fn correction_dags<'a>(
     plan: &'a CorrectionPlan,
     syllable_split: bool,
@@ -1751,82 +1868,190 @@ fn correction_weights(
     spaced: &mut String,
 ) -> (u64, u64) {
     let mut weight = 0;
+    visit_dag_words(dag, code, flypy, corpus, imported, retention, |_, _, word_weight, count| {
+        weight = weight.max(word_weight).max(if count > 0 { 1000 + u64::from(count) } else { 1 });
+    });
     let mut tail_weight = 0;
-    if let Some(imported) = imported {
-        let entries = if flypy {
-            imported.xiaohe_entries(code)
-        } else {
-            imported.quanpin_entries(code)
-        };
-        weight = entries
-            .iter()
-            .map(|entry| u64::from(entry.weight))
-            .max()
-            .unwrap_or(0);
-    }
-    let mut stack = vec![(0, [""; 12], 0)];
-    for _ in 0..64 {
-        let Some((pos, syllables, len)) = stack.pop() else {
-            break;
-        };
-        if pos == dag.len && len >= 2 {
-            spaced.clear();
-            spaced.push_str(syllables[0]);
-            for syllable in &syllables[1..len] {
-                spaced.push(' ');
-                spaced.push_str(syllable);
-            }
-            if let Some((_, w)) = corpus.spaced_pinyin_words(spaced).next() {
-                weight = weight.max(w);
-            }
-            if let Some(phrase) = retention.and_then(|r| r.user_phrases_by_reading(spaced).next()) {
-                weight = weight.max(1000 + u64::from(phrase.count));
-            }
-            if !flypy {
-                for tail in 2..=3.min(len - 1) {
-                    let syllables = &syllables[len - tail..len];
-                    let mut letters = raw_input.bytes().rev().filter(u8::is_ascii_alphabetic);
-                    if syllables
-                        .iter()
-                        .rev()
-                        .flat_map(|s| s.bytes().rev())
-                        .all(|letter| letters.next() == Some(letter))
-                    {
-                        continue;
-                    }
-                    let bytes = syllables.iter().map(|s| s.len()).sum::<usize>() + tail - 1;
-                    let suffix = &spaced[spaced.len() - bytes..];
-                    if let Some((_, w)) = corpus.spaced_pinyin_words(suffix).next() {
-                        tail_weight = tail_weight.max(w);
-                    }
+    if !flypy {
+        visit_exact_readings(dag, false, |reading| {
+            for tail in 2..=3.min(reading.len() - 1) {
+                let syllables = &reading[reading.len() - tail..];
+                let mut letters = raw_input.bytes().rev().filter(u8::is_ascii_alphabetic);
+                if syllables.iter().rev().flat_map(|s| s.bytes().rev())
+                    .all(|letter| letters.next() == Some(letter))
+                {
+                    continue;
+                }
+                write_spaced_reading(spaced, syllables);
+                if let Some((_, weight)) = corpus.spaced_pinyin_words(spaced).next() {
+                    tail_weight = tail_weight.max(weight);
                 }
             }
-        } else if pos < dag.len && len < syllables.len() {
-            for (next, syllable, penalty) in &dag.edges[pos] {
-                if (flypy && *penalty <= 0.5) || *penalty == 0.0 {
-                    let mut reading = syllables;
-                    reading[len] = syllable;
-                    stack.push((*next, reading, len + 1));
-                }
-            }
-        }
+        });
     }
     (weight, tail_weight)
 }
 
-/// Rank one-edit spellings before bounding decoder work; separators are immutable.
-pub(super) fn correction_codes(code: &str, flypy: bool) -> Vec<String> {
-    correction_plan(code, flypy)
-        .edits
-        .iter()
-        .map(|(_, code)| code.clone())
-        .collect()
+pub(super) fn can_correct(code: &str, flypy: bool, level: TypoCorrectionLevel) -> bool {
+    level != TypoCorrectionLevel::Off
+        && code.len() <= 48
+        && code.bytes().filter(u8::is_ascii_lowercase).count() >= if flypy { 2 } else { 3 }
+        && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'\'' || b == b' ')
+}
+
+pub(super) fn is_consonant_abbreviation(code: &str) -> bool {
+    (3..=4).contains(&code.len()) && code.bytes().all(is_initial_byte)
+}
+
+pub(super) fn is_initial_token(part: &str) -> bool {
+    is_initial(part)
+}
+
+pub(super) fn is_initial_sequence(code: &str) -> bool {
+    if code.contains(['\'', ' ']) {
+        let mut parts = code.split(['\'', ' ']);
+        let first = parts.next().unwrap_or_default();
+        is_initial(first) && parts.all(is_initial)
+    } else {
+        is_consonant_abbreviation(code)
+    }
+}
+
+pub(super) fn append_initial_choices(
+    candidates: &mut Vec<QuanpinCandidate>,
+    raw: &str,
+    corpus: &RimeDictCorpus,
+    retention: Option<&RetentionEngine>,
+    flypy: bool,
+    continuing: bool,
+) {
+    let initial = if raw.contains(['\'', ' ']) {
+        let mut parts = raw.split(['\'', ' ']);
+        let first = parts.next().unwrap_or_default();
+        if !is_initial(first) || !parts.all(is_initial) {
+            return;
+        }
+        first
+    } else if is_consonant_abbreviation(raw)
+        || (continuing && (1..=2).contains(&raw.len()) && raw.bytes().all(is_initial_byte))
+    {
+        &raw[..1]
+    } else {
+        return;
+    };
+
+    let mut choices = HashMap::new();
+    for &syllable in canonical_syllable_set() {
+        if !syllable.starts_with(initial) {
+            continue;
+        }
+        for (word, weight) in corpus.spaced_pinyin_words(syllable).take(12) {
+            if word.chars().count() != 1
+                || !word.chars().all(crate::ret::is_cjk)
+                || retention.is_some_and(|r| r.erased_words.contains(word))
+            {
+                continue;
+            }
+            let entry = choices.entry(word).or_insert((weight, syllable));
+            *entry = (*entry).max((weight, syllable));
+        }
+    }
+    let mut choices: Vec<_> = choices.into_iter().collect();
+    choices.sort_unstable_by(|(a, (a_weight, _)), (b, (b_weight, _))| {
+        b_weight.cmp(a_weight).then_with(|| a.cmp(b))
+    });
+    choices.truncate(40);
+    if continuing && !raw.contains(['\'', ' ']) && raw.len() == 2 {
+        // A tail such as "sh" also completes "shang". Keep the selectable
+        // one-letter match when continuing an unsegmented abbreviation.
+        let short_words: HashSet<_> = choices.iter().map(|&(word, _)| word).collect();
+        candidates.retain(|candidate| {
+            candidate.consumed_len != raw.len()
+                || !short_words.contains(candidate.text.as_str())
+                || matches_exact_reading(&candidate.syllables, raw, flypy)
+        });
+    }
+    candidates.extend(choices.into_iter().map(|(word, (weight, syllable))| {
+        QuanpinCandidate {
+            text: word.to_owned(),
+            score: (weight as f64).ln_1p() * 0.72 - INITIAL_PENALTY,
+            consumed_len: initial.len(),
+            syllables: vec![syllable.to_owned()],
+            segments: vec![word.to_owned()],
+        }
+    }));
+}
+
+fn is_initial_byte(byte: u8) -> bool {
+    b"bpmfdtnlgkhjqxrzcsyw".contains(&byte)
+}
+
+pub(super) fn ranked_abbreviations<'a>(
+    code: &str,
+    corpus: &'a RimeDictCorpus,
+    gram: Option<&RimeGramDb>,
+    retention: Option<&RetentionEngine>,
+) -> Vec<(&'a str, f64)> {
+    if !(2..=4).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Vec::new();
+    }
+    let strong = is_consonant_abbreviation(code);
+    let mut scores = HashMap::new();
+    let mut add = |word: &'a str, weight: u64| {
+        if weight < HIGH_DICTIONARY_WEIGHT
+            || retention.is_some_and(|r| r.erased_words.contains(word))
+            || scores.contains_key(word)
+        {
+            return;
+        }
+        let frequency = (weight as f64).ln_1p();
+        let score = if strong {
+            // A strong whole-phrase gram relative to its parts is a better
+            // abbreviation match than a frequent fragment of a sentence.
+            let association = gram.and_then(|g| {
+                let first = word.chars().next()?.len_utf8();
+                let last = word.char_indices().next_back()?.0;
+                let baseline = 11.2 + 2.8 * code.len().saturating_sub(3) as f64;
+                let parts = g.lookup("", &word[..last]).unwrap_or(baseline)
+                    .max(g.lookup("", &word[first..]).unwrap_or(baseline)).max(baseline);
+                g.lookup("", word).map(|score| score - parts)
+            });
+            (code.len() - 1) as f64 * 6.0 + 12.0
+                + association.map_or(frequency * 0.25, |score| score.max(0.0) + frequency * 0.025)
+        } else {
+            frequency - 12.0
+        };
+        scores.insert(word, score);
+    };
+    for (word, weight) in corpus.abbreviations(code) {
+        add(word, weight);
+    }
+    if strong {
+        // The abbreviation bucket is already capped by raw frequency. Search
+        // the indexed readings too so phrase association can affect the shortlist.
+        for reading in corpus.initial_readings(code) {
+            for (word, weight) in corpus.spaced_pinyin_words(reading)
+                .take_while(|(_, weight)| *weight >= HIGH_DICTIONARY_WEIGHT)
+            {
+                add(word, weight);
+            }
+        }
+    }
+    let mut ranked: Vec<_> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    ranked.truncate(3);
+    ranked
+}
+
+pub(super) fn correction_codes(code: &str, flypy: bool, level: TypoCorrectionLevel) -> Vec<(u8, String)> {
+    correction_plan(code, flypy, level).edits.clone()
 }
 
 #[derive(Default)]
 struct CorrectionPlan {
     code: String,
     flypy: bool,
+    length_edits: bool,
     edits: Vec<(u8, String)>,
 }
 
@@ -1835,30 +2060,32 @@ thread_local! {
     static LAST_CORRECTION_PLAN: RefCell<Option<Rc<CorrectionPlan>>> = const { RefCell::new(None) };
 }
 
-fn correction_plan(code: &str, flypy: bool) -> Rc<CorrectionPlan> {
-    if !(4..=48).contains(&code.len())
-        || !code
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b == b'\'' || b == b' ')
-    {
+fn correction_plan(code: &str, flypy: bool, level: TypoCorrectionLevel) -> Rc<CorrectionPlan> {
+    if !can_correct(code, flypy, level) {
         return Rc::default();
     }
+    let length_edits = flypy
+        && matches!(level, TypoCorrectionLevel::Standard | TypoCorrectionLevel::Aggressive)
+        && code.bytes().filter(u8::is_ascii_lowercase).count() % 2 != 0;
     LAST_CORRECTION_PLAN.with(|last| {
         let mut last = last.borrow_mut();
-        if let Some(plan) = last.as_ref().filter(|p| p.flypy == flypy && p.code == code) {
+        if let Some(plan) = last.as_ref().filter(|p| {
+            p.flypy == flypy && p.code == code && p.length_edits == length_edits
+        }) {
             return Rc::clone(plan);
         }
         let plan = Rc::new(CorrectionPlan {
             code: code.to_owned(),
             flypy,
-            edits: ranked_correction_codes(code, flypy),
+            length_edits,
+            edits: ranked_correction_codes(code, flypy, length_edits),
         });
         *last = Some(Rc::clone(&plan));
         plan
     })
 }
 
-fn ranked_correction_codes(code: &str, flypy: bool) -> Vec<(u8, String)> {
+fn ranked_correction_codes(code: &str, flypy: bool, length_edits: bool) -> Vec<(u8, String)> {
     let legal = |text: &str| {
         text.split(['\'', ' ']).all(|part| {
             if part.is_empty() {
@@ -1874,28 +2101,45 @@ fn ranked_correction_codes(code: &str, flypy: bool) -> Vec<(u8, String)> {
             legal_quanpin(part)
         })
     };
-    // Generate in the original (quality, position, spelling) order. Once the
-    // first 24 distinct legal edits are known, later edits cannot be selected.
     const NEIGHBOURS: [&str; 26] = [
         "qswz", "ghnv", "dfvx", "cefrsx", "drsw", "cdgrtv", "bfhtvy", "bgjnuy", "jkou", "hikmnu",
         "ijlmo", "kop", "jkn", "bhjm", "iklp", "lo", "aw", "deft", "adewxz", "fgry", "hijy",
         "bcfg", "aeqs", "cdsz", "ghtu", "asx",
     ];
-    const MAX_CORRECTIONS: usize = 24;
     let bytes = code.as_bytes();
     let len = bytes.len();
+    let dag = if flypy {
+        build_xiaohe_syllable_paths(code)
+    } else {
+        build_quanpin_syllable_paths(code, false)
+    };
+    let break_at = if dag.exact_end == 0 { 0 } else { raw_offset(code, dag.exact_end) };
+    let mut positions: Vec<_> = (0..=len).collect();
+    positions.sort_by_key(|&i| (i.abs_diff(break_at).min(len - i), len - i));
+
+    let qualities: &[u8] = match (flypy, length_edits) {
+        (true, true) => &[3, 4],
+        (true, false) => &[0, 1],
+        (false, _) => &[0, 1, 2, 3, 4],
+    };
     let mut ranked: Vec<(u8, String)> = Vec::new();
     let mut buffer = [0; 49];
     buffer[..len].copy_from_slice(bytes);
-    for quality in 0..=if flypy { 1 } else { 4 } {
-        for i in 0..=len {
+    for &quality in qualities {
+        // Distribute work across edit types so a large number of legal
+        // substitutions cannot crowd out insertions or deletions.
+        let budget = ranked.len() + match quality {
+            0 | 3 => len,
+            4 if len <= 5 => (len + 1) * 26,
+            1 | 4 => 32,
+            _ => 16,
+        };
+        for &i in &positions {
             let key = bytes.get(i).copied();
-            if key.is_some_and(|key| !key.is_ascii_lowercase()) {
-                continue;
-            }
+            let is_letter = key.is_some_and(|key| key.is_ascii_lowercase());
             let mut add = |bytes: &[u8]| {
                 let text = std::str::from_utf8(bytes).expect("ASCII pinyin");
-                if ranked.len() < MAX_CORRECTIONS
+                if ranked.len() < budget
                     && text != code
                     && legal(text)
                     && !ranked.iter().any(|(_, previous)| previous == text)
@@ -1904,12 +2148,12 @@ fn ranked_correction_codes(code: &str, flypy: bool) -> Vec<(u8, String)> {
                 }
             };
             match quality {
-                0 if i + 1 < len && bytes[i + 1].is_ascii_lowercase() => {
+                0 if is_letter && i + 1 < len && bytes[i + 1].is_ascii_lowercase() => {
                     buffer.swap(i, i + 1);
                     add(&buffer[..len]);
                     buffer.swap(i, i + 1);
                 }
-                1 | 2 if i < len => {
+                1 | 2 if is_letter => {
                     let key = bytes[i];
                     let replacements = if quality == 1 {
                         NEIGHBOURS[usize::from(key - b'a')].as_bytes()
@@ -1922,7 +2166,7 @@ fn ranked_correction_codes(code: &str, flypy: bool) -> Vec<(u8, String)> {
                     }
                     buffer[i] = key;
                 }
-                3 if key.is_some() => {
+                3 if is_letter => {
                     buffer[i..len - 1].copy_from_slice(&bytes[i + 1..]);
                     add(&buffer[..len - 1]);
                     buffer[i..len].copy_from_slice(&bytes[i..]);
@@ -1937,8 +2181,8 @@ fn ranked_correction_codes(code: &str, flypy: bool) -> Vec<(u8, String)> {
                 }
                 _ => {}
             }
-            if ranked.len() == MAX_CORRECTIONS {
-                return ranked;
+            if ranked.len() == budget {
+                break;
             }
         }
     }
@@ -1999,18 +2243,39 @@ mod regression_tests {
         assert!(!build_quanpin_syllable_paths("z'hong", false).edges[0]
             .iter()
             .any(|(end, _, _)| *end > 1));
-        assert!(correction_codes("zhonggou", false)
+        assert!(correction_codes("zhonggou", false, TypoCorrectionLevel::Standard)
             .iter()
             .take(5)
-            .any(|c| c == "zhongguo"));
-        for code in correction_codes("zhong'gou", false) {
+            .any(|(_, code)| code == "zhongguo"));
+        for (_, code) in correction_codes("zhong'gou", false, TypoCorrectionLevel::Standard) {
             assert_eq!(code.matches('\'').count(), 1);
             assert!(code.split('\'').all(|part| !part.is_empty()));
         }
-        assert!(correction_codes("nihk", true).iter().all(|code| code
+        assert!(correction_codes("nihk", true, TypoCorrectionLevel::Standard).iter().all(|(_, code)| code
             .as_bytes()
             .chunks(2)
             .all(|pair| xiaohe_reverse_map().contains_key(std::str::from_utf8(pair).unwrap()))));
+    }
+
+    #[test]
+    fn edits_cover_long_tails_and_single_missing_or_extra_xiaohe_keys() {
+        for (raw, expected, flypy, quality) in [
+            ("tna", "tan", false, 0),
+            ("nui", "niu", false, 0),
+            ("woxiangchi'pinggou", "woxiangchi'pingguo", false, 0),
+            ("jintiantianqizhenhzo", "jintiantianqizhenhao", false, 1),
+            ("nxi", "ni", true, 3),
+            ("nih", "nihc", true, 4),
+            ("nhc", "nihc", true, 4),
+            ("nixhc", "nihc", true, 3),
+        ] {
+            let edits = correction_codes(raw, flypy, TypoCorrectionLevel::Standard);
+            assert!(edits.iter().any(|(rank, code)| *rank == quality && code == expected),
+                "{raw}: {edits:?}");
+            if flypy {
+                assert!(correction_codes(raw, true, TypoCorrectionLevel::Conservative).is_empty());
+            }
+        }
     }
 
     #[test]

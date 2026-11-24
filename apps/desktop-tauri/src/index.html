@@ -145,6 +145,24 @@
 
           <div class="row">
             <div class="row-copy">
+              <label for="typo-level-select">拼写纠错强度</label>
+              <p class="help">自动纠正邻键误触、相邻字母打反、多按或少按键</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="select-wrap">
+                <select id="typo-level-select" name="typo_correction_level">
+                  <option value="off">关闭</option>
+                  <option value="conservative">保守（仅无词时纠错）</option>
+                  <option value="standard" selected>标准（推荐）</option>
+                  <option value="aggressive">积极（优先高频纠错词）</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
               <label for="opencc-select">输出字形</label>
               <p class="help">通过 OpenCC 实时转换简繁标准</p>
             </div>

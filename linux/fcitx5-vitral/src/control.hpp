@@ -2,7 +2,9 @@
 
 #include "vitral_core.h"
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <fcitx-utils/log.h>
 #include <fcitx-utils/unixfd.h>
@@ -48,15 +50,17 @@ private:
       std::string command(cmd);
       if (command == "panel-state")
         return sd_bus_reply_method_return(msg, "s", self.state_().c_str());
-      if (command == "poll-services" || command == "clipboard-push" ||
-          command == "clipboard-poll" || command == "clipboard-pin" ||
+      const bool fullSync = command == "poll-services" || command == "clipboard-poll";
+      if (fullSync || command == "clipboard-poll-current" ||
+          command == "clipboard-push" || command == "clipboard-pin" ||
           command == "clipboard-unpin" || command == "clipboard-clear-unpinned") {
         {
           std::lock_guard lock(self.serviceMutex_);
-          self.queued_.emplace_back(msg, std::move(command), args);
+          auto &queue = fullSync ? self.fullSyncQueue_ : self.queued_;
+          queue.emplace_back(msg, std::move(command), args);
           sd_bus_message_ref(msg);
         }
-        self.serviceReady_.notify_one();
+        self.serviceReady_.notify_all();
         return 1; // The bus thread replies after the service finishes.
       }
       if (command == "translate-selection" || command == "polish-selection" ||
@@ -81,13 +85,13 @@ private:
     }
   }
 
-  void runServices(std::stop_token stop, int wake) {
+  void runServices(std::stop_token stop, int wake, std::list<ServiceCall> &queue) {
     std::unique_lock lock(serviceMutex_);
     std::list<ServiceCall> running;
-    while (serviceReady_.wait(lock, stop, [this] { return !queued_.empty(); })) {
+    while (serviceReady_.wait(lock, stop, [&queue] { return !queue.empty(); })) {
       if (stop.stop_requested())
         break;
-      running.splice(running.end(), queued_, queued_.begin());
+      running.splice(running.end(), queue, queue.begin());
       lock.unlock();
       auto &call = running.front();
       call.result = vitral_fcitx_command(core_, call.command.c_str(), call.args.c_str());
@@ -136,11 +140,24 @@ private:
     return 0;
   }
 
+  void notifyClipboard(sd_bus *bus, uint64_t &revision) {
+    auto result = vitral_fcitx_command(core_, "clipboard-lan-revision", "{}");
+    if (result.status == VITRAL_STATUS_OK) {
+      const auto next = std::strtoull(result.json_utf8, nullptr, 10);
+      if (next && next != revision &&
+          sd_bus_emit_signal(bus, "/dev/vitral/IME", "dev.vitral.IME",
+                             "ClipboardChanged", "") >= 0)
+        revision = next;
+    }
+    vitral_free_result(result);
+  }
+
   void serve(std::stop_token stop) {
     static const sd_bus_vtable methods[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_METHOD("Command", "ss", "s", dispatch,
                       SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_SIGNAL("ClipboardChanged", "", 0),
         SD_BUS_VTABLE_END};
     sd_bus *bus = nullptr;
     sd_bus_slot *slot = nullptr;
@@ -161,17 +178,35 @@ private:
       rc = sd_bus_attach_event(bus, event, 0);
     if (rc >= 0) {
       std::jthread service([this, fd = wake.fd()](std::stop_token stop) {
-        runServices(stop, fd);
+        runServices(stop, fd, queued_);
       });
-      while (rc >= 0 && !stop.stop_requested())
-        rc = sd_event_run(event, 250000);
+      std::jthread fullSync([this, fd = wake.fd()](std::stop_token stop) {
+        runServices(stop, fd, fullSyncQueue_);
+      });
+      using Clock = std::chrono::steady_clock;
+      constexpr auto clipboardInterval = std::chrono::milliseconds(40);
+      auto nextClipboardCheck = Clock::now();
+      uint64_t clipboardRevision = 0;
+      while (rc >= 0 && !stop.stop_requested()) {
+        auto now = Clock::now();
+        if (now >= nextClipboardCheck) {
+          notifyClipboard(bus, clipboardRevision);
+          nextClipboardCheck = now + clipboardInterval;
+        }
+        auto timeout = std::chrono::duration_cast<std::chrono::microseconds>(
+            nextClipboardCheck - now);
+        rc = sd_event_run(event, timeout.count());
+      }
       service.request_stop();
+      fullSync.request_stop();
       service.join();
+      fullSync.join();
       replyCompleted();
       std::list<ServiceCall> pending;
       {
         std::lock_guard lock(serviceMutex_);
         pending.swap(queued_);
+        pending.splice(pending.end(), fullSyncQueue_);
       }
       for (auto &call : pending) {
         sd_bus_reply_method_errorf(call.message, "dev.vitral.IME.Error",
@@ -192,6 +227,6 @@ private:
   std::function<std::string()> state_;
   std::mutex serviceMutex_;
   std::condition_variable_any serviceReady_;
-  std::list<ServiceCall> queued_, completed_;
+  std::list<ServiceCall> queued_, fullSyncQueue_, completed_;
   std::jthread thread_;
 };

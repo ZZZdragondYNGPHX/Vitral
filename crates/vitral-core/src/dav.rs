@@ -23,22 +23,26 @@ use vitral_tokens::TOKENS;
 static DAV_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 static TLS_CONFIG: OnceLock<rustls::ClientConfig> = OnceLock::new();
 
-fn dav_runtime() -> Result<&'static tokio::runtime::Runtime, VitralError> {
+pub(crate) fn network_runtime() -> Result<&'static tokio::runtime::Runtime, VitralError> {
+    static INIT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
     if let Some(rt) = DAV_RUNTIME.get() {
         return Ok(rt);
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|e| VitralError::Internal(format!("tokio runtime init failed: {e}")))?;
-    let _ = DAV_RUNTIME.set(rt);
+    let _init = INIT.lock();
+    if DAV_RUNTIME.get().is_none() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .map_err(|e| VitralError::Internal(format!("tokio runtime init failed: {e}")))?;
+        let _ = DAV_RUNTIME.set(rt);
+    }
     DAV_RUNTIME
         .get()
         .ok_or_else(|| VitralError::Internal("tokio runtime missing after init".into()))
 }
 
-fn rustls_client_config() -> &'static rustls::ClientConfig {
+pub(crate) fn rustls_client_config() -> &'static rustls::ClientConfig {
     TLS_CONFIG.get_or_init(|| {
         let mut root_store = rustls::RootCertStore::empty();
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -287,7 +291,13 @@ fn dav_error_summary(message: &str) -> String {
 }
 
 fn dav_http_client(follow_redirects: bool) -> Result<reqwest::Client, VitralError> {
-    reqwest::Client::builder()
+    static FOLLOW: OnceLock<reqwest::Client> = OnceLock::new();
+    static NO_REDIRECT: OnceLock<reqwest::Client> = OnceLock::new();
+    let pool = if follow_redirects { &FOLLOW } else { &NO_REDIRECT };
+    if let Some(client) = pool.get() {
+        return Ok(client.clone());
+    }
+    let client = reqwest::Client::builder()
         .user_agent(concat!("Vitral/", env!("CARGO_PKG_VERSION")))
         .tls_backend_preconfigured(rustls_client_config().clone())
         .redirect(if follow_redirects {
@@ -298,8 +308,10 @@ fn dav_http_client(follow_redirects: bool) -> Result<reqwest::Client, VitralErro
         .connect_timeout(Duration::from_secs(5))
         .read_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(20))
+        .pool_idle_timeout(Duration::from_secs(60))
         .build()
-        .map_err(|e| VitralError::Io(format!("reqwest client build failed: {e}")))
+        .map_err(|e| VitralError::Io(format!("reqwest client build failed: {e}")))?;
+    Ok(pool.get_or_init(|| client).clone())
 }
 
 pub struct KoofrDavClient {
@@ -357,7 +369,7 @@ impl KoofrDavClient {
         let ctx = base_op.base_context().with_http_transport(transport);
         let async_op = base_op.with_context(ctx);
 
-        let rt = dav_runtime()?;
+        let rt = network_runtime()?;
         let _rt_guard = rt.enter();
         let blocking_op = blocking::Operator::new(async_op)
             .map_err(|e| VitralError::Io(format!("OpenDAL blocking operator init failed: {e}")))?;
@@ -389,7 +401,7 @@ impl KoofrDavClient {
         let method = reqwest::Method::from_bytes(b"MKCOL")
             .map_err(|e| VitralError::Internal(e.to_string()))?;
         run_on_blocking_dav_thread(|| {
-            dav_runtime()?.block_on(async {
+            network_runtime()?.block_on(async {
                 for segment in self
                     .clean_root
                     .split('/')
@@ -679,7 +691,7 @@ pub(crate) fn merge_clipboard_ring(
     let io = |e: reqwest::Error| VitralError::Io(e.without_url().to_string());
     run_on_blocking_dav_thread(|| {
         for _ in 0..4 {
-            let conditional = dav_runtime()?.block_on(async {
+            let conditional = network_runtime()?.block_on(async {
                 guard.require_online("read clipboard revision")?;
                 let reply = request(reqwest::Method::GET).send().await.map_err(io)?;
                 let (cloud, tag, missing) = if reply.status() == reqwest::StatusCode::NOT_FOUND {
@@ -717,52 +729,153 @@ pub(crate) fn merge_clipboard_ring(
 
 /// The latest copy survives history trimming and device-local suggestion dismissal.
 pub(crate) fn sync_current_copy(
-    guard: &OfflineGuard, cfg: &DavConfig, local: Option<&ClipboardEntry>,
-) -> Result<Option<ClipboardEntry>, VitralError> {
-    let dav = KoofrDavClient::connect(guard, cfg)?;
-    let mut url = reqwest::Url::parse(&cfg.endpoint).map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
-    url.path_segments_mut().map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?
-        .pop_if_empty().extend(dav.clean_root.split('/')).push("clipboard").push("current.json.enc");
+    guard: &OfflineGuard,
+    cfg: &DavConfig,
+    local: Option<&ClipboardEntry>,
+    known_etag: Option<&str>,
+) -> Result<CurrentCopySync, VitralError> {
+    guard.require_online("synchronize current clipboard")?;
+    let root = validate_clean_root(cfg.root.as_deref())?;
+    let mut url = reqwest::Url::parse(cfg.endpoint.trim())
+        .map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(VitralError::InvalidArgument(
+            "unsupported WebDAV endpoint URL scheme".into(),
+        ));
+    }
+    url.path_segments_mut()
+        .map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?
+        .pop_if_empty()
+        .extend(root.split('/'))
+        .push("clipboard")
+        .push("current.json.enc");
     let client = dav_http_client(true)?;
     let request = |method| {
         let req = client.request(method, url.clone());
-        if let Some(user) = cfg.username.as_ref() { req.basic_auth(user, cfg.password.as_ref()) } else { req }
+        if let Some(user) = cfg.username.as_ref() {
+            req.basic_auth(user, cfg.password.as_ref())
+        } else {
+            req
+        }
     };
     let io = |e: reqwest::Error| VitralError::Io(e.without_url().to_string());
     run_on_blocking_dav_thread(|| {
-        for _ in 0..4 {
-            let outcome = dav_runtime()?.block_on(async {
+        for attempt in 0..4 {
+            let outcome = network_runtime()?.block_on(async {
                 guard.require_online("synchronize current clipboard")?;
-                let reply = request(reqwest::Method::GET).send().await.map_err(io)?;
+                let mut get = request(reqwest::Method::GET);
+                let conditional = known_etag.filter(|_| attempt == 0 && local.is_some());
+                if let Some(tag) = conditional {
+                    get = get.header(reqwest::header::IF_NONE_MATCH, tag);
+                }
+                let reply = get.send().await.map_err(io)?;
+                if reply.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    let tag = conditional.ok_or_else(|| {
+                        VitralError::Io("unexpected WebDAV 304 without a clipboard ETag".into())
+                    })?;
+                    return Ok(CurrentCopyOutcome::Synced(CurrentCopySync {
+                        entry: None,
+                        etag: Some(tag.to_owned()),
+                    }));
+                }
                 let missing = reply.status() == reqwest::StatusCode::NOT_FOUND;
-                let (cloud, tag) = if missing { (None, None) } else {
+                let (cloud, tag) = if missing {
+                    (None, None)
+                } else {
                     let reply = reply.error_for_status().map_err(io)?;
                     let tag = reply.headers().get(reqwest::header::ETAG).cloned();
                     let data = reply.bytes().await.map_err(io)?;
-                    (Some(serde_json::from_slice::<ClipboardEntry>(&decrypt_envelope(&data, cfg.sync_key.as_deref())?)
-                        .map_err(|e| VitralError::Parse(e.to_string()))?), tag)
+                    (
+                        Some(
+                            serde_json::from_slice::<ClipboardEntry>(&decrypt_envelope(
+                                &data,
+                                cfg.sync_key.as_deref(),
+                            )?)
+                            .map_err(|e| VitralError::Parse(e.to_string()))?,
+                        ),
+                        tag,
+                    )
                 };
-                let Some(local) = local else { return Ok((true, cloud)); };
-                if cloud.as_ref().is_some_and(|e| crate::clip::copy_order(e) >= crate::clip::copy_order(local)) {
-                    return Ok((true, cloud));
-                }
+                let local = match local {
+                    Some(local)
+                        if cloud.as_ref().is_none_or(|e| {
+                            crate::clip::copy_order(e) < crate::clip::copy_order(local)
+                        }) =>
+                    {
+                        local
+                    }
+                    _ => {
+                        return Ok(CurrentCopyOutcome::Synced(CurrentCopySync {
+                            entry: cloud,
+                            etag: tag.and_then(|tag| tag.to_str().ok().map(str::to_owned)),
+                        }))
+                    }
+                };
                 let mut put = request(reqwest::Method::PUT);
-                if missing { put = put.header(reqwest::header::IF_NONE_MATCH, "*"); }
-                else { put = put.header(reqwest::header::IF_MATCH, tag.ok_or_else(|| VitralError::Io("WebDAV current clipboard response is missing ETag".into()))?); }
-                let data = serde_json::to_vec(local).map_err(|e| VitralError::Parse(e.to_string()))?;
+                if missing {
+                    put = put.header(reqwest::header::IF_NONE_MATCH, "*");
+                } else {
+                    put = put.header(
+                        reqwest::header::IF_MATCH,
+                        tag.ok_or_else(|| {
+                            VitralError::Io(
+                                "WebDAV current clipboard response is missing ETag".into(),
+                            )
+                        })?,
+                    );
+                }
+                let data =
+                    serde_json::to_vec(local).map_err(|e| VitralError::Parse(e.to_string()))?;
                 guard.require_online("write current clipboard")?;
-                let response = put.body(encrypt_envelope(&data, cfg.sync_key.as_deref())?).send().await.map_err(io)?;
+                let response = put
+                    .body(encrypt_envelope(&data, cfg.sync_key.as_deref())?)
+                    .send()
+                    .await
+                    .map_err(io)?;
                 match response.status() {
-                    reqwest::StatusCode::PRECONDITION_FAILED => Ok((false, None)),
-                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => Ok((false, Some(local.clone()))),
-                    _ => { response.error_for_status().map_err(io)?; Ok::<_, VitralError>((true, Some(local.clone()))) }
+                    reqwest::StatusCode::PRECONDITION_FAILED => Ok(CurrentCopyOutcome::Retry),
+                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => {
+                        Ok(CurrentCopyOutcome::CreateCollection)
+                    }
+                    _ => {
+                        let response = response.error_for_status().map_err(io)?;
+                        let etag = response
+                            .headers()
+                            .get(reqwest::header::ETAG)
+                            .and_then(|tag| tag.to_str().ok())
+                            .map(str::to_owned);
+                        // Finish reading the reply so the connection can return to the pool.
+                        let _ = response.bytes().await;
+                        Ok::<_, VitralError>(CurrentCopyOutcome::Synced(CurrentCopySync {
+                            entry: Some(local.clone()),
+                            etag,
+                        }))
+                    }
                 }
             })?;
-            if outcome.0 { return Ok(outcome.1); }
-            if outcome.1.is_some() { dav.ensure_collections("clipboard")?; }
+            match outcome {
+                CurrentCopyOutcome::Synced(state) => return Ok(state),
+                CurrentCopyOutcome::Retry => {}
+                CurrentCopyOutcome::CreateCollection => {
+                    KoofrDavClient::connect(guard, cfg)?.ensure_collections("clipboard")?;
+                }
+            }
         }
-        Err(VitralError::Io("current clipboard changed during synchronization".into()))
+        Err(VitralError::Io(
+            "current clipboard changed during synchronization".into(),
+        ))
     })
+}
+
+pub(crate) struct CurrentCopySync {
+    pub entry: Option<ClipboardEntry>,
+    pub etag: Option<String>,
+}
+
+enum CurrentCopyOutcome {
+    Synced(CurrentCopySync),
+    Retry,
+    CreateCollection,
 }
 
 pub fn upload_clipboard_ring(
@@ -1250,6 +1363,65 @@ mod device_tests {
 mod http_device_tests {
     use super::*;
     use std::io::{Read, Write};
+
+    #[test]
+    fn clipboard_put_etag_reuses_http_connection_for_conditional_get() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let cfg = DavConfig {
+            endpoint: format!("http://{}", server.server_addr()),
+            ..Default::default()
+        };
+        let handle = std::thread::spawn(move || {
+            let mut peer = None;
+            for (method, status) in [("GET", 404), ("PUT", 201), ("GET", 304)] {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .unwrap();
+                let addr = request.remote_addr().copied().unwrap();
+                assert_eq!(*peer.get_or_insert(addr), addr);
+                assert_eq!(request.method().as_str(), method);
+                if status == 201 {
+                    let mut body = Vec::new();
+                    request.as_reader().read_to_end(&mut body).unwrap();
+                    assert!(body.starts_with(b"VTRL1"));
+                }
+                if status == 304 {
+                    let condition = request
+                        .headers()
+                        .iter()
+                        .find(|header| header.field.equiv("If-None-Match"))
+                        .unwrap();
+                    assert_eq!(condition.value.as_str(), "\"clipboard-version\"");
+                }
+                let mut response = tiny_http::Response::empty(status);
+                if status == 201 {
+                    response.add_header(
+                        tiny_http::Header::from_bytes("ETag", "\"clipboard-version\"").unwrap(),
+                    );
+                }
+                request.respond(response).unwrap();
+            }
+        });
+        let entry = ClipboardEntry {
+            id: "copy".into(),
+            content: "copy content".into(),
+            mime_type: "text/plain".into(),
+            source_device: "sender".into(),
+            timestamp_ms: 10,
+            pinned: false,
+            shortcut_code: None,
+        };
+        let guard = OfflineGuard::new(false);
+        let initial = sync_current_copy(&guard, &cfg, Some(&entry), None).unwrap();
+        assert_eq!(initial.entry.as_ref(), Some(&entry));
+        assert_eq!(initial.etag.as_deref(), Some("\"clipboard-version\""));
+        let repeated =
+            sync_current_copy(&guard, &cfg, Some(&entry), initial.etag.as_deref()).unwrap();
+        assert!(repeated.entry.is_none());
+        assert_eq!(repeated.etag, initial.etag);
+        handle.join().unwrap();
+    }
 
     #[test]
     fn mkcol_accepts_existing_collection_redirects_but_rejects_errors() {

@@ -48,6 +48,12 @@ fn public_settings(mut cfg: Value) -> Value {
     if cfg.get("prediction_delay_ms").is_none() {
         cfg["prediction_delay_ms"] = json!(380);
     }
+    if cfg.get("typo_correction_level").is_none() {
+        cfg["typo_correction_level"] = json!("standard");
+    }
+    if cfg.get("fuzzy_pinyin").is_none() {
+        cfg["fuzzy_pinyin"] = json!(false);
+    }
     cfg["shortcut_defaults"] = json!(shortcuts::defaults());
     cfg["shortcut_actions"] = json!(shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()})));
     cfg["launch_page"] = json!(if std::env::args().any(|a| a == "--clipboard") { "library" } else { "input" });
@@ -107,6 +113,19 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                 "adaptive_learning" | "learn_from_clipboard" | "prediction_enabled" | "profile_distill_enabled" => {
                     if !value.is_boolean() {
                         return Err("学习设置应为开启或关闭".into());
+                    }
+                }
+                "fuzzy_pinyin" => {
+                    if !value.is_boolean() {
+                        return Err("模糊音设置应为开启或关闭".into());
+                    }
+                }
+                "typo_correction_level" => {
+                    if !matches!(
+                        value.as_str(),
+                        Some("off" | "conservative" | "standard" | "aggressive")
+                    ) {
+                        return Err("拼写纠错强度应为关闭、保守、标准或积极".into());
                     }
                 }
                 "linux_english_mode" if cfg!(target_os = "linux") => {

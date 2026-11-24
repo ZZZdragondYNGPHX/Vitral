@@ -2,7 +2,7 @@ use crate::eng::gram::RimeGramDb;
 #[cfg(test)]
 use crate::eng::quanpin::{decode_quanpin_with_fuzzy, decode_xiaohe_long_context};
 use crate::eng::quanpin::{decode_quanpin_context, decode_xiaohe_context, QuanpinCandidate};
-use crate::eng::{CandidateItem, OpenCcMode, PageInfo, SchemaKind};
+use crate::eng::{CandidateItem, OpenCcMode, PageInfo, SchemaKind, TypoCorrectionLevel};
 use crate::imp::polyphone::RimeDictCorpus;
 use crate::imp::ImportedLexiconIndex;
 use crate::ret::RetentionEngine;
@@ -130,7 +130,9 @@ pub struct PureRustEngine {
     #[cfg(all(test, target_os = "linux", feature = "native-rime"))]
     pub(super) decode_calls: std::cell::Cell<usize>,
     pub(super) confirmed_prefix: String,
+    pub(super) confirming_initials: bool,
     pub fuzzy_pinyin: bool,
+    pub(crate) typo_correction_level: TypoCorrectionLevel,
     pub syllable_split: bool,
     pub page_index: usize,
     pub last_candidates: Vec<CandidateItem>,
@@ -151,7 +153,9 @@ impl PureRustEngine {
             #[cfg(all(test, target_os = "linux", feature = "native-rime"))]
             decode_calls: std::cell::Cell::new(0),
             confirmed_prefix: String::new(),
+            confirming_initials: false,
             fuzzy_pinyin: false,
+            typo_correction_level: TypoCorrectionLevel::default(),
             syllable_split: false,
             page_index: 0,
             last_candidates: Vec::new(),
@@ -282,131 +286,57 @@ impl PureRustEngine {
 
     /// Exact dictionary words for typo recovery, without the sentence beam or grammar LM.
     /// Bound both syllable paths and homophones so a malformed code stays inexpensive.
-    pub(super) fn query_correction_candidates<'a>(
-        &'a self,
-        code: &'a str,
+    pub(super) fn query_correction_candidates(
+        &self,
+        code: &str,
         schema: SchemaKind,
-        imported: &'a ImportedLexiconIndex,
+        imported: &ImportedLexiconIndex,
         retention: &RetentionEngine,
-    ) -> Vec<(CandidateItem, String, f64)> {
-        use crate::imp::xiaohe::{canonical_syllable_set, xiaohe_reverse_map};
-
-        const MAX_SYLLABLES: usize = 8;
-        enum CorrectionReading<'a> {
-            Imported(&'a str),
-            Corpus([&'a str; MAX_SYLLABLES], usize),
-        }
-
-        if !(4..=48).contains(&code.len()) || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+    ) -> Vec<(CandidateItem, String, u64)> {
+        if !(2..=49).contains(&code.len()) {
             return Vec::new();
         }
-        let flypy = schema == SchemaKind::DoublePinyinFlypy;
-        if flypy && code.len() % 2 != 0 {
-            return Vec::new();
-        }
-        let corpus = self.get_corpus();
         let now_ms = RetentionEngine::now_epoch_ms();
-        let mut seen = HashSet::new();
-        let mut ranked = Vec::new();
-        let mut add = |word: &'a str, reading: CorrectionReading<'a>, weight: u64| {
-            if word.chars().count() < 2
-                || !word.chars().all(crate::ret::is_cjk)
-                || retention.erased_words.contains(word)
-                || !imported.matches_reading(word, code, flypy)
-                || !seen.insert(word)
-            {
-                return;
-            }
-            let pinned = retention.pinned_words.contains(word);
-            let frecency = retention.decayed_score_at(word, now_ms);
-            let score = frecency + (weight as f64 + 1.0).ln();
-            ranked.push((word, reading, pinned, frecency, score));
-        };
-        let imported_words = if flypy {
-            imported.xiaohe_entries(code)
-        } else {
-            imported.quanpin_entries(code)
-        };
-        for entry in imported_words.iter().take(8) {
-            add(
-                &entry.text,
-                CorrectionReading::Imported(&entry.pinyin),
-                u64::from(entry.weight),
-            );
-        }
-        let mut paths = vec![(0, [""; MAX_SYLLABLES], 0)];
-        let mut spaced = String::new();
-        for _ in 0..64 {
-            let Some((offset, syllables, len)) = paths.pop() else {
-                break;
+        let mut words = HashMap::new();
+        super::quanpin::visit_exact_words(
+            code, schema == SchemaKind::DoublePinyinFlypy, self.get_corpus(),
+            Some(imported), Some(retention), |word, reading, weight, count| {
+                let weight = if count > 0 { weight.max(1000 + u64::from(count)) } else { weight };
+                let entry = words.entry(word.to_owned()).or_insert_with(|| (reading.to_owned(), weight));
+                if weight > entry.1 {
+                    *entry = (reading.to_owned(), weight);
+                }
+            },
+        );
+        let mut ranked: Vec<_> = words.into_iter().map(|(word, (reading, weight))| {
+            let pinned = retention.pinned_words.contains(&word);
+            let frecency_score = retention.decayed_score_at(&word, now_ms);
+            (
+                CandidateItem {
+                    index: 0,
+                    text: word.clone(),
+                    comment: reading,
+                    pinned,
+                    is_clipboard_shortcut: false,
+                    quick_paste_id: None,
+                    function_action: None,
+                    shortcut_code: None,
+                    frecency_score,
+                },
+                word,
+                weight,
+            )
+        }).collect();
+        ranked.sort_by(|(a, a_word, a_weight), (b, b_word, b_weight)| {
+            let score = |item: &CandidateItem, weight: u64| {
+                item.frecency_score + (weight as f64).ln_1p()
             };
-            if offset == code.len() {
-                if len >= 2 {
-                    spaced.clear();
-                    spaced.push_str(syllables[0]);
-                    for syllable in &syllables[1..len] {
-                        spaced.push(' ');
-                        spaced.push_str(syllable);
-                    }
-                    for (word, weight) in corpus.spaced_pinyin_words(&spaced).take(8) {
-                        add(word, CorrectionReading::Corpus(syllables, len), weight);
-                    }
-                }
-                continue;
-            }
-            if len == MAX_SYLLABLES {
-                continue;
-            }
-            let mut push = |end: usize, syllable: &'a str| {
-                let mut next = syllables;
-                next[len] = syllable;
-                paths.push((end, next, len + 1));
-            };
-            if flypy {
-                if let Some(syllables) = xiaohe_reverse_map().get(&code[offset..offset + 2]) {
-                    for syllable in syllables.iter().rev() {
-                        push(offset + 2, syllable);
-                    }
-                }
-            } else {
-                for end in offset + 1..=(offset + 6).min(code.len()) {
-                    let syllable = &code[offset..end];
-                    if canonical_syllable_set().contains(syllable) {
-                        push(end, syllable);
-                    }
-                }
-            }
-        }
-        ranked.sort_by(|a, b| {
-            b.2.cmp(&a.2)
-                .then_with(|| b.4.total_cmp(&a.4))
-                .then_with(|| a.0.cmp(b.0))
+            b.pinned.cmp(&a.pinned)
+                .then_with(|| score(b, *b_weight).total_cmp(&score(a, *a_weight)))
+                .then_with(|| a_word.cmp(b_word))
         });
+        ranked.truncate(3);
         ranked
-            .into_iter()
-            .take(3)
-            .map(|(word, reading, pinned, frecency_score, score)| {
-                let comment = match reading {
-                    CorrectionReading::Imported(reading) => reading.to_owned(),
-                    CorrectionReading::Corpus(syllables, len) => syllables[..len].join(" "),
-                };
-                (
-                    CandidateItem {
-                        index: 0,
-                        text: word.to_owned(),
-                        comment,
-                        pinned,
-                        is_clipboard_shortcut: false,
-                        quick_paste_id: None,
-                        function_action: None,
-                        shortcut_code: None,
-                        frecency_score,
-                    },
-                    word.to_owned(),
-                    score,
-                )
-            })
-            .collect()
     }
 
     /// At most three dictionary buckets (24/10/10 entries) and bounded personal buckets.
@@ -580,6 +510,7 @@ impl PureRustEngine {
                 self.fuzzy_pinyin,
                 self.syllable_split,
                 &self.confirmed_prefix,
+                self.typo_correction_level,
             ),
             SchemaKind::DoublePinyinFlypy => decode_xiaohe_context(
                 raw_input,
@@ -589,9 +520,18 @@ impl PureRustEngine {
                 retention,
                 40,
                 &self.confirmed_prefix,
+                self.typo_correction_level,
             ),
         };
 
+        super::quanpin::append_initial_choices(
+            &mut decoded,
+            raw_input,
+            corpus,
+            retention,
+            schema == SchemaKind::DoublePinyinFlypy,
+            self.confirming_initials,
+        );
         // Prefer the longest valid input span before deduplicating typo and prefix paths.
         decoded.sort_by(|a, b| {
             b.consumed_len
@@ -622,11 +562,9 @@ impl PureRustEngine {
             syllables
                 .iter()
                 .all(|s| crate::imp::xiaohe::canonical_syllable_set().contains(s.as_str()))
-                && if schema == SchemaKind::RimeIce {
-                    crate::imp::xiaohe::matches_quanpin_reading(syllables, raw_input)
-                } else {
-                    crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&syllables.join(" ")) == raw_input
-                }
+                && super::quanpin::matches_exact_reading(
+                    syllables, raw_input, schema == SchemaKind::DoublePinyinFlypy,
+                )
         };
         let has_exact_chinese = decoded.iter().any(|c| {
             c.consumed_len == raw_input.len()
@@ -830,9 +768,11 @@ impl PureRustEngine {
                 },
             );
         }
-        let prediction = prev_context.and_then(|context| {
-            self.contextual_prefix_candidate(raw_input, schema, imported, retention, context, adaptive)
-        });
+        let prediction = prev_context
+            .filter(|_| !self.confirming_initials)
+            .and_then(|context| {
+                self.contextual_prefix_candidate(raw_input, schema, imported, retention, context, adaptive)
+            });
         if let Some((word, syllables)) = &prediction {
             // An explicitly typed sentence wins over an unfinished contextual completion.
             let longer_sentence = !exact_reading(syllables)
@@ -1092,6 +1032,7 @@ mod device_tests {
             false,
             false,
             "",
+            TypoCorrectionLevel::Standard,
         );
         let prefixed = decode_quanpin_context(
             "quchifan",
@@ -1103,6 +1044,7 @@ mod device_tests {
             false,
             false,
             "我要",
+            TypoCorrectionLevel::Standard,
         );
         let plain = plain.iter().find(|c| c.text == "去吃饭").unwrap();
         let prefixed = prefixed.iter().find(|c| c.text == "去吃饭").unwrap();
@@ -1168,6 +1110,7 @@ mod device_tests {
             false,
             false,
             "",
+            TypoCorrectionLevel::Standard,
         );
         assert!(!erased
             .iter()

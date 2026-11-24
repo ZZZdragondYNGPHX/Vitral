@@ -355,7 +355,7 @@ pub struct RetentionEngine {
     #[serde(default)]
     pub semantic_memories:
         IndexedRetentionData<Vec<SemanticMemoryEntry>, HashMap<String, Vec<usize>>>,
-    #[serde(skip, default)]
+    #[serde(default)]
     pub pending_phrase_pairs: HashMap<String, u32>,
     #[serde(skip, default)]
     pub session_cache: VecDeque<(String, String, u64)>,
@@ -433,7 +433,9 @@ impl RetentionEngine {
     }
 
     pub fn record_selection_at(&mut self, word: &str, now_ms: u64, boost: f64) -> f64 {
-        self.erased_words.remove(word);
+        if self.erased_words.contains(word) {
+            return 0.0;
+        }
         let decayed = self.decayed_score_at(word, now_ms);
         let updated = decayed + boost;
         self.frecency.insert(word.to_string(), updated);
@@ -459,9 +461,11 @@ impl RetentionEngine {
         lambda: f64,
         boost: f64,
     ) -> f64 {
+        if self.erased_words.contains(word) {
+            return 0.0;
+        }
         let now_ms = Self::now_epoch_ms();
         if delta_seconds > 0.0 {
-            self.erased_words.remove(word);
             let prev = self.frecency.get(word).copied().unwrap_or(0.0);
             let eff_lambda = if lambda.is_finite() && lambda > 0.0 {
                 lambda
@@ -639,6 +643,10 @@ impl RetentionEngine {
         feats[3] = lookup(&self.app_frecency, "a:", &app_key);
         let code = normalize_borrowed(code);
         feats[4] = self.code_preference_at(word, &code, now_ms);
+        if feats[4] > 1.0 && valid_phrase(word) {
+            // Repeat choices in the same code retain a boost after the session cache expires.
+            feats[4] += (feats[4] - 1.0).min(2.0);
+        }
         feats[5] = query_vec.map_or(0.0, |v| self.semantic_score(v, word, &app_key, now_ms));
         feats[6] = word
             .chars()
@@ -790,6 +798,9 @@ impl RetentionEngine {
         boost: f64,
         adaptive: bool,
     ) {
+        if self.erased_words.contains(word) {
+            return;
+        }
         self.record_selection_at(word, now_ms, boost);
         if !adaptive {
             return;
@@ -819,19 +830,8 @@ impl RetentionEngine {
             if key.is_empty() {
                 continue;
             }
-            let clock = self
-                .habit_updated_ms
-                .entry(format!("{prefix}{key}"))
-                .or_insert(now_ms);
-            let decay = (-lambda * (now_ms.saturating_sub(*clock) as f64 / 1000.0)).exp();
-            let words = map.entry(key.clone()).or_default();
-            for score in words.values_mut() {
-                *score *= decay;
-            }
-            *words.entry(word.to_string()).or_default() += boost;
-            *clock = now_ms
-                .max(clock.saturating_add(1))
-                .max(self.learned_reset_ms);
+            let clock = self.habit_updated_ms.entry(format!("{prefix}{key}")).or_insert(now_ms);
+            update_habit(map.entry(key).or_default(), clock, word, now_ms, self.learned_reset_ms, lambda, boost);
         }
         self.enforce_bounds();
     }
@@ -919,11 +919,11 @@ impl RetentionEngine {
                 },
             );
             self.record_selection_at(combined_word, now_ms, 0.8);
+            self.pending_phrase_pairs.remove(combined_word);
+        } else {
+            self.crdt_seq = self.crdt_seq.saturating_add(1);
         }
-        // Pending observations are transient and bounded too.
-        if self.pending_phrase_pairs.len() > 1024 {
-            prune_counts(&mut self.pending_phrase_pairs, 1024);
-        }
+        prune_counts(&mut self.pending_phrase_pairs, 1024);
         self.enforce_bounds();
     }
 
@@ -1091,20 +1091,51 @@ impl RetentionEngine {
         self.enforce_bounds();
     }
 
+    pub(crate) fn record_acronym_selection(
+        &mut self,
+        word: &str,
+        acronym: &str,
+        typed_code: &str,
+        now_ms: u64,
+    ) {
+        if !self.user_phrases.contains_key(word) || self.erased_words.contains(word) {
+            return;
+        }
+        let lambda = self.lambda();
+        for code in std::iter::once(acronym).chain((typed_code != acronym).then_some(typed_code)) {
+            let clock = self.habit_updated_ms.entry(format!("c:{code}")).or_insert(now_ms);
+            update_habit(
+                self.code_preferences.entry(code.to_owned()).or_default(),
+                clock, word, now_ms, self.learned_reset_ms, lambda, 1.0,
+            );
+        }
+        self.enforce_bounds();
+    }
+
     pub fn query_acronym_phrases(&self, compact_code: &str) -> Vec<&UserPhrase> {
         let code = normalize(compact_code);
         if code.len() < 2 {
             return Vec::new();
         }
+        let preferred_for_code = self.code_preferences.get(&code);
         let mut phrases: Vec<_> = self
             .user_phrases
             .values()
             .filter(|p| {
-                !self.erased_words.contains(&p.word)
-                    && p.effective_acronym() == code
-                    && (p.count >= 2
+                if self.erased_words.contains(&p.word) {
+                    return false;
+                }
+                let has_pref = preferred_for_code
+                    .and_then(|words| words.get(&p.word))
+                    .is_some_and(|&score| score > 0.0);
+                if p.effective_acronym() == code {
+                    p.count >= 2
                         || self.pinned_words.contains(&p.word)
-                        || self.frecency.get(&p.word).copied().unwrap_or(0.0) >= 1.5)
+                        || self.frecency.get(&p.word).copied().unwrap_or(0.0) >= 1.5
+                        || has_pref
+                } else {
+                    has_pref && matches_initial_reading(&p.quanpin, &p.xiaohe, &code)
+                }
             })
             .collect();
         phrases.sort_by(|a, b| {
@@ -1316,6 +1347,7 @@ impl RetentionEngine {
     pub fn erase_word(&mut self, word: &str) {
         self.semantic_memories.retain(|e| e.word != word);
         self.session_cache.retain(|(_, cached, _)| cached != word);
+        self.pending_phrase_pairs.remove(word);
         self.pinned_words.remove(word);
         self.frecency.remove(word);
         self.frecency_updated_ms.remove(word);
@@ -1503,6 +1535,46 @@ impl RetentionEngine {
         self.enforce_bounds();
         self.crdt_seq = self.crdt_seq.max(delta.seq);
     }
+}
+
+fn update_habit(
+    words: &mut HashMap<String, f64>,
+    clock: &mut u64,
+    word: &str,
+    now_ms: u64,
+    reset_ms: u64,
+    lambda: f64,
+    boost: f64,
+) {
+    let decay = (-lambda * (now_ms.saturating_sub(*clock) as f64 / 1000.0)).exp();
+    for score in words.values_mut() {
+        *score *= decay;
+    }
+    *words.entry(word.to_owned()).or_default() += boost;
+    *clock = now_ms.max(clock.saturating_add(1)).max(reset_ms);
+}
+
+fn matches_initial_reading(quanpin_code: &str, xiaohe_code: &str, code: &str) -> bool {
+    let syllables: Vec<&str> = quanpin_code.split_whitespace().collect();
+    if syllables.len() < 2 || code == xiaohe_code || code == syllables.concat() {
+        return false;
+    }
+    fn step(syllables: &[&str], rest: &str) -> bool {
+        let Some((&syl, tail)) = syllables.split_first() else {
+            return rest.is_empty();
+        };
+        if rest.is_empty() {
+            return false;
+        }
+        if matches!(syl.get(..2), Some("zh" | "ch" | "sh"))
+            && rest.starts_with(&syl[..2])
+            && step(tail, &rest[2..])
+        {
+            return true;
+        }
+        syl.as_bytes().first() == rest.as_bytes().first() && step(tail, &rest[1..])
+    }
+    step(&syllables, code)
 }
 
 fn normalize(value: &str) -> String {
@@ -1873,6 +1945,32 @@ mod personalization_tests {
     }
 
     #[test]
+    fn pending_phrase_observation_survives_restart_and_promotes_on_second_input() {
+        let legacy = r#"{"frecency":{},"pinned_words":[],"erased_words":[]}"#;
+        let mut retention: RetentionEngine = serde_json::from_str(legacy).unwrap();
+        let observe = |retention: &mut RetentionEngine, now| {
+            retention.observe_phrase_composition("云璃", "yyli", "yun li", now);
+        };
+        observe(&mut retention, 1000);
+        assert_eq!(retention.crdt_seq, 1);
+        assert_eq!(retention.pending_phrase_pairs["云璃"], 1);
+        assert!(retention.user_phrases.is_empty());
+        let saved = serde_json::to_vec(&retention).unwrap();
+        let mut restarted: RetentionEngine = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restarted.pending_phrase_pairs["云璃"], 1);
+        observe(&mut restarted, 2000);
+        assert_eq!(restarted.user_phrases["云璃"].count, 2);
+        assert!(restarted.pending_phrase_pairs.is_empty());
+
+        restarted.erase_word("云璃");
+        restarted.record_contextual_selection("云璃", "yunli", None, None, 3000, 1.0, true);
+        observe(&mut restarted, 3000);
+        assert!(restarted.erased_words.contains("云璃"));
+        assert!(restarted.pending_phrase_pairs.is_empty());
+        assert!(restarted.query_user_phrases("yunli", false).is_empty());
+    }
+
+    #[test]
     fn typed_phrase_updates_preserve_counts_after_frecency_decay() {
         let mut r = RetentionEngine::default();
         let xiaohe = crate::imp::xiaohe::pinyin_phrase_to_xiaohe("ce shi ci zu");
@@ -2119,7 +2217,7 @@ mod personalization_tests {
         assert_eq!(a.stats().vocab_count, 0);
         assert_eq!(a.stats().phrase_count, 0);
         assert_eq!(a.stats().english_count, 0);
-        // Pending phrase observations never survive serialization.
+        // A cleared snapshot has no pending phrase observations.
         let restored: RetentionEngine =
             serde_json::from_str(&serde_json::to_string(&b).unwrap()).unwrap();
         assert!(restored.pending_phrase_pairs.is_empty());

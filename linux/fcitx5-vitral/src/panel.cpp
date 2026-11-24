@@ -469,16 +469,26 @@ public:
     idle_.start();
     connect(&timer_, &QTimer::timeout, this, [this] { poll(); });
     timer_.start(500);
+    auto *clipboardTimer = new QTimer(this);
+    connect(clipboardTimer, &QTimer::timeout, this, [this] {
+      pollClipboardService("clipboard-poll-current", clipboardPolling_);
+    });
+    clipboardTimer->start(1000);
     auto *cloudTimer = new QTimer(this);
     connect(cloudTimer, &QTimer::timeout, this, [this] {
-      if (!cloudWatcher_ || cloudWatcher_->isFinished()) {
-        if (cloudWatcher_)
-          cloudWatcher_->deleteLater();
-        cloudWatcher_ = new QDBusPendingCallWatcher(
-            bus_.asyncCall("Command", "poll-services", "{}"), this);
-      }
+      pollClipboardService("poll-services", cloudPolling_);
     });
-    cloudTimer->start(3000);
+    cloudTimer->start(10000);
+    lanClipboardNotification_.setSingleShot(true);
+    connect(&lanClipboardNotification_, &QTimer::timeout, this, [this] {
+      const auto revision = clipboardRevision_;
+      request("quick-paste-state", {}, [this, revision](auto state) {
+        applyClipboardState(state, revision);
+      });
+    });
+    bus_.connection().connect("dev.vitral.IME", "/dev/vitral/IME",
+                              "dev.vitral.IME", "ClipboardChanged",
+                              &lanClipboardNotification_, SLOT(start()));
     if (QApplication::platformName() == "wayland")
       waylandClipboard_ = std::make_unique<WaylandClipboard>(
           [this](const QString &text, const QString &id, qint64 stamp) {
@@ -890,6 +900,8 @@ private:
   QString systemCopyId_;
   quint64 clipboardRevision_ = 0;
   bool clipboardSyncing_ = false;
+  bool clipboardPolling_ = false, cloudPolling_ = false;
+  qint64 appliedCopyAt_ = 0;
   qint64 localCopyAt_ = 0;
   QString localCopyText_;
 
@@ -927,39 +939,64 @@ private:
     const auto revision = clipboardRevision_;
     request("quick-paste-state", {}, [this, revision](auto state) {
       clipboardSyncing_ = false;
-      if (revision != clipboardRevision_)
-        return;
-      const auto copy = state["current_copy"].toObject();
-      const auto id = copy["id"].toString();
-      const auto text = copy["content"].toString();
-      if (id.isEmpty() || id == systemCopyId_ ||
-          copy["timestamp_ms"].toInteger() < localCopyAt_)
-        return;
-      if (copy["timestamp_ms"].toInteger() == localCopyAt_ &&
-          text == localCopyText_) {
-        systemCopyId_ = id;
-      } else if (waylandClipboard_ && waylandClipboard_->isActive()) {
-        if (!waylandClipboard_->setText(text, id))
-          return;
-        systemCopyId_ = id;
-      } else {
-        auto *mime = new QMimeData;
-        mime->setText(text);
-        mime->setData("application/x-vitral-copy-id", id.toUtf8());
-        systemCopyId_ = id;
-        QApplication::clipboard()->setMimeData(mime);
-      }
-      preferences_.setValue("clipboard/id", id);
-      preferences_.setValue("clipboard/text", text);
+      applyClipboardState(state, revision);
     });
+  }
+
+  void pollClipboardService(const QString &command, bool &polling) {
+    if (polling)
+      return;
+    polling = true;
+    const auto revision = clipboardRevision_;
+    auto *watcher = new QDBusPendingCallWatcher(
+        bus_.asyncCall("Command", command, "{}"), this);
+    connect(watcher, &QDBusPendingCallWatcher::finished, this,
+            [this, watcher, revision, &polling] {
+              QDBusPendingReply<QString> reply = *watcher;
+              watcher->deleteLater();
+              polling = false;
+              if (!reply.isError())
+                applyClipboardState(
+                    QJsonDocument::fromJson(reply.value().toUtf8()).object(),
+                    revision);
+            });
+  }
+
+  void applyClipboardState(const QJsonObject &state, quint64 revision) {
+    if (revision != clipboardRevision_)
+      return;
+    const auto copy = state["current_copy"].toObject();
+    const auto id = copy["id"].toString();
+    const auto text = copy["content"].toString();
+    const auto stamp = copy["timestamp_ms"].toInteger();
+    if (id.isEmpty() || id == systemCopyId_ || stamp < localCopyAt_ ||
+        stamp < appliedCopyAt_ ||
+        (stamp == appliedCopyAt_ && id.toUtf8() < systemCopyId_.toUtf8()))
+      return;
+    if (stamp == localCopyAt_ && text == localCopyText_) {
+      systemCopyId_ = id;
+    } else if (waylandClipboard_ && waylandClipboard_->isActive()) {
+      if (!waylandClipboard_->setText(text, id))
+        return;
+      systemCopyId_ = id;
+    } else {
+      auto *mime = new QMimeData;
+      mime->setText(text);
+      mime->setData("application/x-vitral-copy-id", id.toUtf8());
+      systemCopyId_ = id;
+      QApplication::clipboard()->setMimeData(mime);
+    }
+    appliedCopyAt_ = stamp;
+    preferences_.setValue("clipboard/id", id);
+    preferences_.setValue("clipboard/text", text);
   }
 
   int functionSerial_ = 0;
   void poll() {
+    syncClipboard();
     if (polling_)
       return;
     polling_ = true;
-    syncClipboard();
     request("panel-state", {}, [this](auto state) {
       polling_ = false;
       applyTheme(state["theme"].toString("system"));
@@ -1278,8 +1315,7 @@ private:
   Ink *ink_ = nullptr;
   QHBoxLayout *choices_ = nullptr;
   LayerShellQt::Window *layer_ = nullptr;
-  QDBusPendingCallWatcher *cloudWatcher_ = nullptr;
-  QTimer timer_;
+  QTimer timer_, lanClipboardNotification_;
   QElapsedTimer idle_;
   QSize lastSize_;
   int lastRight_ = INT_MIN;

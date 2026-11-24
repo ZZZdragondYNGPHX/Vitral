@@ -7,6 +7,7 @@
 #include <QProcessEnvironment>
 #include <QSettings>
 #include <QStandardPaths>
+#include <QStringList>
 #include <QSysInfo>
 #include <QUuid>
 #include <atomic>
@@ -299,8 +300,10 @@ public:
           !key.states().test(KeyState::Ctrl) && !key.states().test(KeyState::Alt) &&
           !key.states().test(KeyState::Shift) && !key.states().test(KeyState::Super) &&
           sym == FcitxKey_Tab &&
-          !ic->capabilityFlags().test(CapabilityFlag::PasswordOrSensitive) &&
-          predictionContext_ == contextBefore(ic)) {
+          !ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive) &&
+          !hasSelection(ic) &&
+          predictionContext_ == contextBefore(ic) &&
+          predictionContextAfter_ == contextAfter(ic)) {
         const auto text = predictionText_;
         const auto id = predictionId_;
         const auto current = command("predict-poll", {{"id", id}});
@@ -403,23 +406,19 @@ public:
     auto list = std::dynamic_pointer_cast<CommonCandidateList>(
         ic->inputPanel().candidateList());
     if (list && list->size() > 0 && !key.states().test(KeyState::Shift)) {
-      if (sym == FcitxKey_Left || sym == FcitxKey_Right) {
-        int next =
-            std::clamp(list->cursorIndex() + (sym == FcitxKey_Left ? -1 : 1), 0,
-                       list->size() - 1);
-        list->setGlobalCursorIndex(next);
-        ic->updateUserInterface(UserInterfaceComponent::InputPanel);
-        event.filterAndAccept();
-        return;
-      }
-      if (sym == FcitxKey_Up || sym == FcitxKey_Down) {
-        if (sym == FcitxKey_Up ? hasPrev_ : hasNext_) {
-          auto page =
-              sym == FcitxKey_Up ? FcitxKey_Page_Up : FcitxKey_Page_Down;
+      const bool vertical = sym == FcitxKey_Up || sym == FcitxKey_Down;
+      if (vertical || (!composing_ && (sym == FcitxKey_Left || sym == FcitxKey_Right))) {
+        const bool backward = sym == FcitxKey_Up || sym == FcitxKey_Left;
+        const int next = list->cursorIndex() + (backward ? -1 : 1);
+        if (vertical && (backward ? next < 0 && hasPrev_ : next >= list->size() && hasNext_)) {
+          auto page = backward ? FcitxKey_Page_Up : FcitxKey_Page_Down;
           auto action =
               unpack(vitral_process_key(core_, page, 0, VITRAL_SWIPE_DIR_NONE));
           if (!action.isEmpty())
-            render(ic, action);
+            render(ic, action, backward);
+        } else {
+          list->setGlobalCursorIndex(std::clamp(next, 0, list->size() - 1));
+          ic->updateUserInterface(UserInterfaceComponent::InputPanel);
         }
         event.filterAndAccept();
         return;
@@ -432,6 +431,9 @@ public:
     }
     const bool editingKey = sym == FcitxKey_BackSpace ||
                             sym == FcitxKey_Return || sym == FcitxKey_Escape ||
+                            sym == FcitxKey_Left || sym == FcitxKey_Right ||
+                            sym == FcitxKey_Home || sym == FcitxKey_End ||
+                            sym == FcitxKey_Delete ||
                             sym == FcitxKey_Page_Up ||
                             sym == FcitxKey_Page_Down;
     if ((sym < 32 || sym > 126) && !(composing_ && editingKey))
@@ -449,9 +451,15 @@ public:
   }
 
 private:
+  bool hasSelection(InputContext *ic) const {
+    const auto &surrounding = ic->surroundingText();
+    return surrounding.isValid() && surrounding.cursor() != surrounding.anchor();
+  }
   QString contextBefore(InputContext *ic) const {
     const auto &surrounding = ic->surroundingText();
-    if (!surrounding.isValid() || ic->capabilityFlags().test(CapabilityFlag::PasswordOrSensitive)) return {};
+    if (!surrounding.isValid() ||
+        ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive))
+      return {};
     const auto &text = surrounding.text();
     if (surrounding.cursor() == 0)
       return {};
@@ -466,6 +474,19 @@ private:
     }
     return QString::fromUtf8(text.data() + (start - text.cbegin()), cursor - start);
   }
+  QString contextAfter(InputContext *ic) const {
+    const auto &surrounding = ic->surroundingText();
+    if (!surrounding.isValid() ||
+        ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive))
+      return {};
+    const auto &text = surrounding.text();
+    const auto cursor = utf8::nextNChar(text.data(), surrounding.cursor());
+    const auto end = text.data() + text.size();
+    auto finish = cursor;
+    for (int n = 0; n < 80 && finish != end; ++n)
+      finish = utf8::nextChar(finish);
+    return QString::fromUtf8(cursor, finish - cursor);
+  }
   void cancelSubmittedPrediction() {
     if (predictionId_ != 0) {
       command("predict-cancel");
@@ -477,6 +498,7 @@ private:
     cancelSubmittedPrediction();
     const bool visible = !predictionText_.isEmpty();
     predictionText_.clear();
+    predictionHint_.clear();
     if (ic && visible) {
       ic->inputPanel().setAuxDown(Text());
       ic->updateUserInterface(UserInterfaceComponent::InputPanel);
@@ -494,17 +516,24 @@ private:
           timer->setEnabled(false);
           auto *ic = instance_->lastFocusedInputContext();
           if (epoch != editor_ || !active_ || composing_ || !ic || !ic->hasFocus() ||
-              instance_->inputMethod(ic) != "vitral" ||
-              ic->capabilityFlags().test(CapabilityFlag::PasswordOrSensitive)) {
+              instance_->inputMethod(ic) != "vitral" || hasSelection(ic) ||
+              ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
             cancelSubmittedPrediction();
             return true;
           }
           QJsonObject response;
           const bool submitting = predictionId_ == 0;
           if (submitting) {
-            const auto before = contextBefore(ic);
-            predictionContext_ = before;
-            response = command("predict-request", {{"app_id", QString::fromStdString(ic->program().empty() ? "desktop" : ic->program())}, {"context_before", before}, {"trigger", trigger}, {"is_composing", false}, {"is_password", false}});
+            predictionContext_ = contextBefore(ic);
+            predictionContextAfter_ = contextAfter(ic);
+            response = command("predict-request", {
+                {"app_id", QString::fromStdString(ic->program().empty() ? "desktop" : ic->program())},
+                {"context_before", predictionContext_},
+                {"context_after", predictionContextAfter_},
+                {"trigger", trigger},
+                {"is_composing", false},
+                {"is_password", false},
+            });
           } else {
             response = command("predict-poll", {{"id", predictionId_}});
           }
@@ -517,10 +546,24 @@ private:
             timer->setOneShot();
             return true;
           }
-          if (status == "ready" && predictionContext_ == contextBefore(ic)) {
+          if (status == "ready" && predictionContext_ == contextBefore(ic) &&
+              predictionContextAfter_ == contextAfter(ic)) {
             predictionText_ = response["text"].toString();
             if (!predictionText_.isEmpty()) {
-              ic->inputPanel().setAuxDown(Text("Tab 补全：" + predictionText_.toStdString()));
+              predictionHint_ = "Tab 补全：" + predictionText_;
+              const auto candidates = response["candidates"].toArray();
+              if (candidates.size() > 1) {
+                QStringList alternatives;
+                for (qsizetype i = 1; i < candidates.size() && i < 4; ++i) {
+                  auto alternative = candidates[i].toString();
+                  const auto characters = alternative.toUcs4();
+                  if (characters.size() > 8)
+                    alternative = QString::fromUcs4(characters.constData(), 8) + "…";
+                  alternatives.append(alternative);
+                }
+                predictionHint_ += " · 备选 " + alternatives.join(" / ");
+              }
+              ic->inputPanel().setAuxDown(Text(predictionHint_.toStdString()));
               ic->updateUserInterface(UserInterfaceComponent::InputPanel);
               return true;
             }
@@ -645,7 +688,7 @@ private:
                                InputContext &) override {
     return english_ ? "En" : "中";
   }
-  void render(InputContext *ic, const QJsonObject &action) {
+  void render(InputContext *ic, const QJsonObject &action, bool selectLast = false) {
     english_ = action["lang_mode"].toString() == "en";
     auto commit = action["commit_text"].toString();
     if (!commit.isEmpty())
@@ -660,9 +703,11 @@ private:
     hasNext_ = page["has_next"].toBool();
     auto &panel = ic->inputPanel();
     panel.reset();
-    if (!composing_ && !predictionText_.isEmpty()) panel.setAuxDown(Text("Tab 补全：" + predictionText_.toStdString()));
+    if (!composing_ && !predictionHint_.isEmpty())
+      panel.setAuxDown(Text(predictionHint_.toStdString()));
     Text marked(text, TextFormatFlag::Underline);
-    marked.setCursor(preedit["cursor_utf8"].toInt());
+    marked.setCursor(std::clamp(preedit["cursor_utf8"].toInt(), 0,
+                                static_cast<int>(text.size())));
     if (ic->capabilityFlags().test(CapabilityFlag::Preedit))
       panel.setClientPreedit(marked);
     else
@@ -685,7 +730,7 @@ private:
           });
     }
     if (list->size()) {
-      list->setGlobalCursorIndex(0);
+      list->setGlobalCursorIndex(selectLast ? list->size() - 1 : 0);
       panel.setCandidateList(std::move(list));
     }
     ic->updatePreedit();
@@ -706,7 +751,7 @@ private:
   Instance *instance_;
   EventDispatcher dispatcher_;
   std::unique_ptr<EventSourceTime> predictionTimer_;
-  QString predictionText_, predictionContext_;
+  QString predictionText_, predictionHint_, predictionContext_, predictionContextAfter_;
   double predictionId_ = 0;
   int predictionDelay_ = 380, predictionPolls_ = 0;
   bool predictionEnabled_ = true;

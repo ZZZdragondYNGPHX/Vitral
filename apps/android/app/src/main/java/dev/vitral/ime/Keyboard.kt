@@ -139,18 +139,98 @@ internal fun trailingWordDeleteSlice(before: String, lastCommitted: String): Pai
     return before.substring(start) to false
 }
 
-internal fun formatPreedit(raw: String, comment: String): String {
+internal data class PreeditDisplay(
+    val text: String,
+    val cursorIndex: Int,
+    val rawByteOffsets: IntArray,
+)
+
+internal fun formatPreedit(raw: String, comment: String): String =
+    buildPreeditDisplay(raw, comment, raw.toByteArray(Charsets.UTF_8).size).text
+
+internal fun buildPreeditDisplay(raw: String, comment: String, cursorUtf8: Int): PreeditDisplay {
+    val rawBytesLen = raw.toByteArray(Charsets.UTF_8).size
+    val clampedUtf8 = cursorUtf8.coerceIn(0, rawBytesLen)
     // Only use complete, matching annotations; abbreviations and partial syllables stay raw.
     val syllables = comment.trim().split(Regex("[\\s'’]+"))
-    if (syllables.size < 2 || syllables.any { part -> part.isEmpty() || part.any { !it.isLetter() } })
-        return raw
-    val letters = raw.filter { it.isLetter() }
-    if (!syllables.joinToString("").equals(letters, ignoreCase = true)) return raw
-    if (raw.any { !it.isLetter() && it != '\'' && it != '’' && !it.isWhitespace() }) return raw
-    var offset = 0
-    return syllables.joinToString("'") { part ->
-        letters.substring(offset, offset + part.length).also { offset += part.length }
+    val useFormatted =
+        syllables.size >= 2 &&
+            syllables.none { part -> part.isEmpty() || part.any { !it.isLetter() } } &&
+            raw.none { !it.isLetter() && it != '\'' && it != '’' && !it.isWhitespace() } &&
+            syllables.joinToString("").equals(raw.filter { it.isLetter() }, ignoreCase = true)
+
+    if (!useFormatted) {
+        val offsets = IntArray(raw.length + 1)
+        var bytes = 0
+        var cursorIdx = 0
+        for (i in raw.indices) {
+            offsets[i] = bytes
+            if (bytes <= clampedUtf8) cursorIdx = i
+            bytes += raw.substring(i, i + 1).toByteArray(Charsets.UTF_8).size
+        }
+        offsets[raw.length] = bytes
+        if (bytes <= clampedUtf8) cursorIdx = raw.length
+        return PreeditDisplay(raw, cursorIdx, offsets)
     }
+
+    val letterRawByteStart = IntArray(raw.length)
+    val letterRawByteEnd = IntArray(raw.length)
+    var letterCount = 0
+    var bytePos = 0
+    for (i in raw.indices) {
+        val ch = raw[i]
+        val chBytes = raw.substring(i, i + 1).toByteArray(Charsets.UTF_8).size
+        if (ch.isLetter()) {
+            letterRawByteStart[letterCount] = bytePos
+            letterRawByteEnd[letterCount] = bytePos + chBytes
+            letterCount++
+        }
+        bytePos += chBytes
+    }
+    val letters = raw.filter { it.isLetter() }
+    val sb = StringBuilder(letterCount + syllables.size)
+    val offsetsList = ArrayList<Int>(letterCount + syllables.size + 1)
+    var letterOffset = 0
+    syllables.forEachIndexed { sIdx, part ->
+        if (sIdx > 0) {
+            sb.append('\'')
+            val boundaryByte =
+                if (letterOffset > 0) letterRawByteEnd[letterOffset - 1] else 0
+            offsetsList.add(boundaryByte)
+        }
+        for (j in part.indices) {
+            offsetsList.add(letterRawByteStart[letterOffset])
+            sb.append(letters[letterOffset])
+            letterOffset++
+        }
+    }
+    offsetsList.add(rawBytesLen)
+    val offsets = IntArray(offsetsList.size) { offsetsList[it] }
+    var cursorIdx = 0
+    for (i in offsets.indices) {
+        if (offsets[i] <= clampedUtf8) {
+            cursorIdx = i
+        }
+    }
+    // Prefer landing right after an auto-inserted apostrophe when cursor is at syllable end
+    return PreeditDisplay(sb.toString(), cursorIdx, offsets)
+}
+
+internal fun visualTapToRawByteOffset(
+    display: PreeditDisplay,
+    visualCharOffset: Int,
+    hasCaret: Boolean,
+): Int {
+    val logicalOffset =
+        if (!hasCaret) {
+            visualCharOffset
+        } else if (visualCharOffset <= display.cursorIndex) {
+            visualCharOffset
+        } else {
+            visualCharOffset - 1
+        }
+    val idx = logicalOffset.coerceIn(0, display.rawByteOffsets.lastIndex)
+    return display.rawByteOffsets[idx]
 }
 
 internal class Key(

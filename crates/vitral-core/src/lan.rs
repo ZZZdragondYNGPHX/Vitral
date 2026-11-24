@@ -1,8 +1,12 @@
+use crate::clip::ClipboardEntry;
 use crate::dav::{upload_koofr_relay, DavConfig};
 use crate::error::VitralError;
 use crate::offline_guard::OfflineGuard;
 use crate::ret::RetentionEngine;
-use crate::sync::{sha256_hex, sort_devices_mru, DeviceTier, RelayDevice, RelaySendResult};
+use crate::sync::{
+    decrypt_envelope, encrypt_envelope, sha256_hex, sort_devices_mru, DeviceTier, RelayDevice,
+    RelaySendResult,
+};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -12,7 +16,7 @@ use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 pub const LOCALSEND_MULTICAST_ADDR: &str = "224.0.0.167";
@@ -20,8 +24,11 @@ pub const LOCALSEND_DEFAULT_PORT: u16 = 53317;
 pub const LOCALSEND_MDNS_TYPE: &str = "_localsend._tcp.local.";
 pub const MAX_LOCALSEND_CONTROL_BODY_BYTES: usize = 1024 * 1024;
 pub const MAX_LOCALSEND_UPLOAD_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLIPBOARD_BODY_BYTES: usize = 256 * 1024;
+const MAX_PENDING_CLIPBOARD_ENTRIES: usize = 32;
 
 static RELAY_TX_SEQ: AtomicU64 = AtomicU64::new(1);
+static CLIPBOARD_RX_SEQ: AtomicU64 = AtomicU64::new(1);
 
 fn is_safe_query_token(val: &str) -> bool {
     !val.is_empty()
@@ -128,10 +135,58 @@ struct ServerSession {
     cancelled: bool,
 }
 
+#[derive(Default)]
+struct ClipboardInbox {
+    sync_key: Option<String>,
+    entries: Vec<ClipboardEntry>,
+    revision: u64,
+}
+
+impl ClipboardInbox {
+    fn has_key(&self) -> bool {
+        self.sync_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+    }
+
+    fn receive(&mut self, body: &[u8]) -> u16 {
+        // The WebDAV format has a built-in fallback key. LAN requires a shared secret.
+        let Some(key) = self
+            .sync_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        else {
+            return 403;
+        };
+        let Ok(data) = decrypt_envelope(body, Some(key)) else {
+            return 403;
+        };
+        let Ok(entry) = serde_json::from_slice::<ClipboardEntry>(&data) else {
+            return 400;
+        };
+        if self.entries.len() >= MAX_PENDING_CLIPBOARD_ENTRIES {
+            let (index, oldest) = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| crate::clip::copy_order(entry))
+                .expect("full clipboard inbox");
+            if crate::clip::copy_order(&entry) <= crate::clip::copy_order(oldest) {
+                return 204;
+            }
+            self.entries.swap_remove(index);
+        }
+        self.entries.push(entry);
+        self.revision = CLIPBOARD_RX_SEQ.fetch_add(1, Ordering::Relaxed);
+        204
+    }
+}
+
 pub struct LocalSendReceiverHandle {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     received: Arc<Mutex<Vec<ReceivedLocalSendTransfer>>>,
+    clipboard: Arc<Mutex<ClipboardInbox>>,
     join: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -168,9 +223,15 @@ pub struct DiscoverySession {
 }
 
 impl DiscoverySession {
-    pub fn start(guard: &OfflineGuard, id: &str, name: &str) -> Result<Self, VitralError> {
+    pub fn start(
+        guard: &OfflineGuard,
+        id: &str,
+        name: &str,
+        sync_key: Option<String>,
+    ) -> Result<Self, VitralError> {
         let mut info = LocalSendDeviceInfo::new(id, name, 0);
         let receiver = LocalSendTransport::start_receiver(guard, "0.0.0.0:0", info.clone())?;
+        receiver.clipboard.lock().sync_key = sync_key;
         info.port = receiver.port();
         let mdns = LocalSendTransport::register_mdns(guard, &info)?;
         Ok(Self { receiver, mdns })
@@ -178,6 +239,26 @@ impl DiscoverySession {
 
     pub fn take_received(&self) -> Vec<ReceivedLocalSendTransfer> {
         std::mem::take(&mut *self.receiver.received.lock())
+    }
+
+    pub fn take_received_clipboard(&self) -> Vec<ClipboardEntry> {
+        std::mem::take(&mut self.receiver.clipboard.lock().entries)
+    }
+
+    pub(crate) fn has_received_clipboard(&self) -> bool {
+        !self.receiver.clipboard.lock().entries.is_empty()
+    }
+
+    pub(crate) fn clipboard_revision(&self) -> u64 {
+        self.receiver.clipboard.try_lock().map_or(0, |inbox| inbox.revision)
+    }
+
+    pub(crate) fn set_clipboard_key(&self, sync_key: Option<String>) {
+        let mut inbox = self.receiver.clipboard.lock();
+        if inbox.sync_key != sync_key {
+            inbox.sync_key = sync_key;
+            inbox.entries.clear();
+        }
     }
 }
 
@@ -212,6 +293,9 @@ impl LocalSendTransport {
         let stop_bg = Arc::clone(&stop);
         let received = Arc::new(Mutex::new(Vec::<ReceivedLocalSendTransfer>::new()));
         let rec_bg = Arc::clone(&received);
+        let clipboard = Arc::new(Mutex::new(ClipboardInbox::default()));
+        let clipboard_bg = Arc::clone(&clipboard);
+        let guard = guard.clone();
         let sessions = Arc::new(Mutex::new(HashMap::<String, ServerSession>::new()));
         let sess_seq = Arc::new(AtomicU64::new(1));
 
@@ -247,6 +331,25 @@ impl LocalSendTransport {
                         }
                         let json = serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string());
                         let _ = req.respond(json_response(200, &json));
+                    }
+                    ("POST", "vitral-clipboard") => {
+                        if guard.is_pure_offline() || !clipboard_bg.lock().has_key() {
+                            let _ = req.respond(tiny_http::Response::empty(403));
+                            continue;
+                        }
+                        let body = match read_bounded_body(&mut req, MAX_CLIPBOARD_BODY_BYTES) {
+                            Ok(body) => body,
+                            Err(code) => {
+                                let _ = req.respond(tiny_http::Response::empty(code));
+                                continue;
+                            }
+                        };
+                        let status = if guard.is_pure_offline() {
+                            403
+                        } else {
+                            clipboard_bg.lock().receive(&body)
+                        };
+                        let _ = req.respond(tiny_http::Response::empty(status));
                     }
                     ("POST", "prepare-upload") => {
                         let body = match read_bounded_body(&mut req, MAX_LOCALSEND_CONTROL_BODY_BYTES) {
@@ -381,8 +484,73 @@ impl LocalSendTransport {
             addr,
             stop,
             received,
+            clipboard,
             join: Some(join),
         })
+    }
+
+    pub async fn push_clipboard_to_peer(
+        guard: &OfflineGuard,
+        base_url: &str,
+        entry: &ClipboardEntry,
+        sync_key: &str,
+    ) -> Result<(), VitralError> {
+        guard.require_online("localsend_clipboard_push")?;
+        if sync_key.trim().is_empty() {
+            return Err(VitralError::InvalidArgument(
+                "LocalSend clipboard requires a sync key".into(),
+            ));
+        }
+        let mut url = reqwest::Url::parse(base_url)
+            .map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(VitralError::InvalidArgument(
+                "invalid LocalSend clipboard URL".into(),
+            ));
+        }
+        url.path_segments_mut()
+            .map_err(|_| VitralError::InvalidArgument("invalid LocalSend clipboard URL".into()))?
+            .pop_if_empty()
+            .extend(["api", "localsend", "v2", "vitral-clipboard"]);
+        let data = serde_json::to_vec(entry).map_err(|e| VitralError::Parse(e.to_string()))?;
+        let encrypted = encrypt_envelope(&data, Some(sync_key))?;
+        if encrypted.len() > MAX_CLIPBOARD_BODY_BYTES {
+            return Err(VitralError::InvalidArgument(
+                "LocalSend clipboard exceeds 256 KiB".into(),
+            ));
+        }
+        static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+        let client = CLIENT
+            .get_or_init(|| {
+                reqwest::Client::builder()
+                    .tls_backend_preconfigured(crate::dav::rustls_client_config().clone())
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_millis(800))
+                    .pool_idle_timeout(Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(|e| VitralError::Io(e.clone()))?;
+        guard.require_online("localsend_clipboard_push")?;
+        let response = client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(encrypted)
+            .send()
+            .await
+            .map_err(|e| VitralError::Io(e.without_url().to_string()))?;
+        if !response.status().is_success() {
+            return Err(VitralError::Io(format!(
+                "LocalSend clipboard HTTP error status {}",
+                response.status().as_u16()
+            )));
+        }
+        Ok(())
     }
 
     pub fn announce_udp(
@@ -759,4 +927,133 @@ fn parse_query_params(q: &str) -> HashMap<String, String> {
         map.insert(k.to_string(), v.to_string());
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::ClipboardPayload;
+    use crate::VitralCore;
+
+    fn clipboard_entry() -> ClipboardEntry {
+        ClipboardEntry {
+            id: "lan-copy".into(),
+            content: "剪贴板内容".into(),
+            mime_type: "text/plain".into(),
+            source_device: "sender".into(),
+            timestamp_ms: 10,
+            pinned: false,
+            shortcut_code: None,
+        }
+    }
+
+    #[test]
+    fn clipboard_endpoint_authenticates_and_enforces_offline() {
+        let guard = OfflineGuard::new(false);
+        let receiver = LocalSendTransport::start_receiver(
+            &guard,
+            "127.0.0.1:0",
+            LocalSendDeviceInfo::new("receiver", "Receiver", 0),
+        )
+        .unwrap();
+        let key = "shared-clipboard-key";
+        receiver.clipboard.lock().sync_key = Some(key.into());
+        let url = receiver.base_url();
+        let entry = clipboard_entry();
+        let send =
+            |guard, key| {
+                crate::dav::network_runtime().unwrap().block_on(
+                    LocalSendTransport::push_clipboard_to_peer(guard, &url, &entry, key),
+                )
+            };
+
+        let wrong = send(&guard, "wrong-key").unwrap_err();
+        assert!(wrong.to_string().contains("403"));
+        assert!(receiver.clipboard.lock().entries.is_empty());
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(2)))
+            .build()
+            .into();
+        let endpoint = format!("{url}/api/localsend/v2/vitral-clipboard");
+        assert!(matches!(
+            agent.post(&endpoint).send(b"plaintext".as_slice()),
+            Err(ureq::Error::StatusCode(403))
+        ));
+        assert!(matches!(
+            agent
+                .post(&endpoint)
+                .send(&vec![0u8; MAX_CLIPBOARD_BODY_BYTES + 1]),
+            Err(ureq::Error::StatusCode(413))
+        ));
+
+        send(&guard, key).unwrap();
+        assert_eq!(receiver.clipboard.lock().entries, [entry.clone()]);
+        guard.set_pure_offline(true);
+        assert!(matches!(
+            send(&guard, key),
+            Err(VitralError::PureOfflineViolation(_))
+        ));
+        assert!(send(&OfflineGuard::new(false), key)
+            .unwrap_err()
+            .to_string()
+            .contains("403"));
+        assert_eq!(receiver.clipboard.lock().entries, [entry]);
+    }
+
+    #[test]
+    fn clipboard_push_reaches_known_lan_peer_without_webdav() {
+        let key = "shared-clipboard-key";
+        let receiver = VitralCore::init(
+            &serde_json::json!({
+                "device_id": "receiver", "sync_key": key
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let transport = LocalSendTransport::start_receiver(
+            &receiver.offline_guard,
+            "127.0.0.1:0",
+            LocalSendDeviceInfo::new("receiver", "Receiver", 0),
+        )
+        .unwrap();
+        let url = transport.base_url();
+        let session = DiscoverySession {
+            receiver: transport,
+            mdns: ServiceDaemon::new().unwrap(),
+        };
+        session.set_clipboard_key(Some(key.into()));
+        *receiver.lan_session.lock() = Some(session);
+        let sender = VitralCore::init(
+            &serde_json::json!({
+                "device_id": "sender", "sync_key": key,
+                "known_devices": [{
+                    "device_id": "receiver", "device_name": "Receiver", "tier": "lan",
+                    "lan_online": true, "localsend_url": url
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let expected = clipboard_entry();
+        sender.clipboard_push(ClipboardPayload {
+            id: Some(expected.id.clone()),
+            content: expected.content.clone(),
+            mime_type: expected.mime_type.clone(),
+            source_device: String::new(),
+            timestamp_ms: expected.timestamp_ms,
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while receiver.clipboard_lan_revision() == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "clipboard push never reached the LAN receiver"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(receiver.quick_paste_state().current_copy, Some(expected));
+        assert!(receiver.clipboard_state().ring.is_empty());
+    }
+
+
 }

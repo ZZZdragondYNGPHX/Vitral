@@ -843,17 +843,26 @@ impl Service_Impl {
             return Some(Action::new("select-candidate", json!({"idx":0})));
         }
         if !view.words.is_empty() && view.mode == 0 && !down(0x10) {
-            if code == 37 || code == 39 {
+            if !composing && (code == 37 || code == 39) {
                 return Some(Action::new(
                     "move-candidate",
                     json!({"delta":if code == 37 {-1} else {1}}),
                 ));
             }
             if code == 38 || code == 40 {
-                return Some(Action::new(
-                    "process-key",
-                    json!({"keycode":if code == 38 {"PageUp"} else {"PageDown"}}),
-                ));
+                let step = if code == 38 { -1 } else { 1 };
+                let at_edge = if code == 38 {
+                    view.selected == 0
+                } else {
+                    view.selected + 1 >= view.words.len()
+                };
+                if at_edge {
+                    return Some(Action::new(
+                        "process-key",
+                        json!({"keycode":if code == 38 {"PageUp"} else {"PageDown"}}),
+                    ));
+                }
+                return Some(Action::new("move-candidate", json!({"delta":step})));
             }
             if code == 32 {
                 return Some(Action::new(
@@ -863,13 +872,18 @@ impl Service_Impl {
             }
         }
         let key = match code {
-            8 | 13 | 27 | 32 | 33 | 34 if composing => match code {
+            8 | 13 | 27 | 32..=37 | 39 | 46 if composing => match code {
                 8 => "BackSpace",
                 13 => "Return",
                 27 => "Escape",
                 32 => "space",
                 33 => "PageUp",
-                _ => "PageDown",
+                34 => "PageDown",
+                35 => "End",
+                36 => "Home",
+                37 => "Left",
+                39 => "Right",
+                _ => "Delete",
             }
             .into(),
             0x30..=0x5a | 0xba..=0xe2 => {
@@ -1123,23 +1137,47 @@ impl ITfEditSession_Impl for Edit_Impl {
                 let text = commit.unwrap_or(pre);
                 let wide: Vec<u16> = text.encode_utf16().collect();
                 range.SetText(ec, 0, &wide)?;
-                let end = range.Clone()?;
-                end.Collapse(ec, TF_ANCHOR_END)?;
+                let mut caret = range.Clone()?;
+                caret.Collapse(ec, TF_ANCHOR_END)?;
+                if (commit.is_some() || pre.is_empty()) && composition.is_some() {
+                    ed.composition.replace(None);
+                    composition.unwrap().EndComposition(ec)?;
+                }
+                if commit.is_some() && !pre.is_empty() {
+                    let owner: ITfContextComposition = self.ctx.cast()?;
+                    let next_comp = owner.StartComposition(ec, &caret, &self.sink)?;
+                    let pre_range = next_comp.GetRange()?;
+                    let pre_wide: Vec<u16> = pre.encode_utf16().collect();
+                    pre_range.SetText(ec, 0, &pre_wide)?;
+                    ed.composition
+                        .replace(Some((self.ctx.clone(), next_comp)));
+                    caret = pre_range.Clone()?;
+                    caret.Collapse(ec, TF_ANCHOR_END)?;
+                }
+                let mut delta = r["cursor_delta"].as_i64().unwrap_or(0) as i32;
+                if !pre.is_empty() {
+                    if let Some(cursor) = r["preedit"]["cursor_utf8"].as_u64() {
+                        let mut cursor = cursor.min(pre.len() as u64) as usize;
+                        while !pre.is_char_boundary(cursor) {
+                            cursor -= 1;
+                        }
+                        delta -= pre[cursor..].encode_utf16().count() as i32;
+                    }
+                }
+                if delta < 0 {
+                    let mut moved = 0;
+                    caret.ShiftStart(ec, delta, &mut moved, ptr::null())?;
+                    caret.Collapse(ec, TF_ANCHOR_START)?;
+                }
                 if let Ok(view) = self.ctx.GetActiveView() {
                     let mut rect = RECT::default();
                     let mut clipped = BOOL(0);
-                    if view.GetTextExt(ec, &end, &mut rect, &mut clipped).is_ok() {
+                    if view.GetTextExt(ec, &caret, &mut rect, &mut clipped).is_ok() {
                         ed.view.borrow_mut().caret = rect;
                     }
                 }
-                let delta = r["cursor_delta"].as_i64().unwrap_or(0) as i32;
-                if delta < 0 {
-                    let mut moved = 0;
-                    end.ShiftStart(ec, delta, &mut moved, ptr::null())?;
-                    end.Collapse(ec, TF_ANCHOR_START)?;
-                }
                 let mut selection = TF_SELECTION {
-                    range: ManuallyDrop::new(Some(end)),
+                    range: ManuallyDrop::new(Some(caret)),
                     style: TF_SELECTIONSTYLE {
                         ase: TF_AE_NONE,
                         fInterimChar: false.into(),
@@ -1148,10 +1186,6 @@ impl ITfEditSession_Impl for Edit_Impl {
                 let sel = self.ctx.SetSelection(ec, std::slice::from_ref(&selection));
                 ManuallyDrop::drop(&mut selection.range);
                 sel?;
-                if (commit.is_some() || pre.is_empty()) && composition.is_some() {
-                    ed.composition.replace(None);
-                    composition.unwrap().EndComposition(ec)?;
-                }
             }
         }
         if a.cmd == "prediction-accept" && commit.is_some() {

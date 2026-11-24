@@ -359,6 +359,7 @@ class SettingsActivity : ComponentActivity() {
                 )
             }
             var fuzzyPinyin by remember { mutableStateOf(config.optBoolean("fuzzy_pinyin", false)) }
+            var typoLevel by remember { mutableStateOf(config.optString("typo_correction_level", "standard")) }
             var openccMode by remember { mutableStateOf(config.optString("opencc_mode", "simplified")) }
             var sublabelMode by remember { mutableStateOf(config.optString("mobile_sublabel_mode", "dual")) }
             var keyboardHeight by remember { mutableStateOf(config.optString("mobile_keyboard_height", "standard")) }
@@ -412,6 +413,7 @@ class SettingsActivity : ComponentActivity() {
                 config
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
                     .put("fuzzy_pinyin", fuzzyPinyin)
+                    .put("typo_correction_level", typoLevel)
                     .put("opencc_mode", openccMode)
                     .put("theme", themeMode)
                     .put("mobile_sublabel_mode", sublabelMode)
@@ -784,6 +786,35 @@ class SettingsActivity : ComponentActivity() {
                                             onCheckedChange = {
                                                 fuzzyPinyin = it
                                                 persistConfig(if (it) "已开启模糊音容错" else "已关闭模糊音容错")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(14.dp))
+                                        Text("拼写纠错强度", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
+                                        Text(
+                                            "自动纠正邻键误触、相邻字母打反、多按或少按键",
+                                            fontSize = 11.5.sp,
+                                            color = palette.textSecondary,
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassSegmentedControl(
+                                            options = listOf(
+                                                "off" to "关闭",
+                                                "conservative" to "保守",
+                                                "standard" to "标准",
+                                                "aggressive" to "积极",
+                                            ),
+                                            selected = typoLevel,
+                                            onSelect = {
+                                                typoLevel = it
+                                                val name =
+                                                    when (it) {
+                                                        "off" -> "关闭"
+                                                        "conservative" -> "保守"
+                                                        "aggressive" -> "积极"
+                                                        else -> "标准"
+                                                    }
+                                                persistConfig("拼写纠错已设为$name")
                                             },
                                         )
 
