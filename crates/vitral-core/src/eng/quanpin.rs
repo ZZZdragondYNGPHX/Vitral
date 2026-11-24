@@ -423,30 +423,76 @@ fn build_xiaohe_syllable_paths(raw_input: &str) -> SyllableDag {
     }
 }
 
+const FUZZY_INITIALS: [(&str, &str, &str); 5] = [
+    ("zh_z", "zh", "z"),
+    ("ch_c", "ch", "c"),
+    ("sh_s", "sh", "s"),
+    ("n_l", "n", "l"),
+    ("f_h", "f", "h"),
+];
+const FUZZY_FINALS: [(&str, &str, &str); 3] = [
+    ("an_ang", "ang", "an"),
+    ("en_eng", "eng", "en"),
+    ("in_ing", "ing", "in"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FuzzyPairs(u8);
+
+impl FuzzyPairs {
+    pub(super) const NONE: Self = Self(0);
+    pub(super) const ALL: Self = Self(u8::MAX);
+
+    pub(super) fn from_names(names: &[String]) -> Result<Self, crate::VitralError> {
+        if names.is_empty() {
+            return Ok(Self::ALL);
+        }
+        let mut selected = 0;
+        for name in names {
+            let index = FUZZY_INITIALS.iter().chain(&FUZZY_FINALS)
+                .position(|&(key, _, _)| key == name)
+                .ok_or_else(|| crate::VitralError::InvalidArgument(
+                    format!("invalid fuzzy_pinyin_pairs entry: {name}"),
+                ))?;
+            selected |= 1 << index;
+        }
+        Ok(Self(selected))
+    }
+
+    fn includes(self, index: usize) -> bool {
+        self.0 & (1 << index) != 0
+    }
+}
+
 // Expand only legal syllables, preserving the input offsets and exact edges.
-fn add_fuzzy_syllables(edges: &mut [Vec<SyllableEdge>]) {
+fn add_fuzzy_syllables(edges: &mut [Vec<SyllableEdge>], pairs: FuzzyPairs, flypy: bool) {
+    if pairs == FuzzyPairs::NONE {
+        return;
+    }
     let canon = canonical_syllable_set();
-    for outgoing in edges {
+    for (start, outgoing) in edges.iter_mut().enumerate() {
         for index in 0..outgoing.len() {
             let (end, ref syllable, penalty) = outgoing[index];
+            // A trailing Xiaohe initial has no second key to swap.
+            if flypy && (end - start != 2 || !canon.contains(syllable.as_ref())) {
+                continue;
+            }
             let mut base = [0; 8];
             base[..syllable.len()].copy_from_slice(syllable.as_bytes());
             let base = std::str::from_utf8(&base[..syllable.len()]).expect("ASCII syllable");
             let mut replacement = [0; 8];
-            let other_initial = [
-                ("zh", "z"),
-                ("ch", "c"),
-                ("sh", "s"),
-                ("l", "n"),
-                ("f", "h"),
-            ]
-            .into_iter()
-            .find_map(|(a, b)| {
-                base.strip_prefix(a)
-                    .map(|tail| (b, tail))
-                    .or_else(|| base.strip_prefix(b).map(|tail| (a, tail)))
-            })
-            .map(|(prefix, tail)| join_ascii(&mut replacement, prefix, tail));
+            let other_initial = FUZZY_INITIALS
+                .iter()
+                .enumerate()
+                .find_map(|(index, &(_, a, b))| {
+                    base.strip_prefix(a)
+                        .map(|tail| (index, b, tail))
+                        .or_else(|| base.strip_prefix(b).map(|tail| (index, a, tail)))
+                })
+                // Identify the entire initial before filtering. A disabled zh/z
+                // pair must not turn zhuang into a single-letter z initial.
+                .filter(|(index, _, _)| pairs.includes(*index))
+                .map(|(_, prefix, tail)| join_ascii(&mut replacement, prefix, tail));
             let mut add = |other: &str, cost: f64| {
                 if let Some(&canonical) = canon.get(other) {
                     if !outgoing.iter().any(|(e, s, p)| {
@@ -463,7 +509,10 @@ fn add_fuzzy_syllables(edges: &mut [Vec<SyllableEdge>]) {
                 .into_iter()
                 .chain(other_initial.map(|s| (s, 3.0)))
             {
-                for (a, b) in [("ang", "an"), ("eng", "en"), ("ing", "in")] {
+                for (index, &(_, a, b)) in FUZZY_FINALS.iter().enumerate() {
+                    if !pairs.includes(FUZZY_INITIALS.len() + index) {
+                        continue;
+                    }
                     if let Some((head, suffix)) = base
                         .strip_suffix(a)
                         .map(|head| (head, b))
@@ -519,7 +568,7 @@ pub(super) fn decode_quanpin_with_fuzzy(
         imported,
         retention,
         top_k,
-        fuzzy,
+        if fuzzy { FuzzyPairs::ALL } else { FuzzyPairs::NONE },
         syllable_split,
         "",
         TypoCorrectionLevel::Standard,
@@ -534,15 +583,13 @@ pub(super) fn decode_quanpin_context(
     imported: Option<&ImportedLexiconIndex>,
     retention: Option<&RetentionEngine>,
     top_k: usize,
-    fuzzy: bool,
+    fuzzy: FuzzyPairs,
     syllable_split: bool,
     left_context: &str,
     correction_level: TypoCorrectionLevel,
 ) -> Vec<QuanpinCandidate> {
     let mut dag = build_quanpin_syllable_paths(raw_input, syllable_split);
-    if fuzzy {
-        add_fuzzy_syllables(&mut dag.edges);
-    }
+    add_fuzzy_syllables(&mut dag.edges, fuzzy, false);
     if dag.len == 0 {
         return Vec::new();
     }
@@ -624,7 +671,7 @@ pub fn decode_xiaohe_long_context(
     top_k: usize,
 ) -> Vec<QuanpinCandidate> {
     decode_xiaohe_context(
-        raw_input, corpus, gram, imported, retention, top_k, "", TypoCorrectionLevel::Standard,
+        raw_input, corpus, gram, imported, retention, top_k, FuzzyPairs::NONE, "", TypoCorrectionLevel::Standard,
     )
 }
 
@@ -636,10 +683,12 @@ pub(super) fn decode_xiaohe_context(
     imported: Option<&ImportedLexiconIndex>,
     retention: Option<&RetentionEngine>,
     top_k: usize,
+    fuzzy: FuzzyPairs,
     left_context: &str,
     correction_level: TypoCorrectionLevel,
 ) -> Vec<QuanpinCandidate> {
-    let dag = build_xiaohe_syllable_paths(raw_input);
+    let mut dag = build_xiaohe_syllable_paths(raw_input);
+    add_fuzzy_syllables(&mut dag.edges, fuzzy, true);
     if dag.len == 0 {
         return Vec::new();
     }
@@ -1051,6 +1100,15 @@ fn decode_from_syllable_dag(
         all_cjk: true,
     });
 
+    let leading_weight = if retention.is_some_and(|r| !r.frecency.is_empty()) {
+        word_edges[0].iter()
+            .filter(|edge| edge.end == n && edge.split_penalty <= if use_barriers { 0.0 } else { 0.5 })
+            .filter_map(|edge| corpus.word_weight(edge.text))
+            .max()
+            .unwrap_or(0)
+    } else {
+        0
+    };
     let now_ms = RetentionEngine::now_epoch_ms();
     if incoming.len() <= n {
         incoming.resize_with(n + 1, Vec::new);
@@ -1105,6 +1163,13 @@ fn decode_from_syllable_dag(
                         !use_barriers,
                         now_ms,
                     );
+                    let f = if edge.start == 0 && edge.end == n {
+                        r.protect_dictionary_rank(
+                            edge.text, f, corpus.word_weight(edge.text).unwrap_or(0), leading_weight,
+                        )
+                    } else {
+                        f
+                    };
                     if word_chars == 1 && f == 0.0 && r.decayed_score_at(edge.text, now_ms) > 0.0 {
                         return 0.0;
                     }
@@ -1791,10 +1856,15 @@ fn append_corrections(
     }
 }
 
+pub(super) fn matches_xiaohe_reading(reading: &str, code: &str) -> bool {
+    crate::imp::xiaohe::pinyin_phrase_to_xiaohe(reading)
+        .bytes()
+        .eq(code.bytes().filter(u8::is_ascii_alphabetic))
+}
+
 pub(super) fn matches_exact_reading(syllables: &[String], code: &str, flypy: bool) -> bool {
     if flypy {
-        crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&syllables.join(" "))
-            == code.replace(['\'', ' '], "")
+        matches_xiaohe_reading(&syllables.join(" "), code)
     } else {
         crate::imp::xiaohe::matches_quanpin_reading(syllables, code)
     }
@@ -2227,6 +2297,39 @@ fn legal_quanpin(text: &str) -> bool {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn fuzzy_pair_selection_filters_initials_and_finals_in_both_schemas() {
+        for flypy in [false, true] {
+            let code = if flypy { "uj" } else { "shan" };
+            let make_dag = || if flypy {
+                build_xiaohe_syllable_paths(code)
+            } else {
+                build_quanpin_syllable_paths(code, false)
+            };
+            for (group, included, excluded) in [
+                ("sh_s", "san", "shang"),
+                ("an_ang", "shang", "san"),
+            ] {
+                let mut dag = make_dag();
+                let pairs = FuzzyPairs::from_names(&[group.into()]).unwrap();
+                add_fuzzy_syllables(&mut dag.edges, pairs, flypy);
+                let full_cost = |reading: &str| {
+                    dag.edges[0].iter().find_map(|(end, syl, cost)| {
+                        (*end == dag.len && syl == reading).then_some(*cost)
+                    })
+                };
+                assert_eq!(full_cost("shan"), Some(0.0));
+                assert!(full_cost(included).unwrap() > 0.0);
+                assert!(full_cost(excluded).is_none());
+                assert!(full_cost("sang").is_none());
+            }
+            let mut dag = make_dag();
+            add_fuzzy_syllables(&mut dag.edges, FuzzyPairs::ALL, flypy);
+            assert!(dag.edges[0].iter().any(|(end, syl, cost)| *end == dag.len && syl == "sang" && *cost > 0.0));
+        }
+        assert!(crate::eng::EngineConfig::parse_json(r#"{"fuzzy_pinyin_pairs":["sh_s","bad"]}"#).is_err());
+    }
 
     #[test]
     fn aliases_initials_and_corrections_respect_explicit_boundaries() {

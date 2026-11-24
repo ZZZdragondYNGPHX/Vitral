@@ -2,8 +2,11 @@ package dev.vitral.ime
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
 import android.content.ClipboardManager
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
@@ -11,8 +14,10 @@ import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.inputmethodservice.InputMethodService
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
@@ -43,7 +48,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private lateinit var frame: FrameLayout
     private lateinit var sheet: LinearLayout
     private lateinit var bar: LinearLayout
-    private lateinit var body: LinearLayout
+    private lateinit var body: KeyboardTouchHost
     private val clipboard by lazy { getSystemService(ClipboardManager::class.java) }
     private val imm by lazy { getSystemService(InputMethodManager::class.java) }
     private val vibrator by lazy { getSystemService(Vibrator::class.java) }
@@ -53,6 +58,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var shortcutKeys = setOf("Shift")
     private val handledHardwareKeys = mutableSetOf<Int>()
     private var inputGeneration = 0
+    private var pendingKeyOps = 0
     private val backspaceFlight = BackspaceFlightGate()
     private var hwComposing = false
     private val pressedPointers = mutableSetOf<Int>()
@@ -80,6 +86,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var numbers = false
     private var mode = "keys" // keys | tools | lookup | continuous | clipboard | clipboard_shortcut | candidates | emoji | symbols
     private var clipboardItems: List<ClipboardItemSnapshot>? = null
+    private var clipboardFilterPreset = "all"
     private var clipboardMutationSeq = 0
     private var clipboardScrollY = 0
     private var clipboardScrollView: ScrollView? = null
@@ -97,8 +104,32 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var lastShiftTapMs = 0L
     private var lastSpaceTapMs = 0L
     private var lastCommittedText = ""
+    private var currentSelStart = -1
+    private var currentSelEnd = -1
+    private var lastComposingStart = -1
+    private var lastUndoCommitEnd = -1
+    private var awaitingUndoCommitCursor = false
+    private var lastUndoCommitText = ""
+    private var lastUndoCommitSnapshot = ""
+    private var lastUndoCommitAtMs = 0L
+    private var undoCommitEnabled = true
     private var lastDeletedText = ""
     private var lastDeletedAtMs = 0L
+    private var voiceActive = false
+    private var voicePartialText = ""
+    private var lastVoiceCommitted = ""
+    private var lastVoiceCommitAtMs = 0L
+    private var voiceCommitEnd = -1
+    private var voiceCommitAwaitingCursor = false
+    private var voiceCommitSnapshot = ""
+    private var voiceCommitSeq = 0
+    private var lastPowerSaveSent: Boolean? = null
+    private val powerSaveReceiver =
+        object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                syncPowerSaveState()
+            }
+        }
     private var emojiCategory = 0
     private var symbolCategory = 0
     private var composing = false
@@ -107,6 +138,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var passwordEditor = false
     private var enterLabel = "↵"
     private var themePref = "system" // system | dark | light
+    private var quoteStyle = "curly" // curly | corner
+    private var hapticStrength = "medium" // off | light | medium | strong
     private var sublabelMode = SublabelMode.DUAL
     private var heightPreset = "standard" // compact | standard | comfort
     private var predictionEnabled = true
@@ -175,6 +208,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var systemCopyId = ""
     private var clipboardRevision = 0
     private var lastPushedClipText = ""
+    private var inFlightClipStamp = -1L
+    private var inFlightClipText = ""
     private var pollServiceTick = 0
     private var pasteVisible = false
     private val copyMarker = "dev.vitral.copy_id"
@@ -225,13 +260,46 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     override fun onCreate() {
         super.onCreate()
         alive = true
+        syncPowerSaveState()
+        val powerFilter =
+            IntentFilter().apply {
+                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+                addAction(Intent.ACTION_BATTERY_LOW)
+                addAction(Intent.ACTION_BATTERY_OKAY)
+            }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(powerSaveReceiver, powerFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(powerSaveReceiver, powerFilter)
+        }
         main.post(pollClipboard)
         clipboard.addPrimaryClipChangedListener(this)
         getSharedPreferences("vitral", 0).registerOnSharedPreferenceChangeListener(preferencesListener)
     }
 
+    private fun clearVoiceCommitAnchor() {
+        lastVoiceCommitted = ""
+        lastVoiceCommitAtMs = 0L
+        voiceCommitEnd = -1
+        voiceCommitAwaitingCursor = false
+        voiceCommitSnapshot = ""
+        voiceCommitSeq += 1
+    }
+
+    private fun syncPowerSaveState() {
+        val pm = getSystemService(PowerManager::class.java)
+        val bm = getSystemService(BatteryManager::class.java)
+        val pct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
+        val powerSave = (pm?.isPowerSaveMode == true) || (pct in 1..19)
+        if (lastPowerSaveSent == powerSave) return
+        lastPowerSaveSent = powerSave
+        Core.call(this, "set-power-save", json("enabled" to powerSave), background = true) {}
+    }
+
     override fun onDestroy() {
         alive = false
+        runCatching { unregisterReceiver(powerSaveReceiver) }
         clearInlineSuggestions(refreshBar = false)
         main.removeCallbacks(pollClipboard)
         invalidateEditor()
@@ -494,6 +562,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         aeviouLeftHanded = cfg.optString("mobile_aeviou_hand", "right") == "left"
         font = cfg.optInt("candidate_font_px", 16).coerceIn(13, 22).toFloat()
         themePref = cfg.optString("theme", "system")
+        quoteStyle = cfg.optString("quote_style", "curly")
+        hapticStrength = cfg.optString("mobile_haptic_strength", "medium")
+        undoCommitEnabled = cfg.optBoolean("undo_commit_on_backspace", true)
         sublabelMode =
             when (cfg.optString("mobile_sublabel_mode", "dual")) {
                 "symbols" -> SublabelMode.SYMBOLS
@@ -565,7 +636,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 else -> 1
             }
         lastCommittedText = ""
+        pendingKeyOps = 0
+        currentSelStart = info?.initialSelStart ?: -1
+        currentSelEnd = info?.initialSelEnd ?: -1
+        lastComposingStart = -1
+        clearUndoCommitAnchor()
         lastDeletedText = ""
+        voiceActive = false
+        voicePartialText = ""
+        clearVoiceCommitAnchor()
+        syncPowerSaveState()
         lastSpaceTapMs = 0L
         manualLangOverride = false
         loadUiPreferences()
@@ -604,6 +684,38 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             candidatesEnd,
         )
         if (!active) return
+        currentSelStart = newSelStart
+        currentSelEnd = newSelEnd
+        lastComposingStart = candidatesStart
+        if (lastUndoCommitEnd >= 0) {
+            if (candidatesStart != -1 || newSelStart != newSelEnd) {
+                clearUndoCommitAnchor()
+            } else if (awaitingUndoCommitCursor) {
+                if (newSelStart == lastUndoCommitEnd) {
+                    awaitingUndoCommitCursor = false
+                } else {
+                    clearUndoCommitAnchor()
+                }
+            } else if (newSelStart != lastUndoCommitEnd) {
+                clearUndoCommitAnchor()
+            }
+        }
+        if (lastVoiceCommitted.isNotEmpty() || voiceCommitEnd >= 0) {
+            if (candidatesStart != -1 || newSelStart != newSelEnd) {
+                clearVoiceCommitAnchor()
+                candidates()
+            } else if (voiceCommitAwaitingCursor) {
+                if (newSelStart == voiceCommitEnd) {
+                    voiceCommitAwaitingCursor = false
+                } else {
+                    clearVoiceCommitAnchor()
+                    candidates()
+                }
+            } else if (newSelStart != voiceCommitEnd) {
+                clearVoiceCommitAnchor()
+                candidates()
+            }
+        }
         val moved = oldSelStart != newSelStart || oldSelEnd != newSelEnd
         if (moved) invalidateSurroundingCache()
         if (moved && !composing) {
@@ -617,6 +729,14 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 refreshAeviouContextHints()
             }
         }
+    }
+
+    private fun clearUndoCommitAnchor() {
+        lastUndoCommitEnd = -1
+        awaitingUndoCommitCursor = false
+        lastUndoCommitText = ""
+        lastUndoCommitSnapshot = ""
+        lastUndoCommitAtMs = 0L
     }
 
     private fun invalidateSurroundingCache() {
@@ -731,6 +851,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         editor++
         inputGeneration++
         canvasGeneration++
+        voiceActive = false
+        voicePartialText = ""
+        clearVoiceCommitAnchor()
         microphone.cancel()
     }
 
@@ -1209,21 +1332,27 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
         val rawStamp = description.timestamp
         val prefs = getSharedPreferences("vitral", 0)
-        if (rawStamp > 0L && prefs.getLong("clipboard_stamp", -1L) == rawStamp) return
+        if (rawStamp > 0L && (prefs.getLong("clipboard_stamp", -1L) == rawStamp || inFlightClipStamp == rawStamp)) return
         val text = clip.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString() ?: return
         if (text.isEmpty()) return
-        if (rawStamp <= 0L && text == lastPushedClipText) return
+        if (rawStamp <= 0L && (text == lastPushedClipText || text == inFlightClipText || prefs.getString("clipboard_last_text", null) == text)) return
         val stamp = if (rawStamp > 0L) rawStamp else System.currentTimeMillis()
-        lastPushedClipText = text
+        if (rawStamp > 0L) inFlightClipStamp = rawStamp else inFlightClipText = text
         ++clipboardRevision
         val revision = clipboardRevision
-        if (rawStamp > 0L) prefs.edit().putLong("clipboard_stamp", rawStamp).apply()
         Core.call(
             this,
             "clipboard-push",
             json("payload" to json("content" to text, "timestamp_ms" to stamp)),
             background = true,
-        ) {
+        ) { result ->
+            if (rawStamp > 0L && inFlightClipStamp == rawStamp) inFlightClipStamp = -1L
+            if (rawStamp <= 0L && inFlightClipText == text) inFlightClipText = ""
+            result.onSuccess {
+                lastPushedClipText = text
+                if (rawStamp > 0L) prefs.edit().putLong("clipboard_stamp", rawStamp).apply()
+                else prefs.edit().putString("clipboard_last_text", text).apply()
+            }
             if (alive && revision == clipboardRevision) reconcileClipboard()
         }
     }
@@ -1738,7 +1867,13 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
         // Row 3: Active Input Surface
         val bodyWrapper = FrameLayout(this)
-        body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        body =
+            KeyboardTouchHost(this).apply {
+                touchErgonomicsEnabled = mode == "keys" && !numbers && !(!flypy && aeviouExperimental)
+                preeditProvider = { preeditText }
+                flypyProvider = { flypy }
+                englishProvider = { english }
+            }
         bodyWrapper.addView(body, FrameLayout.LayoutParams(-1, -1))
         if (floating) {
             val grip =
@@ -2056,6 +2191,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun switch(next: String) {
         inputGeneration++
+        pendingKeyOps = 0
+        clearUndoCommitAnchor()
         backspaceFlight.reset()
         cancelPrediction()
         inlineRequest++
@@ -2369,6 +2506,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val idleQuickPunc =
             mode == "keys" &&
                 !composing &&
+                !voiceActive &&
+                lastVoiceCommitted.isEmpty() &&
                 !inlineSuggestionsActive &&
                 shown.length() == 0 &&
                 predictionText.isEmpty() &&
@@ -2582,6 +2721,81 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 bar.addView(v, lp)
             }
         }
+        if (voiceActive) {
+            val preview =
+                if (!passwordEditor && voicePartialText.isNotEmpty())
+                    "🎙 ${clipboardPreviewText(voicePartialText, 24)}"
+                else "🎙 正在聆听…"
+            addBarItem(label(preview, highlight = true) {})
+            return
+        }
+        if (
+            !composing &&
+                !passwordEditor &&
+                lastVoiceCommitted.isNotEmpty() &&
+                SystemClock.uptimeMillis() - lastVoiceCommitAtMs <= 15_000L
+        ) {
+            val voiced = lastVoiceCommitted
+            val expectedEnd = voiceCommitEnd
+            val expectedSnap = voiceCommitSnapshot
+            val expectedSeq = voiceCommitSeq
+            fun verifyLiveVoiceAnchor(ic: android.view.inputmethod.InputConnection?): Boolean {
+                if (
+                    ic == null ||
+                        voiceCommitSeq != expectedSeq ||
+                        voiceCommitAwaitingCursor ||
+                        expectedEnd < 0 ||
+                        expectedSnap.isEmpty()
+                ) {
+                    return false
+                }
+                val live = ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0) ?: return false
+                if (live.startOffset < 0 || live.selectionStart < 0 || live.selectionEnd < 0) return false
+                val liveStart = live.startOffset + live.selectionStart
+                val liveEnd = live.startOffset + live.selectionEnd
+                if (liveStart != expectedEnd || liveEnd != expectedEnd) return false
+                if (!ic.getSelectedText(0).isNullOrEmpty()) return false
+                val snapLen = expectedSnap.length.coerceAtLeast(voiced.length)
+                return ic.getTextBeforeCursor(snapLen, 0)?.toString() == expectedSnap
+            }
+            addBarItem(
+                label("↩ 撤回语音", subtle = true) {
+                    val ic = currentInputConnection
+                    if (verifyLiveVoiceAnchor(ic) && ic!!.deleteSurroundingText(voiced.length, 0)) {
+                        invalidateSurroundingCache()
+                    }
+                    clearVoiceCommitAnchor()
+                    candidates()
+                }
+            )
+            addBarItem(
+                label("✨ 润色语音", highlight = true) {
+                    val id = editor
+                    val polishSeq = expectedSeq
+                    lastVoiceCommitted = ""
+                    candidates()
+                    call(
+                        "ai-inline",
+                        json("mode" to "polish", "text" to voiced, "target_lang" to "zh"),
+                        auxiliary = true,
+                    ) { res ->
+                        if (!active || editor != id || voiceCommitSeq != polishSeq) return@call
+                        val polished = res.optString("output_text").trim()
+                        val ic = currentInputConnection
+                        if (
+                            polished.isNotEmpty() &&
+                                polished != voiced &&
+                                verifyLiveVoiceAnchor(ic) &&
+                                ic!!.deleteSurroundingText(voiced.length, 0)
+                        ) {
+                            ic.commitText(polished, 1)
+                            invalidateSurroundingCache()
+                        }
+                        clearVoiceCommitAnchor()
+                    }
+                }
+            )
+        }
         if (!composing && lastDeletedText.isNotEmpty()) {
             val undo = lastDeletedText
             addBarItem(
@@ -2685,6 +2899,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     fieldKind == "email" && english -> listOf("@", ".", "_", "-", ".com", ".cn", "gmail.com")
                     fieldKind == "uri" && english -> listOf("https://", ".", "/", ":", "?", "=", "-", ".com")
                     english -> listOf(",", ".", "?", "!", "@", "/", "-", "_", ":", "#")
+                    quoteStyle == "corner" -> listOf("，", "。", "？", "！", "、", "：", "……", "（）", "「」", "『』", "《》")
                     else -> listOf("，", "。", "？", "！", "、", "：", "……", "（）", "“”", "《》")
                 }
             val quickPunc =
@@ -3542,7 +3757,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         headerRow.addView(
             TextView(this).apply {
-                text = "共 ${items.size} 条 · 点击粘贴 · 长按收藏设简码"
+                text = "共 ${items.size} 条 · 点击粘贴 · 长按设简码"
                 textSize = 11.5f
                 setTextColor(
                     (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
@@ -3587,9 +3802,47 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         )
         list.addView(headerRow)
 
+        // Quick filter bar (全部 / 收藏 / 链接 / 数字)
+        val filterRow =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(2), 0, dp(2), dp(6))
+            }
+        val presets = listOf("all" to "全部", "pinned" to "收藏", "links" to "链接", "numbers" to "数字")
+        for ((presetKey, presetLabel) in presets) {
+            val selected = clipboardFilterPreset == presetKey
+            filterRow.addView(
+                label(presetLabel, highlight = selected, subtle = !selected) {
+                    clipboardFilterPreset = presetKey
+                    clipboardScrollY = 0
+                    showRing(items)
+                }.apply {
+                    setPadding(dp(10), dp(4), dp(10), dp(4))
+                },
+                LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(6), 0) },
+            )
+        }
+        list.addView(filterRow)
+
+        val visibleItems = filterClipboardItems(items, "", preset = clipboardFilterPreset)
+        if (visibleItems.isEmpty()) {
+            list.addView(
+                TextView(this).apply {
+                    text = "该分类下暂无剪贴板记录"
+                    textSize = 12.5f
+                    gravity = Gravity.CENTER
+                    setPadding(dp(12), dp(20), dp(12), dp(20))
+                    setTextColor(
+                        (if (dark) T.Dark.textSecondaryArgb else T.Light.textSecondaryArgb).toInt()
+                    )
+                }
+            )
+            return
+        }
+
         for (pinnedGroup in listOf(true, false)) {
             var headerAdded = false
-            for (item in items) {
+            for (item in visibleItems) {
                 val isPinned = item.pinned
                 if (isPinned != pinnedGroup) continue
                 if (!headerAdded) {
@@ -3652,7 +3905,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 }
                 val textView =
                     TextView(this).apply {
-                        text = content.replace('\n', ' ')
+                        val preview = clipboardPreviewText(content, 220)
+                        text = if (content.length > 220) "$preview (${content.length}字)" else preview
                         textSize = 13.5f
                         maxLines = 2
                         ellipsize = android.text.TextUtils.TruncateAt.END
@@ -3672,6 +3926,21 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         }
                     }
                 card.addView(textView, LinearLayout.LayoutParams(0, -2, 1f))
+
+                if (content.length >= 4) {
+                    val splitBtn =
+                        label("分词", subtle = true) {
+                            showClipboardTokenize(content)
+                        }.apply {
+                            setPadding(dp(7), dp(4), dp(7), dp(4))
+                            textSize = 11.5f
+                            contentDescription = "分词局部取词"
+                        }
+                    card.addView(
+                        splitBtn,
+                        LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, dp(2), 0) },
+                    )
+                }
 
                 val pinBtn =
                     ImageButton(this).apply {
@@ -3711,6 +3980,87 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (targetScrollY > 0) {
             scroll.post { scroll.scrollTo(0, targetScrollY) }
         }
+    }
+
+    private fun showClipboardTokenize(content: String) {
+        val dark = isDarkTheme
+        val tokens = tokenizeClipboardSegments(content)
+        val picked = LinkedHashSet<Int>()
+        val scroll = ScrollView(this)
+        val container =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(8), dp(6), dp(8), dp(8))
+            }
+        scroll.addView(container)
+        body.removeAllViews()
+        body.addView(scroll, -1, -1)
+
+        var pasteBtn: TextView? = null
+        fun updatePasteLabel() {
+            pasteBtn?.text = if (picked.isEmpty()) "点击片段取词" else "粘贴选中 (${picked.size})"
+        }
+
+        val topBar =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, 0, 0, dp(8))
+            }
+        topBar.addView(
+            label("← 返回", subtle = true) { showRing(clipboardItems.orEmpty()) },
+            LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(6), 0) },
+        )
+        pasteBtn =
+            label("点击片段取词", solidAccent = true) {
+                val joined = tokens.filterIndexed { i, _ -> i in picked }.joinToString("")
+                if (joined.isNotEmpty()) {
+                    currentInputConnection?.commitText(joined, 1)
+                    invalidateSurroundingCache()
+                    switch("keys")
+                }
+            }
+        topBar.addView(pasteBtn, LinearLayout.LayoutParams(0, -2, 1f))
+        container.addView(topBar)
+
+        val chipRows = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        var approxChars = 0
+        for ((idx, tok) in tokens.withIndex()) {
+            val weightCost = tok.length.coerceAtLeast(2) + 2
+            if (approxChars > 0 && approxChars + weightCost > 18) {
+                chipRows.addView(row, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, 0, 0, dp(5)) })
+                row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                approxChars = 0
+            }
+            lateinit var chip: TextView
+            chip =
+                label(tok, subtle = true) {
+                    if (idx in picked) picked.remove(idx) else picked.add(idx)
+                    val sel = idx in picked
+                    chip.background =
+                        pillDrawable(
+                            if (sel) (if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb)
+                            else (if (dark) T.Dark.surfaceKeyFunctionArgb else T.Light.surfaceKeyFunctionArgb),
+                            10,
+                            if (sel) (if (dark) T.Dark.accentTextArgb else T.Light.accentPrimaryArgb) else null,
+                        )
+                    chip.setTextColor(
+                        (if (sel) (if (dark) T.Dark.accentTextArgb else T.Light.accentTextArgb)
+                        else (if (dark) T.Dark.textPrimaryArgb else T.Light.textPrimaryArgb)).toInt()
+                    )
+                    updatePasteLabel()
+                }.apply {
+                    setPadding(dp(9), dp(5), dp(9), dp(5))
+                    textSize = 13f
+                }
+            row.addView(chip, LinearLayout.LayoutParams(-2, -2).apply { setMargins(0, 0, dp(5), 0) })
+            approxChars += weightCost
+        }
+        if (row.childCount > 0) {
+            chipRows.addView(row, LinearLayout.LayoutParams(-1, -2))
+        }
+        container.addView(chipRows)
     }
 
     private fun showInk(r: JSONObject) {
@@ -4009,6 +4359,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             updateAutoCap(redraw = true)
             return
         }
+        val reqEditor = editor
+        val generation = inputGeneration
+        pendingKeyOps += 1
         runNativeAction(
             operation = { h ->
                 val committed = StringBuilder()
@@ -4031,10 +4384,20 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 if (committed.isNotEmpty()) merged.put("commit_text", committed.toString())
                 if (cursorDelta != 0) merged.put("cursor_delta", cursorDelta)
                 merged
-            }
+            },
+            onComplete = {
+                if (editor == reqEditor && generation == inputGeneration && pendingKeyOps > 0) {
+                    pendingKeyOps -= 1
+                }
+            },
         ) { r ->
             applyAction(r)
         }
+    }
+
+    private fun vibrateKey(isLetter: Boolean) {
+        val (ms, amp) = hapticParamsFor(hapticStrength, isLetter) ?: return
+        vibrator?.vibrate(VibrationEffect.createOneShot(ms, amp))
     }
 
     private fun key(rawLabel: String) {
@@ -4044,12 +4407,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         cancelPrediction()
         inlineRequest++
         val ic = currentInputConnection ?: return
-        val duration =
-            if (label.length == 1 && label[0].isLetter()) T.Ergonomics.hapticLetterTickMs
-            else T.Ergonomics.hapticActionThudMs
-        vibrator?.vibrate(
-            VibrationEffect.createOneShot(duration.toLong(), VibrationEffect.DEFAULT_AMPLITUDE)
-        )
+        vibrateKey(label.length == 1 && label[0].isLetter())
         when (label) {
             "123" -> {
                 numbers = true
@@ -4147,6 +4505,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (lastDeletedText.isNotEmpty() && effectiveLabel != "⌫") {
             lastDeletedText = ""
         }
+        if (lastVoiceCommitted.isNotEmpty() || voiceCommitEnd >= 0) {
+            clearVoiceCommitAnchor()
+        }
         // English double-space -> ". " (standard mobile UX)
         if (
             effectiveLabel == "空格" &&
@@ -4208,19 +4569,73 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 shown.getJSONObject(0).has("quick_paste_id")
         val startedComposing = composing
         val backspace = effectiveLabel == "⌫"
+        var preDeletedUndoText: String? = null
+        // When no earlier keystrokes are in flight and we are idle, decide undo synchronously
+        // BEFORE sending BackSpace to core so refusing editors or repeat-delete never desync core.
+        if (backspace && !startedComposing && !dismissPaste && pendingKeyOps == 0) {
+            val withinWindow =
+                lastUndoCommitText.isNotEmpty() &&
+                    SystemClock.uptimeMillis() - lastUndoCommitAtMs <= 4500L
+            val atCommitPos =
+                lastUndoCommitEnd >= 0 &&
+                    !awaitingUndoCommitCursor &&
+                    currentSelStart == lastUndoCommitEnd &&
+                    currentSelEnd == lastUndoCommitEnd
+            val snapLen = lastUndoCommitSnapshot.length.coerceAtLeast(lastUndoCommitText.length)
+            val snapshotMatches =
+                lastUndoCommitSnapshot.isNotEmpty() &&
+                    ic.getTextBeforeCursor(snapLen, 0)?.toString() == lastUndoCommitSnapshot
+            val eligibleUndo =
+                undoCommitEnabled &&
+                    !isRepeatDelete &&
+                    withinWindow &&
+                    atCommitPos &&
+                    snapshotMatches &&
+                    ic.getSelectedText(0).isNullOrEmpty()
+            val candidateUndo = lastUndoCommitText
+            clearUndoCommitAnchor()
+            if (eligibleUndo) {
+                if (!ic.deleteSurroundingText(candidateUndo.length, 0)) {
+                    // Editor refused deletion: never wake core undo or penalize learning.
+                    return
+                }
+                invalidateSurroundingCache()
+                lastCommittedText = ""
+                preDeletedUndoText = candidateUndo
+            } else {
+                deleteWithSelectionOrSingle(ic)
+                updateAutoCap(redraw = true)
+                return
+            }
+        }
         val reqEditor = editor
         val generation = inputGeneration
+        pendingKeyOps += 1
         if (backspace) backspaceFlight.onDispatched()
         val onComplete = {
-            if (backspace && editor == reqEditor && generation == inputGeneration) {
-                backspaceFlight.onCompleted()
+            if (editor == reqEditor && generation == inputGeneration) {
+                if (pendingKeyOps > 0) pendingKeyOps -= 1
+                if (backspace) backspaceFlight.onCompleted()
             }
         }
         val onResult: (JSONObject) -> Unit = { r ->
+            val undoChars = r.optInt("undo_commit_chars", 0)
+            val undoText = if (!r.isNull("undo_commit_text")) r.optString("undo_commit_text") else ""
             when {
                 dismissPaste -> {
                     applyAction(r)
                     call("quick-paste-state") { updatePaste(it) }
+                }
+                preDeletedUndoText != null -> {
+                    if (undoChars > 0) {
+                        applyAction(r)
+                    } else {
+                        // Core declined undo (e.g. expired right at boundary): restore text and delete 1 char.
+                        ic.commitText(preDeletedUndoText, 1)
+                        invalidateSurroundingCache()
+                        deleteWithSelectionOrSingle(ic)
+                        updateAutoCap(redraw = true)
+                    }
                 }
                 shouldDeleteHostText(composing, startedComposing, isRepeatDelete)
                     && effectiveLabel == "⌫" -> {
@@ -4235,8 +4650,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         }
         val nativeCode = nativeKeycode(code)
+        // Non-zero modifier prevents core from triggering undo on queued BackSpace when host
+        // has not pre-verified & deleted the committed text synchronously.
+        val keyModifiers = if (backspace && preDeletedUndoText == null) 1 else 0
         if (nativeCode >= 0) {
-            processKeyDirect(nativeCode, onComplete = onComplete, done = onResult)
+            processKeyDirect(nativeCode, modifiers = keyModifiers, onComplete = onComplete, done = onResult)
         } else {
             call("process-key", json("keycode" to code), onComplete = onComplete, done = onResult)
         }
@@ -4526,11 +4944,32 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun applyAction(r: JSONObject) {
         val ic = currentInputConnection ?: return
+        val wasComposing = composing
         val committed = if (!r.isNull("commit_text")) r.getString("commit_text") else ""
         if (committed.isNotEmpty()) {
-            ic.commitText(committed, 1)
+            val baseStart =
+                if (lastComposingStart >= 0) lastComposingStart
+                else if (currentSelStart >= 0 && currentSelEnd >= 0) minOf(currentSelStart, currentSelEnd)
+                else -1
+            val committedOk = ic.commitText(committed, 1)
             invalidateSurroundingCache()
-            if (!passwordEditor) lastCommittedText = committed
+            if (!passwordEditor) {
+                if (committedOk) lastCommittedText = committed
+                if (committedOk && wasComposing && baseStart >= 0) {
+                    val snapshot = ic.getTextBeforeCursor(40, 0)?.toString().orEmpty()
+                    if (snapshot.endsWith(committed)) {
+                        lastUndoCommitEnd = baseStart + committed.length
+                        awaitingUndoCommitCursor = true
+                        lastUndoCommitText = committed
+                        lastUndoCommitSnapshot = snapshot
+                        lastUndoCommitAtMs = SystemClock.uptimeMillis()
+                    } else {
+                        clearUndoCommitAnchor()
+                    }
+                } else {
+                    clearUndoCommitAnchor()
+                }
+            }
         }
         val delta = r.optInt("cursor_delta", 0)
         if (delta < 0) {
@@ -4591,11 +5030,20 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun cancelVoice() {
         microphone.cancel()
+        if (voiceActive) {
+            voiceActive = false
+            voicePartialText = ""
+            candidates()
+        }
     }
 
     private fun voice(start: Boolean) {
         if (!start) {
             microphone.stop()
+            return
+        }
+        if (passwordEditor) {
+            message("密码框不支持语音输入")
             return
         }
         if (
@@ -4606,17 +5054,56 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             return
         }
         val id = editor
-        microphone.start(this) { result ->
-            if (active && id == editor)
+        voiceActive = true
+        voicePartialText = ""
+        clearVoiceCommitAnchor()
+        candidates()
+        microphone.start(
+            this,
+            onPartial = { partial ->
+                if (active && id == editor && voiceActive && !passwordEditor) {
+                    voicePartialText = partial
+                    candidates()
+                }
+            },
+        ) { result ->
+            voiceActive = false
+            voicePartialText = ""
+            if (active && id == editor && !passwordEditor) {
                 result
                     .onSuccess {
                         if (it.isNotEmpty()) {
-                            currentInputConnection?.commitText(it, 1)
+                            val ic = currentInputConnection
+                            val baseStart =
+                                if (currentSelStart >= 0 && currentSelEnd >= 0)
+                                    minOf(currentSelStart, currentSelEnd)
+                                else -1
+                            val ok = ic?.commitText(it, 1) == true
                             invalidateSurroundingCache()
+                            if (ok && baseStart >= 0 && it.length <= 4000) {
+                                val snapLen = (it.length + 32).coerceAtMost(4096)
+                                val snap = ic?.getTextBeforeCursor(snapLen, 0)?.toString().orEmpty()
+                                if (snap.endsWith(it)) {
+                                    lastVoiceCommitted = it
+                                    lastVoiceCommitAtMs = SystemClock.uptimeMillis()
+                                    voiceCommitEnd = baseStart + it.length
+                                    voiceCommitAwaitingCursor = true
+                                    voiceCommitSnapshot = snap
+                                    voiceCommitSeq += 1
+                                }
+                            }
+                            candidates()
                             schedulePrediction("live")
+                        } else {
+                            candidates()
+                            message("未检测到有效语音")
                         }
                     }
-                    .onFailure { message(it.message.orEmpty()) }
+                    .onFailure {
+                        candidates()
+                        message(it.message.orEmpty())
+                    }
+            }
         }
     }
 

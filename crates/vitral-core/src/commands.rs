@@ -79,6 +79,10 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             json!({"pure_offline":core.is_pure_offline()})
         }
         "is-pure-offline" => json!({"pure_offline":core.is_pure_offline()}),
+        "set-power-save" => {
+            core.set_power_save(arg(v, "enabled")?);
+            json!({"power_save":core.is_power_save()})
+        }
         "set-schema" => {
             core.set_schema(arg(v, "schema")?);
             json!({"schema":v["schema"]})
@@ -175,6 +179,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             }
         }
         "clipboard-state" => to_value(core.clipboard_state())?,
+        "sync-status" => to_value(core.sync_status())?,
         "poll-services" => to_value(core.poll_services()?)?,
         "clipboard-poll" => to_value(core.poll_clipboard()?)?,
         "clipboard-poll-current" => to_value(core.poll_clipboard_current()?)?,
@@ -221,6 +226,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             core.voice_push_pcm(&samples)?;
             json!({"sample_count":samples.len()})
         }
+        "voice-preview" => to_value(core.voice_preview()?)?,
         "voice-stop" => to_value(core.voice_stop()?)?,
         "llm-unload" => {
             core.unload_idle_models();

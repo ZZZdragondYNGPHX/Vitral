@@ -432,6 +432,37 @@ impl RetentionEngine {
         self.decayed_score_at(word, Self::now_epoch_ms())
     }
 
+    /// A lone ordinary selection cannot move a rare homophone above a
+    /// much more common dictionary entry. Explicit and repeated choices keep their boost.
+    pub(crate) fn is_provisional_rare_selection(
+        &self,
+        word: &str,
+        dictionary_weight: u64,
+        leading_weight: u64,
+    ) -> bool {
+        const COMMON_WEIGHT: u64 = 5_000;
+        const WEIGHT_RATIO: u64 = 32;
+        leading_weight >= COMMON_WEIGHT
+            && dictionary_weight < leading_weight / WEIGHT_RATIO
+            && self.frecency.get(word).is_some_and(|&weight| weight > 0.0 && weight <= 1.0)
+            && !self.pinned_words.contains(word)
+            && !self.user_phrases.contains_key(word)
+    }
+
+    pub(crate) fn protect_dictionary_rank(
+        &self,
+        word: &str,
+        score: f64,
+        dictionary_weight: u64,
+        leading_weight: u64,
+    ) -> f64 {
+        if self.is_provisional_rare_selection(word, dictionary_weight, leading_weight) {
+            score.min(0.0)
+        } else {
+            score
+        }
+    }
+
     pub fn record_selection_at(&mut self, word: &str, now_ms: u64, boost: f64) -> f64 {
         if self.erased_words.contains(word) {
             return 0.0;
@@ -845,6 +876,18 @@ impl RetentionEngine {
         app_id: Option<&str>,
         now_ms: u64,
     ) {
+        self.penalize_selection(code, wrong_word, prev_context, app_id, now_ms);
+        self.record_contextual_selection(right_word, code, prev_context, app_id, now_ms, 2.5, true);
+    }
+
+    pub(crate) fn penalize_selection(
+        &mut self,
+        code: &str,
+        wrong_word: &str,
+        prev_context: Option<&str>,
+        app_id: Option<&str>,
+        now_ms: u64,
+    ) {
         if let Some(score) = self.frecency.get_mut(wrong_word) {
             *score *= 0.5;
         }
@@ -874,7 +917,13 @@ impl RetentionEngine {
                 *score *= 0.5;
             }
         }
-        self.record_contextual_selection(right_word, code, prev_context, app_id, now_ms, 2.5, true);
+        let app = normalize_borrowed(app_id.unwrap_or_default());
+        if let Some(index) = self.session_cache.iter().rposition(|(cached_app, word, _)| {
+            cached_app == app.as_ref() && word == wrong_word
+        }) {
+            self.session_cache.remove(index);
+        }
+        self.crdt_seq = self.crdt_seq.saturating_add(1);
     }
 
     pub fn observe_phrase_composition(

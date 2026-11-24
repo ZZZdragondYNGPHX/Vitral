@@ -9,7 +9,7 @@ use std::{
     ptr,
     rc::{Rc, Weak},
     sync::atomic::{AtomicU32, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use vitral_core::windows_host::PipeClient;
 use windows::{
@@ -26,6 +26,17 @@ use windows::{
 };
 
 const CLASS: GUID = GUID::from_u128(0x7c9e6679_7425_40de_944b_e07fc1f90ae7);
+const INTERACTIVE_IPC_TIMEOUT: Duration = Duration::from_millis(150);
+const IPC_BACKOFF: Duration = Duration::from_millis(1500);
+
+fn ipc_in_backoff(until: Option<Instant>, now: Instant) -> bool {
+    until.is_some_and(|until| now < until)
+}
+
+fn should_update_focus(active: bool, open: bool, needs_refocus: bool) -> bool {
+    active != open || (open && needs_refocus)
+}
+
 static OBJECTS: AtomicU32 = AtomicU32::new(0);
 static NEXT: AtomicU32 = AtomicU32::new(0);
 struct Live;
@@ -55,6 +66,7 @@ impl From<&str> for PanelText {
     }
 }
 extern "C" {
+    fn vitral_physical_caret(hwnd: HWND, caret: *mut RECT);
     fn vitral_register(install: bool) -> HRESULT;
     fn vitral_module_path(path: *mut u16, size: u32) -> u32;
     fn vitral_panel_open(
@@ -164,11 +176,14 @@ struct Editor {
     tid: Cell<u32>,
     cookie: Cell<Option<u32>>,
     composition: RefCell<Option<(ITfContext, ITfComposition)>>,
+    commit_end: RefCell<Option<(ITfContext, ITfRange)>>,
     panel: Cell<*mut c_void>,
     view: RefCell<View>,
     shift_held: Cell<bool>,
     shortcuts: RefCell<Vec<String>>,
     ipc_failed: Cell<bool>,
+    ipc_backoff_until: Cell<Option<Instant>>,
+    needs_refocus: Cell<bool>,
     prediction_timer: Cell<usize>,
     prediction_polls: Cell<u32>,
     prediction_trigger: Cell<bool>,
@@ -198,14 +213,42 @@ impl Drop for Editor {
     }
 }
 impl Editor {
+    fn bypass_keys(&self) -> bool {
+        let bypass = ipc_in_backoff(self.ipc_backoff_until.get(), Instant::now());
+        if bypass {
+            self.shift_held.set(false);
+        } else {
+            self.ipc_failed.set(false);
+        }
+        bypass
+    }
+
     fn call(&self, name: &str, v: Value) -> Result<Value> {
-        self.pipe
-            .borrow_mut()
-            .request_with_timeout(&self.host, &self.id, name, &v, Duration::from_millis(1500))
-            .map_err(|e| {
-                self.ipc_failed.set(true);
-                Error::new(E_FAIL, e.to_string())
-            })
+        if ipc_in_backoff(self.ipc_backoff_until.get(), Instant::now()) {
+            self.ipc_failed.set(true);
+            return Err(Error::new(E_FAIL, "Vitral IPC is cooling down"));
+        }
+        self.ipc_backoff_until.set(None);
+        let timeout = match name {
+            "hw-push-stroke" | "hw-confirm" => Duration::from_millis(1500),
+            _ => INTERACTIVE_IPC_TIMEOUT,
+        };
+        let result = self.pipe.borrow_mut().request_with_timeout(
+            &self.host, &self.id, name, &v, timeout,
+        );
+        result.map_err(|error| {
+            self.ipc_failed.set(true);
+            if error.is::<std::io::Error>() {
+                self.ipc_backoff_until.set(Some(Instant::now() + IPC_BACKOFF));
+                self.needs_refocus.set(true);
+            }
+            let message = error.to_string();
+            // PipeClient may reconnect before the host has registered this editor.
+            if message == "editor focus changed" {
+                self.needs_refocus.set(true);
+            }
+            Error::new(E_FAIL, message)
+        })
     }
     fn draw(&self, glow: bool, activity: bool) {
         let v = self.view.borrow();
@@ -265,12 +308,23 @@ impl Editor {
             );
         }
         if self.ipc_failed.get() {
-            self.reset_local();
+            self.recover_ipc_failure();
         } else if visible {
             self.draw(false, true);
         }
     }
+    fn recover_ipc_failure(&self) {
+        self.commit_end.take();
+        if self.composition.borrow().is_none() {
+            self.reset_local();
+            return;
+        }
+        self.clear_prediction();
+        self.pipe.take();
+        self.shift_held.set(false);
+    }
     fn reset_local(&self) {
+        self.commit_end.take();
         self.clear_prediction();
         self.pipe.take();
         self.shift_held.set(false);
@@ -280,6 +334,7 @@ impl Editor {
         if let Some((ctx, comp)) = old {
             let session: ITfEditSession = Finish {
                 comp,
+                clear_text: true,
                 _live: Live::new(),
             }
             .into();
@@ -292,6 +347,25 @@ impl Editor {
             }
         }
         self.draw(false, true);
+    }
+    fn finish_composition_after_reconnect(&self) -> Result<()> {
+        let Some((ctx, comp)) = self.composition.take() else {
+            return Ok(());
+        };
+        let session: ITfEditSession = Finish {
+            comp: comp.clone(),
+            clear_text: false,
+            _live: Live::new(),
+        }
+        .into();
+        let result = unsafe {
+            ctx.RequestEditSession(self.tid.get(), &session, TF_ES_SYNC | TF_ES_READWRITE)
+                .and_then(|hr| hr.ok())
+        };
+        if result.is_err() {
+            self.composition.replace(Some((ctx, comp)));
+        }
+        result
     }
     fn current_context(&self) -> Option<ITfContext> {
         unsafe { self.mgr.borrow().as_ref()?.GetFocus().ok()?.GetTop().ok() }
@@ -372,7 +446,7 @@ impl Editor {
         self.prediction_polls.set(0);
         self.prediction_trigger.set(catch_up);
         let Ok(state) = self.call("profile-state", json!({})) else {
-            self.reset_local();
+            self.recover_ipc_failure();
             return;
         };
         if state["prediction_enabled"] == false {
@@ -389,7 +463,7 @@ impl Editor {
         self.arm_prediction(delay);
     }
     fn poll_prediction(self: &Rc<Self>) {
-        if !self.protect_input(self.current_context().as_ref(), false) {
+        if self.bypass_keys() || !self.protect_input(self.current_context().as_ref(), false) {
             return;
         }
         if !self.view.borrow().active
@@ -413,7 +487,7 @@ impl Editor {
             )
         };
         let Ok(r) = r else {
-            self.reset_local();
+            self.recover_ipc_failure();
             return;
         };
         self.view.borrow_mut().prediction_id = r["id"].as_u64().unwrap_or(0);
@@ -442,19 +516,21 @@ impl Editor {
         let _ = self.call("on-ime-close", json!({}));
     }
     fn focus(self: &Rc<Self>, open: bool) {
-        if self.view.borrow().active == open {
+        if !should_update_focus(self.view.borrow().active, open, self.needs_refocus.get()) {
             return;
         }
         if open {
-            if !self.protect_input(self.current_context().as_ref(), false) {
+            if self.bypass_keys() || !self.protect_input(self.current_context().as_ref(), true) {
                 return;
             }
-            self.ipc_failed.set(false);
+            self.commit_end.take();
             let opened = self.on_ime_open().and_then(|r| {
                 self.call("process-key", json!({"keycode":"Escape"}))?;
+                self.finish_composition_after_reconnect()?;
                 self.refresh_shortcuts()?;
                 Ok(r)
             });
+            self.needs_refocus.set(opened.is_err());
             let mut v = self.view.borrow_mut();
             v.active = opened.is_ok();
             if let Ok(r) = opened {
@@ -472,7 +548,7 @@ impl Editor {
             }
             drop(v);
             if self.ipc_failed.get() {
-                self.reset_local();
+                self.recover_ipc_failure();
                 return;
             }
             self.schedule_prediction(true);
@@ -577,12 +653,15 @@ impl ITfEditSession_Impl for InputScopeCheck_Impl {
 #[implement(ITfEditSession)]
 struct Finish {
     comp: ITfComposition,
+    clear_text: bool,
     _live: Live,
 }
 impl ITfEditSession_Impl for Finish_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
         unsafe {
-            self.comp.GetRange()?.SetText(ec, 0, &[])?;
+            if self.clear_text {
+                self.comp.GetRange()?.SetText(ec, 0, &[])?;
+            }
             self.comp.EndComposition(ec)
         }
     }
@@ -619,11 +698,14 @@ impl Service {
                 tid: Cell::new(0),
                 cookie: Cell::new(None),
                 composition: Default::default(),
+                commit_end: Default::default(),
                 panel: Cell::new(ptr::null_mut()),
                 view: Default::default(),
                 shift_held: Cell::new(false),
                 shortcuts: Default::default(),
                 ipc_failed: Cell::new(false),
+                ipc_backoff_until: Cell::new(None),
+                needs_refocus: Cell::new(false),
                 prediction_timer: Cell::new(0),
                 prediction_polls: Cell::new(0),
                 prediction_trigger: Cell::new(false),
@@ -830,7 +912,7 @@ impl Service_Impl {
             return None;
         }
         if !composing && code == u32::from(VK_BACK.0) {
-            return Some(Action::new("notify-deleted-chars", json!({"count":1})));
+            return Some(Action::new("process-key", json!({"keycode":"BackSpace"})));
         }
         if composing
             && (49..=53).contains(&code)
@@ -872,6 +954,7 @@ impl Service_Impl {
             }
         }
         let key = match code {
+            32 if !composing => "space".into(),
             8 | 13 | 27 | 32..=37 | 39 | 46 if composing => match code {
                 8 => "BackSpace",
                 13 => "Return",
@@ -933,13 +1016,16 @@ impl Service_Impl {
             .and_then(|hr| hr.ok())
         };
         if self.editor.ipc_failed.get() {
-            self.editor.reset_local();
+            self.editor.recover_ipc_failure();
             // A later prediction/settings call may fail after text was inserted.
             // Only pass the key through when the edit session did not handle it.
             return Ok(handled.get());
         }
+        if handled.get() {
+            return Ok(true);
+        }
         result?;
-        Ok(handled.get())
+        Ok(false)
     }
 }
 impl ITfKeyEventSink_Impl for Service_Impl {
@@ -948,16 +1034,19 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok(())
     }
     fn OnTestKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
-        if !self.editor.protect_input(ctx, true) {
+        if self.editor.bypass_keys() || !self.editor.protect_input(ctx, true) {
             return Ok(false.into());
         }
         if !matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
             self.editor.shift_held.set(false);
         }
         self.editor.focus(true);
+        if self.editor.ipc_failed.get() || self.editor.needs_refocus.get() {
+            return Ok(false.into());
+        }
         let shortcut = Self::shortcut_name(w.0 as u32);
         if shortcut.is_some() && self.editor.view.borrow().active && self.editor.refresh_shortcuts().is_err() {
-            self.editor.reset_local();
+            self.editor.recover_ipc_failure();
             return Ok(false.into());
         }
         let action = self.key(w, l);
@@ -972,7 +1061,11 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok((ctx.is_some() && (action.is_some() || shift_shortcut) && !self.editor.ipc_failed.get()).into())
     }
     fn OnKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
-        if !self.editor.protect_input(ctx, true) {
+        if self.editor.bypass_keys() || !self.editor.protect_input(ctx, true) {
+            return Ok(false.into());
+        }
+        self.editor.focus(true);
+        if self.editor.ipc_failed.get() || self.editor.needs_refocus.get() {
             return Ok(false.into());
         }
         if matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
@@ -994,14 +1087,15 @@ impl ITfKeyEventSink_Impl for Service_Impl {
             .into())
     }
     fn OnTestKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
-        Ok((ctx.is_some()
+        Ok((!self.editor.bypass_keys()
+            && ctx.is_some()
             && self.editor.view.borrow().active
             && matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1)
             && self.editor.shift_held.get())
         .into())
     }
     fn OnKeyUp(&self, ctx: Option<&ITfContext>, w: WPARAM, _: LPARAM) -> Result<BOOL> {
-        if !self.editor.view.borrow().active {
+        if self.editor.bypass_keys() || !self.editor.view.borrow().active {
             self.editor.shift_held.set(false);
             return Ok(false.into());
         }
@@ -1013,7 +1107,7 @@ impl ITfKeyEventSink_Impl for Service_Impl {
                 return Ok(false.into());
             }
             if self.editor.refresh_shortcuts().is_err() {
-                self.editor.reset_local();
+                self.editor.recover_ipc_failure();
                 return Ok(false.into());
             }
             if !self.editor.shortcuts.borrow().iter().any(|key| key == "Shift") {
@@ -1032,6 +1126,44 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok(false.into())
     }
 }
+unsafe fn verified_commit_range(
+    ctx: &ITfContext,
+    ec: u32,
+    end: &(ITfContext, ITfRange),
+    text: &str,
+) -> Result<Option<ITfRange>> {
+    if &end.0 != ctx {
+        return Ok(None);
+    }
+    let mut selection = [TF_SELECTION::default()];
+    let mut fetched = 0;
+    let selected = ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
+    let range = ManuallyDrop::take(&mut selection[0].range);
+    selected?;
+    let Some(range) = range.filter(|_| fetched == 1) else {
+        return Ok(None);
+    };
+    if selection[0].style.fInterimChar.as_bool()
+        || !range.IsEmpty(ec)?.as_bool()
+        || !range.IsEqualStart(ec, &end.1, TF_ANCHOR_END)?.as_bool()
+    {
+        return Ok(None);
+    }
+    let expected: Vec<u16> = text.encode_utf16().collect();
+    let Ok(length) = i32::try_from(expected.len()) else {
+        return Ok(None);
+    };
+    let mut shifted = 0;
+    range.ShiftStart(ec, -length, &mut shifted, ptr::null())?;
+    if shifted != -length {
+        return Ok(None);
+    }
+    let mut actual = vec![0; expected.len() + 1];
+    let mut read = 0;
+    range.GetText(ec, 0, &mut actual, &mut read)?;
+    Ok((read as usize == expected.len() && actual[..expected.len()] == expected).then_some(range))
+}
+
 #[implement(ITfEditSession)]
 struct Edit {
     ctx: ITfContext,
@@ -1054,11 +1186,6 @@ impl ITfEditSession_Impl for Edit_Impl {
             return Ok(());
         }
         let a = &self.action;
-        if a.cmd == "notify-deleted-chars" {
-            ed.call(a.cmd, a.args.clone())?;
-            ed.view.borrow_mut().context_before.pop();
-            return Ok(());
-        }
         if a.cmd == "shortcut-repeat" {
             self.handled.set(true);
             return Ok(());
@@ -1079,6 +1206,7 @@ impl ITfEditSession_Impl for Edit_Impl {
             self.handled.set(true);
             return Ok(());
         }
+        let commit_end = ed.commit_end.take();
         let r = if a.cmd == "prediction-accept" {
             let current = ed.call("predict-poll", json!({"id":a.args["id"]}))?;
             if current["status"] != "ready" || current["text"] != a.args["text"] {
@@ -1102,6 +1230,27 @@ impl ITfEditSession_Impl for Edit_Impl {
             .or(r["composing_text"].as_str())
             .unwrap_or("");
         let old = ed.composition.borrow().clone();
+        let backspace = a.cmd == "process-key" && a.args["keycode"] == "BackSpace";
+        let undo_text = r["undo_commit_text"].as_str().filter(|text| !text.is_empty());
+        let undo_requested = undo_text.is_some() || r["undo_commit_chars"].as_u64().unwrap_or(0) > 0;
+        let undo_range = if undo_requested {
+            let verified = undo_text
+                .filter(|_| backspace && old.is_none() && commit.is_none() && !pre.is_empty())
+                .zip(commit_end.as_ref())
+                .and_then(|(text, end)| unsafe {
+                    verified_commit_range(&self.ctx, ec, end, text).ok().flatten()
+                });
+            let Some(range) = verified else {
+                let _ = ed.call("process-key", json!({"keycode":"Escape"}));
+                if backspace && old.is_none() {
+                    ed.view.borrow_mut().context_before.pop();
+                }
+                return Ok(());
+            };
+            Some(range)
+        } else {
+            None
+        };
         if old.as_ref().is_some_and(|(ctx, _)| ctx != &self.ctx) {
             return Err(E_UNEXPECTED.into());
         }
@@ -1114,29 +1263,61 @@ impl ITfEditSession_Impl for Edit_Impl {
             && !toggle
             && !r["function_action"].is_string()
         {
+            if backspace {
+                ed.view.borrow_mut().context_before.pop();
+            }
             return Ok(());
         }
         if edits_text {
             unsafe {
-                let insert: ITfInsertAtSelection = self.ctx.cast()?;
-                let (range, composition) = if let Some((_, comp)) = old {
-                    (comp.GetRange()?, Some(comp))
-                } else if commit.is_none() {
-                    let range = insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
-                    let owner: ITfContextComposition = self.ctx.cast()?;
-                    let comp = owner.StartComposition(ec, &range, &self.sink)?;
-                    ed.composition
-                        .replace(Some((self.ctx.clone(), comp.clone())));
+                let (range, composition) = if let Some(range) = undo_range {
+                    let restored = (|| -> Result<ITfComposition> {
+                        let owner: ITfContextComposition = self.ctx.cast()?;
+                        let comp = owner.StartComposition(ec, &range, &self.sink)?;
+                        let wide: Vec<u16> = pre.encode_utf16().collect();
+                        if let Err(error) = range.SetText(ec, 0, &wide) {
+                            let _ = comp.EndComposition(ec);
+                            return Err(error);
+                        }
+                        Ok(comp)
+                    })();
+                    let Ok(comp) = restored else {
+                        let _ = ed.call("process-key", json!({"keycode":"Escape"}));
+                        ed.view.borrow_mut().context_before.pop();
+                        return Ok(());
+                    };
+                    ed.composition.replace(Some((self.ctx.clone(), comp.clone())));
+                    if let Some(text) = undo_text {
+                        let mut view = ed.view.borrow_mut();
+                        if let Some(prefix) = view.context_before.strip_suffix(text) {
+                            let len = prefix.len();
+                            view.context_before.truncate(len);
+                        }
+                    }
+                    self.handled.set(true);
                     (range, Some(comp))
+                } else if let Some((_, comp)) = old {
+                    (comp.GetRange()?, Some(comp))
                 } else {
-                    (
-                        insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?,
-                        None,
-                    )
+                    let insert: ITfInsertAtSelection = self.ctx.cast()?;
+                    let range = insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
+                    let comp = if commit.is_none() {
+                        let owner: ITfContextComposition = self.ctx.cast()?;
+                        let comp = owner.StartComposition(ec, &range, &self.sink)?;
+                        ed.composition.replace(Some((self.ctx.clone(), comp.clone())));
+                        Some(comp)
+                    } else {
+                        None
+                    };
+                    (range, comp)
                 };
-                let text = commit.unwrap_or(pre);
-                let wide: Vec<u16> = text.encode_utf16().collect();
-                range.SetText(ec, 0, &wide)?;
+                if !undo_requested {
+                    let wide: Vec<u16> = commit.unwrap_or(pre).encode_utf16().collect();
+                    range.SetText(ec, 0, &wide)?;
+                }
+                if commit.is_some() {
+                    self.handled.set(true);
+                }
                 let mut caret = range.Clone()?;
                 caret.Collapse(ec, TF_ANCHOR_END)?;
                 if (commit.is_some() || pre.is_empty()) && composition.is_some() {
@@ -1173,11 +1354,14 @@ impl ITfEditSession_Impl for Edit_Impl {
                     let mut rect = RECT::default();
                     let mut clipped = BOOL(0);
                     if view.GetTextExt(ec, &caret, &mut rect, &mut clipped).is_ok() {
+                        if let Ok(hwnd) = view.GetWnd() {
+                            vitral_physical_caret(hwnd, &mut rect);
+                        }
                         ed.view.borrow_mut().caret = rect;
                     }
                 }
                 let mut selection = TF_SELECTION {
-                    range: ManuallyDrop::new(Some(caret)),
+                    range: ManuallyDrop::new(Some(caret.clone())),
                     style: TF_SELECTIONSTYLE {
                         ase: TF_AE_NONE,
                         fInterimChar: false.into(),
@@ -1186,6 +1370,14 @@ impl ITfEditSession_Impl for Edit_Impl {
                 let sel = self.ctx.SetSelection(ec, std::slice::from_ref(&selection));
                 ManuallyDrop::drop(&mut selection.range);
                 sel?;
+                if a.cmd == "select-candidate" && commit.is_some() && pre.is_empty() && delta == 0 {
+                    // Keep the anchor at the original end when text is inserted there.
+                    if let Ok(end) = caret.Clone() {
+                        if end.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD).is_ok() {
+                            ed.commit_end.replace(Some((self.ctx.clone(), end)));
+                        }
+                    }
+                }
             }
         }
         if a.cmd == "prediction-accept" && commit.is_some() {
@@ -1232,6 +1424,8 @@ impl ITfEditSession_Impl for Edit_Impl {
                         py,
                         c["xiaohe_code"].as_str().unwrap_or("")
                     )
+                } else if let Some(comment) = c["comment"].as_str().filter(|s| s.contains(" · ")) {
+                    format!("{text} {comment}")
                 } else {
                     text.into()
                 });
@@ -1284,8 +1478,15 @@ unsafe extern "C" fn panel_event(
     let _live: ITfTextInputProcessor = service.to_interface();
     let ed = &service.editor;
     let Some(ctx) = ed.current_context() else { return };
+    ed.ipc_failed.set(false);
     if !ed.protect_input(Some(&ctx), true) {
         return;
+    }
+    if ed.needs_refocus.get() {
+        ed.focus(true);
+        if ed.needs_refocus.get() {
+            return;
+        }
     }
     let mode = ed.view.borrow().mode;
     let action = match op {
@@ -1365,7 +1566,7 @@ unsafe extern "C" fn panel_event(
         ed.cancel_prediction(false);
     }
     if ed.ipc_failed.get() {
-        ed.reset_local();
+        ed.recover_ipc_failure();
         return;
     }
     let _ = service.edit(&ctx, action);
@@ -1374,6 +1575,61 @@ unsafe extern "C" fn panel_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[implement(ITfComposition)]
+    struct ReconnectComposition {
+        ended_at: Rc<Cell<Option<u32>>>,
+    }
+    impl ITfComposition_Impl for ReconnectComposition_Impl {
+        fn GetRange(&self) -> Result<ITfRange> {
+            Err(E_NOTIMPL.into())
+        }
+        fn ShiftStart(&self, _: u32, _: Option<&ITfRange>) -> Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+        fn ShiftEnd(&self, _: u32, _: Option<&ITfRange>) -> Result<()> {
+            Err(E_NOTIMPL.into())
+        }
+        fn EndComposition(&self, ec: u32) -> Result<()> {
+            self.ended_at.set(Some(ec));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reconnect_ends_composition_without_opening_its_text_range() {
+        let ended_at = Rc::new(Cell::new(None));
+        let session: ITfEditSession = Finish {
+            comp: ReconnectComposition { ended_at: ended_at.clone() }.into(),
+            clear_text: false,
+            _live: Live::new(),
+        }
+        .into();
+        unsafe { session.DoEditSession(42) }.unwrap();
+        assert_eq!(ended_at.get(), Some(42));
+    }
+
+    #[test]
+    fn ipc_backoff_allows_probe_at_deadline() {
+        let start = Instant::now();
+        let until = Some(start + IPC_BACKOFF);
+        assert!(!ipc_in_backoff(None, start));
+        assert!(ipc_in_backoff(until, start));
+        assert!(ipc_in_backoff(until, start + IPC_BACKOFF - Duration::from_millis(1)));
+        assert!(!ipc_in_backoff(until, start + IPC_BACKOFF));
+    }
+
+    #[test]
+    fn active_editor_registers_focus_again_after_ipc_backoff() {
+        let start = Instant::now();
+        let until = Some(start + IPC_BACKOFF);
+        assert!(!should_update_focus(true, true, false));
+        assert!(should_update_focus(true, true, true));
+        assert!(ipc_in_backoff(until, start));
+        assert!(!ipc_in_backoff(until, start + IPC_BACKOFF));
+        assert!(should_update_focus(true, false, true));
+        assert!(!should_update_focus(false, false, true));
+    }
 
     #[test]
     fn refreshed_shortcut_bindings_drop_removed_and_empty_keys() {

@@ -271,6 +271,9 @@ public:
 
   void reset(const InputMethodEntry &, InputContextEvent &event) override {
     cancelPrediction(event.inputContext());
+    lastCommitCursor_ = -1;
+    lastCommitBefore_.clear();
+    lastCommitAfter_.clear();
     if (composing_)
       unpack(
           vitral_process_key(core_, FcitxKey_Escape, 0, VITRAL_SWIPE_DIR_NONE));
@@ -395,10 +398,55 @@ public:
       return;
     }
     if (event.isRelease() || english_ || key.states().test(KeyState::Ctrl) ||
-        key.states().test(KeyState::Alt) || key.states().test(KeyState::Super))
+        key.states().test(KeyState::Alt) || key.states().test(KeyState::Super)) {
+      if (!event.isRelease()) {
+        lastCommitCursor_ = -1;
+        lastCommitBefore_.clear();
+        lastCommitAfter_.clear();
+      }
       return;
+    }
     if (!composing_ && sym == FcitxKey_BackSpace) {
-      if (active_ && ic->hasFocus() &&
+      bool coreHandledIdleDelete = false;
+      if (active_ && ic->hasFocus() && lastCommitCursor_ >= 0 &&
+          lastCommitEditor_ == editor_.load() &&
+          ic->capabilityFlags().test(CapabilityFlag::SurroundingText)) {
+        const auto &surr = ic->surroundingText();
+        const int expectedCursor = lastCommitCursor_;
+        const auto expectedBefore = lastCommitBefore_;
+        const auto expectedAfter = lastCommitAfter_;
+        lastCommitCursor_ = -1;
+        lastCommitBefore_.clear();
+        lastCommitAfter_.clear();
+        if (surr.isValid() && surr.cursor() == surr.anchor() &&
+            static_cast<int>(surr.cursor()) == expectedCursor &&
+            contextBefore(ic) == expectedBefore &&
+            contextAfter(ic) == expectedAfter) {
+          auto action =
+              unpack(vitral_process_key(core_, sym, 0, VITRAL_SWIPE_DIR_NONE));
+          const int undoChars = action["undo_commit_chars"].toInt(0);
+          const auto undoText = action["undo_commit_text"].toString();
+          if (undoChars > 0 && !undoText.isEmpty() &&
+              expectedBefore.endsWith(undoText)) {
+            ic->deleteSurroundingText(-undoChars, undoChars);
+            render(ic, action);
+            event.filterAndAccept();
+            return;
+          }
+          if (undoChars > 0) {
+            unpack(vitral_process_key(core_, FcitxKey_Escape, 0,
+                                      VITRAL_SWIPE_DIR_NONE));
+          } else {
+            // Core idle BackSpace already recorded notify_deleted_chars(1).
+            coreHandledIdleDelete = true;
+          }
+        }
+      } else {
+        lastCommitCursor_ = -1;
+        lastCommitBefore_.clear();
+        lastCommitAfter_.clear();
+      }
+      if (!coreHandledIdleDelete && active_ && ic->hasFocus() &&
           canReportIdleDeletion(ic->capabilityFlags()))
         command("notify-deleted-chars", {{"count", 1}});
       return;
@@ -436,10 +484,23 @@ public:
                             sym == FcitxKey_Delete ||
                             sym == FcitxKey_Page_Up ||
                             sym == FcitxKey_Page_Down;
-    if ((sym < 32 || sym > 126) && !(composing_ && editingKey))
+    if ((sym < 32 || sym > 126) && !(composing_ && editingKey)) {
+      if (!composing_) {
+        lastCommitCursor_ = -1;
+        lastCommitBefore_.clear();
+        lastCommitAfter_.clear();
+      }
       return;
-    if (sym == FcitxKey_space && !composing_)
+    }
+    if (sym == FcitxKey_space && !composing_) {
+      lastCommitCursor_ = -1;
+      lastCommitBefore_.clear();
+      lastCommitAfter_.clear();
+      if (active_ && ic->hasFocus())
+        unpack(vitral_process_key(core_, FcitxKey_space, 0,
+                                  VITRAL_SWIPE_DIR_NONE));
       return;
+    }
     bool before = composing_;
     auto action =
         unpack(vitral_process_key(core_, sym, 0, VITRAL_SWIPE_DIR_NONE));
@@ -691,8 +752,30 @@ private:
   void render(InputContext *ic, const QJsonObject &action, bool selectLast = false) {
     english_ = action["lang_mode"].toString() == "en";
     auto commit = action["commit_text"].toString();
-    if (!commit.isEmpty())
-      ic->commitString(commit.toStdString());
+    if (!commit.isEmpty()) {
+      const auto commitUtf8 = commit.toStdString();
+      const auto &surr = ic->surroundingText();
+      if (composing_ &&
+          ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
+          surr.isValid()) {
+        const auto start = std::min(surr.cursor(), surr.anchor());
+        lastCommitCursor_ =
+            static_cast<int>(start + utf8::length(commitUtf8));
+        lastCommitEditor_ = editor_.load();
+        // Capture full surrounding snippet so Wayland per-paragraph offsets cannot alias another paragraph.
+        auto beforeNow = contextBefore(ic);
+        beforeNow.append(commit);
+        if (beforeNow.size() > 160)
+          beforeNow = beforeNow.right(160);
+        lastCommitBefore_ = beforeNow;
+        lastCommitAfter_ = contextAfter(ic);
+      } else {
+        lastCommitCursor_ = -1;
+        lastCommitBefore_.clear();
+        lastCommitAfter_.clear();
+      }
+      ic->commitString(commitUtf8);
+    }
     auto preedit = action["preedit"].toObject();
     auto text = preedit["text"].toString().toStdString();
     composing_ = !text.empty();
@@ -754,6 +837,8 @@ private:
   QString predictionText_, predictionHint_, predictionContext_, predictionContextAfter_;
   double predictionId_ = 0;
   int predictionDelay_ = 380, predictionPolls_ = 0;
+  int lastCommitCursor_ = -1, lastCommitEditor_ = 0;
+  QString lastCommitBefore_, lastCommitAfter_;
   bool predictionEnabled_ = true;
   std::unique_ptr<DesktopControl> control_;
   VitralEngine *core_ = nullptr;

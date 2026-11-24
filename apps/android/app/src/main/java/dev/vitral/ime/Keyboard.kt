@@ -7,14 +7,17 @@ import android.graphics.LinearGradient
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RadialGradient
+import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
+import android.os.Build
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
 import android.view.View
+import android.widget.LinearLayout
 import dev.vitral.ime.theme.VitralTokens as T
 import kotlin.math.abs
 import kotlin.math.min
@@ -330,6 +333,35 @@ internal class Key(
         setOnClickListener {
             if (label != "⌫" || backspaceHold.allowsDelete(isComposing())) action(label)
         }
+    }
+
+    internal val keyLabel: String
+        get() = label
+
+    internal fun canRolloverCommit(): Boolean =
+        label.length == 1 &&
+            label[0] in 'a'..'z' &&
+            isPressed &&
+            !swipeUpActive &&
+            !recording &&
+            !spaceScrubbing &&
+            !repeatingDelete &&
+            !clearAllArmed
+
+    internal fun commitRollover() {
+        removeCallbacks(startVoice)
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armClearAll)
+        isPressed = false
+        releasedAt = SystemClock.uptimeMillis()
+        swipeUpActive = false
+        repeatingDelete = false
+        spaceScrubbing = false
+        clearAllPending = false
+        clearAllArmed = false
+        clearAllSwipeUp = false
+        performClick()
+        invalidate()
     }
 
     fun onCompositionChanged(composing: Boolean) {
@@ -993,6 +1025,338 @@ internal class Key(
 }
 
 internal fun alternate(row: Int, col: Int) = alternates[row][col].toString()
+
+internal fun hapticParamsFor(strength: String, isLetter: Boolean): Pair<Long, Int>? =
+    when (strength) {
+        "off" -> null
+        "light" -> (if (isLetter) 6L else 10L) to 48
+        "strong" -> (if (isLetter) 16L else 24L) to 180
+        else ->
+            (if (isLetter) T.Ergonomics.hapticLetterTickMs.toLong()
+            else T.Ergonomics.hapticActionThudMs.toLong()) to 110
+    }
+
+// Complete standard Mandarin syllable set for fast O(1) spatial-hitbox border rescue.
+private val MANDARIN_SYLLABLES: Set<String> by lazy {
+    setOf(
+        "a", "ai", "an", "ang", "ao",
+        "ba", "bai", "ban", "bang", "bao", "bei", "ben", "beng", "bi", "bian", "biao", "bie", "bin", "bing", "bo", "bu",
+        "ca", "cai", "can", "cang", "cao", "ce", "cen", "ceng", "cha", "chai", "chan", "chang", "chao", "che", "chen", "cheng", "chi", "chong", "chou", "chu", "chua", "chuai", "chuan", "chuang", "chui", "chun", "chuo", "ci", "cong", "cou", "cu", "cuan", "cui", "cun", "cuo",
+        "da", "dai", "dan", "dang", "dao", "de", "dei", "den", "deng", "di", "dia", "dian", "diao", "die", "ding", "diu", "dong", "dou", "du", "duan", "dui", "dun", "duo",
+        "e", "ei", "en", "eng", "er",
+        "fa", "fan", "fang", "fei", "fen", "feng", "fiao", "fo", "fou", "fu",
+        "ga", "gai", "gan", "gang", "gao", "ge", "gei", "gen", "geng", "gong", "gou", "gu", "gua", "guai", "guan", "guang", "gui", "gun", "guo",
+        "ha", "hai", "han", "hang", "hao", "he", "hei", "hen", "heng", "hong", "hou", "hu", "hua", "huai", "huan", "huang", "hui", "hun", "huo",
+        "ji", "jia", "jian", "jiang", "jiao", "jie", "jin", "jing", "jiong", "jiu", "ju", "juan", "jue", "jun",
+        "ka", "kai", "kan", "kang", "kao", "ke", "kei", "ken", "keng", "kong", "kou", "ku", "kua", "kuai", "kuan", "kuang", "kui", "kun", "kuo",
+        "la", "lai", "lan", "lang", "lao", "le", "lei", "leng", "li", "lia", "lian", "liang", "liao", "lie", "lin", "ling", "liu", "lo", "long", "lou", "lu", "luan", "lun", "luo", "lv", "lve",
+        "ma", "mai", "man", "mang", "mao", "me", "mei", "men", "meng", "mi", "mian", "miao", "mie", "min", "ming", "miu", "mo", "mou", "mu",
+        "na", "nai", "nan", "nang", "nao", "ne", "nei", "nen", "neng", "ni", "nian", "niang", "niao", "nie", "nin", "ning", "niu", "nong", "nou", "nu", "nuan", "nun", "nuo", "nv", "nve",
+        "o", "ou",
+        "pa", "pai", "pan", "pang", "pao", "pei", "pen", "peng", "pi", "pian", "piao", "pie", "pin", "ping", "po", "pou", "pu",
+        "qi", "qia", "qian", "qiang", "qiao", "qie", "qin", "qing", "qiong", "qiu", "qu", "quan", "que", "qun",
+        "ran", "rang", "rao", "re", "ren", "reng", "ri", "rong", "rou", "ru", "rua", "ruan", "rui", "run", "ruo",
+        "sa", "sai", "san", "sang", "sao", "se", "sen", "seng", "sha", "shai", "shan", "shang", "shao", "she", "shei", "shen", "sheng", "shi", "shou", "shu", "shua", "shuai", "shuan", "shuang", "shui", "shun", "shuo", "si", "song", "sou", "su", "suan", "sui", "sun", "suo",
+        "ta", "tai", "tan", "tang", "tao", "te", "tei", "teng", "ti", "tian", "tiao", "tie", "ting", "tong", "tou", "tu", "tuan", "tui", "tun", "tuo",
+        "wa", "wai", "wan", "wang", "wei", "wen", "weng", "wo", "wu",
+        "xi", "xia", "xian", "xiang", "xiao", "xie", "xin", "xing", "xiong", "xiu", "xu", "xuan", "xue", "xun",
+        "ya", "yan", "yang", "yao", "ye", "yi", "yin", "ying", "yo", "yong", "you", "yu", "yuan", "yue", "yun",
+        "za", "zai", "zan", "zang", "zao", "ze", "zei", "zen", "zeng", "zha", "zhai", "zhan", "zhang", "zhao", "zhe", "zhei", "zhen", "zheng", "zhi", "zhong", "zhou", "zhu", "zhua", "zhuai", "zhuan", "zhuang", "zhui", "zhun", "zhuo", "zi", "zong", "zou", "zu", "zuan", "zui", "zun", "zuo",
+    )
+}
+
+private val QUANPIN_PREFIXES: Set<String> by lazy {
+    HashSet<String>(1024).apply {
+        for (s in MANDARIN_SYLLABLES) {
+            for (len in 1..s.length) add(s.substring(0, len))
+        }
+    }
+}
+
+private val XIAOHE_SYLLABLES: Set<String> by lazy {
+    val finalMap =
+        mapOf(
+            "iu" to 'q', "ei" to 'w', "e" to 'e', "uan" to 'r', "ue" to 't', "ve" to 't',
+            "un" to 'y', "u" to 'u', "i" to 'i', "o" to 'o', "uo" to 'o', "ie" to 'p',
+            "a" to 'a', "ong" to 's', "iong" to 's', "ai" to 'd', "en" to 'f', "eng" to 'g',
+            "ang" to 'h', "an" to 'j', "ing" to 'k', "uai" to 'k', "iang" to 'l', "uang" to 'l',
+            "ou" to 'z', "ia" to 'x', "ua" to 'x', "ao" to 'c', "v" to 'v', "ui" to 'v',
+            "in" to 'b', "iao" to 'n', "ian" to 'm',
+        )
+    HashSet<String>(512).apply {
+        // Zero-initial Xiaohe pairs + j/q/x/y + v aliases accepted by core (e.g. qv -> qu)
+        addAll(listOf("aa", "ai", "an", "ah", "ao", "ee", "ei", "en", "eg", "er", "oo", "ou", "jv", "qv", "xv", "yv"))
+        for (syl in MANDARIN_SYLLABLES) {
+            val (initKey, rest) =
+                when {
+                    syl.startsWith("zh") -> 'v' to syl.substring(2)
+                    syl.startsWith("ch") -> 'i' to syl.substring(2)
+                    syl.startsWith("sh") -> 'u' to syl.substring(2)
+                    syl[0] !in "aeo" && syl.length >= 2 -> syl[0] to syl.substring(1)
+                    else -> continue
+                }
+            val finKey = finalMap[rest] ?: continue
+            add("$initKey$finKey")
+        }
+    }
+}
+
+internal fun isLegalNextPinyinChar(rawPreedit: String, flypy: Boolean, nextChar: Char): Boolean {
+    val ch = nextChar.lowercaseChar()
+    if (ch !in 'a'..'z') return true
+    val seg = rawPreedit.substringAfterLast('\'').lowercase()
+    if (seg.isEmpty()) return true
+    if (flypy) {
+        // Odd length means expecting the 2nd key (final) of a Xiaohe pair.
+        return if (seg.length % 2 == 1) {
+            "${seg.last()}$ch" in XIAOHE_SYLLABLES
+        } else {
+            // Even length starts a new Xiaohe syllable (any letter a..z can be an initial).
+            true
+        }
+    }
+    // Quanpin: check whether the trailing partial syllable can legally accept `ch`,
+    // or whether the previous text ended on a complete syllable (starting a new syllable).
+    val maxTail = min(seg.length, 6)
+    for (len in maxTail downTo 1) {
+        val tail = seg.substring(seg.length - len)
+        if ("$tail$ch" in QUANPIN_PREFIXES) return true
+    }
+    // If the trailing 1..6 chars already form a complete syllable, `ch` can start the next syllable
+    // (unless `ch` is 'i'/'u'/'v' which cannot start a Mandarin syllable).
+    if (ch !in setOf('i', 'u', 'v')) {
+        for (len in maxTail downTo 1) {
+            if (seg.substring(seg.length - len) in MANDARIN_SYLLABLES) return true
+        }
+    }
+    return false
+}
+
+/**
+ * Spatial-hitbox border rescue: when a tap falls inside the outer 22% edge of a letter key
+ * and that key cannot legally continue the active Chinese syllable while the immediate neighbor
+ * CAN, smoothly redirect the hit to the legal neighbor. Never overrides when both keys are legal
+ * or during English typing.
+ */
+internal fun pickSpatialHitKey(
+    rawPreedit: String,
+    flypy: Boolean,
+    english: Boolean,
+    xInKey: Float,
+    keyWidth: Float,
+    primaryChar: Char,
+    leftNeighbor: Char?,
+    rightNeighbor: Char?,
+): Char {
+    if (english || rawPreedit.isEmpty() || keyWidth <= 0f) return primaryChar
+    val primary = primaryChar.lowercaseChar()
+    if (primary !in 'a'..'z') return primaryChar
+    val border = keyWidth * 0.22f
+    val neighbor =
+        when {
+            xInKey < border && leftNeighbor != null -> leftNeighbor.lowercaseChar()
+            xInKey > keyWidth - border && rightNeighbor != null -> rightNeighbor.lowercaseChar()
+            else -> return primaryChar
+        }
+    if (neighbor !in 'a'..'z') return primaryChar
+    val primaryLegal = isLegalNextPinyinChar(rawPreedit, flypy, primary)
+    if (primaryLegal) return primaryChar
+    return if (isLegalNextPinyinChar(rawPreedit, flypy, neighbor)) neighbor else primaryChar
+}
+
+/**
+ * Unified keyboard touch coordinator:
+ * - Two-thumb key rollover (earlier letter key commits immediately on 2nd pointer down)
+ * - Dynamic spatial hitbox border rescue on 26-key Chinese layout
+ * - Android 10+ edge system-gesture exclusion along left/right letter borders
+ */
+internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
+    var touchErgonomicsEnabled: Boolean = false
+    var preeditProvider: () -> String = { "" }
+    var flypyProvider: () -> Boolean = { true }
+    var englishProvider: () -> Boolean = { false }
+
+    private val activePointers = LinkedHashMap<Int, Key>()
+    private val redirectedPointers = HashSet<Int>()
+    private val gestureExclusions = ArrayList<Rect>(2)
+
+    init {
+        orientation = VERTICAL
+    }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        super.onLayout(changed, l, t, r, b)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            gestureExclusions.clear()
+            val w = r - l
+            val h = b - t
+            if (touchErgonomicsEnabled && w > 0 && h > 0) {
+                val edgeW = context.dp(24).coerceAtMost(w / 6)
+                val maxH = context.dp(200)
+                val exclH = min(h, maxH)
+                val top = ((h - exclH) / 2).coerceAtLeast(0)
+                gestureExclusions.add(Rect(0, top, edgeW, top + exclH))
+                gestureExclusions.add(Rect(w - edgeW, top, w, top + exclH))
+            }
+            systemGestureExclusionRects = gestureExclusions
+        }
+    }
+
+    private fun resolveKey(hostX: Float, hostY: Float): Pair<Key, Boolean>? {
+        for (rowIdx in 0 until childCount) {
+            val row = getChildAt(rowIdx) as? LinearLayout ?: continue
+            if (hostY < row.top || hostY > row.bottom) continue
+            val rowX = hostX - row.left
+            val keysInRow = ArrayList<Key>(row.childCount)
+            for (i in 0 until row.childCount) {
+                (row.getChildAt(i) as? Key)?.let { keysInRow.add(it) }
+            }
+            if (keysInRow.isEmpty()) return null
+            var hitIdx = -1
+            for (i in keysInRow.indices) {
+                val k = keysInRow[i]
+                if (rowX >= k.left && rowX <= k.right) {
+                    hitIdx = i
+                    break
+                }
+            }
+            if (hitIdx < 0) {
+                // Clamp edge margins to nearest key in this row (prevents dead zones on curved edges).
+                hitIdx = if (rowX < keysInRow.first().left) 0 else keysInRow.lastIndex
+            }
+            val primary = keysInRow[hitIdx]
+            val pChar = primary.keyLabel.singleOrNull()
+            if (pChar != null && pChar in 'a'..'z') {
+                val leftKey = keysInRow.getOrNull(hitIdx - 1)?.takeIf { it.keyLabel.length == 1 && it.keyLabel[0] in 'a'..'z' }
+                val rightKey = keysInRow.getOrNull(hitIdx + 1)?.takeIf { it.keyLabel.length == 1 && it.keyLabel[0] in 'a'..'z' }
+                val chosen =
+                    pickSpatialHitKey(
+                        rawPreedit = preeditProvider(),
+                        flypy = flypyProvider(),
+                        english = englishProvider(),
+                        xInKey = (rowX - primary.left).coerceIn(0f, primary.width.toFloat()),
+                        keyWidth = primary.width.toFloat(),
+                        primaryChar = pChar,
+                        leftNeighbor = leftKey?.keyLabel?.get(0),
+                        rightNeighbor = rightKey?.keyLabel?.get(0),
+                    )
+                if (chosen == leftKey?.keyLabel?.get(0)) return leftKey to true
+                if (chosen == rightKey?.keyLabel?.get(0)) return rightKey to true
+            }
+            return primary to false
+        }
+        return null
+    }
+
+    private fun dispatchLocal(
+        key: Key,
+        action: Int,
+        source: MotionEvent,
+        pointerIndex: Int,
+        clampX: Boolean,
+    ) {
+        val row = key.parent as? View ?: return
+        val rawLocalX = source.getX(pointerIndex) - row.left - key.left
+        val localX =
+            if (clampX && key.width > 0) rawLocalX.coerceIn(1f, (key.width - 1f).coerceAtLeast(1f))
+            else rawLocalX
+        val localY = source.getY(pointerIndex) - row.top - key.top
+        val synthetic =
+            MotionEvent.obtain(
+                source.downTime,
+                source.eventTime,
+                action,
+                localX,
+                localY,
+                0,
+            )
+        try {
+            key.onTouchEvent(synthetic)
+        } finally {
+            synthetic.recycle()
+        }
+    }
+
+    fun resetActiveTouches() {
+        activePointers.clear()
+        redirectedPointers.clear()
+    }
+
+    override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
+        if (!touchErgonomicsEnabled) {
+            if (activePointers.isNotEmpty()) resetActiveTouches()
+            return super.dispatchTouchEvent(ev)
+        }
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                val idx = ev.actionIndex
+                val pid = ev.getPointerId(idx)
+                val (target, redirected) = resolveKey(ev.getX(idx), ev.getY(idx)) ?: return false
+                // Ignore a second finger landing on the exact same active key (e.g. space/backspace).
+                if (activePointers.values.any { it === target }) {
+                    return true
+                }
+                if (ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN && activePointers.isNotEmpty()) {
+                    val toRollover =
+                        activePointers.entries
+                            .filter { (_, k) -> k !== target && k.canRolloverCommit() }
+                            .map { it.key to it.value }
+                    for ((oldPid, oldKey) in toRollover) {
+                        activePointers.remove(oldPid)
+                        redirectedPointers.remove(oldPid)
+                        oldKey.commitRollover()
+                    }
+                }
+                activePointers[pid] = target
+                if (redirected) redirectedPointers.add(pid) else redirectedPointers.remove(pid)
+                dispatchLocal(target, MotionEvent.ACTION_DOWN, ev, idx, clampX = redirected)
+                return true
+            }
+            MotionEvent.ACTION_MOVE -> {
+                for (i in 0 until ev.pointerCount) {
+                    val pid = ev.getPointerId(i)
+                    val key = activePointers[pid] ?: continue
+                    dispatchLocal(key, MotionEvent.ACTION_MOVE, ev, i, clampX = pid in redirectedPointers)
+                }
+                return true
+            }
+            MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> {
+                val idx = ev.actionIndex
+                val pid = ev.getPointerId(idx)
+                val key = activePointers.remove(pid)
+                val wasRedirected = redirectedPointers.remove(pid)
+                if (key != null) {
+                    dispatchLocal(key, MotionEvent.ACTION_UP, ev, idx, clampX = wasRedirected)
+                }
+                if (ev.actionMasked == MotionEvent.ACTION_UP) {
+                    resetActiveTouches()
+                }
+                return true
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                for ((_, key) in activePointers) {
+                    val cancel =
+                        MotionEvent.obtain(
+                            ev.downTime,
+                            ev.eventTime,
+                            MotionEvent.ACTION_CANCEL,
+                            0f,
+                            0f,
+                            0,
+                        )
+                    try {
+                        key.onTouchEvent(cancel)
+                    } finally {
+                        cancel.recycle()
+                    }
+                }
+                resetActiveTouches()
+                return true
+            }
+        }
+        return super.dispatchTouchEvent(ev)
+    }
+}
 
 internal class InkView(
     ctx: Context,

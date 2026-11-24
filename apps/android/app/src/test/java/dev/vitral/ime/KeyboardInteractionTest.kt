@@ -141,4 +141,64 @@ class KeyboardInteractionTest {
         assertEquals(3, visualTapToRawByteOffset(cjk, 1, hasCaret = true))
         assertEquals(7, visualTapToRawByteOffset(cjk, 4, hasCaret = true))
     }
+
+    @Test
+    fun spatialHitboxRescuesIllegalBorderTapWithoutOverridingLegalKeys() {
+        // Quanpin: after 'q', 'o' is illegal while left neighbor 'i' is legal (qi).
+        assertEquals(
+            'i',
+            pickSpatialHitKey(
+                rawPreedit = "q",
+                flypy = false,
+                english = false,
+                xInKey = 5f,
+                keyWidth = 100f,
+                primaryChar = 'o',
+                leftNeighbor = 'i',
+                rightNeighbor = 'p',
+            ),
+        )
+        // Xiaohe Flypy: after 'q', 'w' (ei) is illegal while right neighbor 'e' is illegal and left 'q' (iu -> qiu) is legal!
+        assertEquals(
+            'q',
+            pickSpatialHitKey(
+                rawPreedit = "q",
+                flypy = true,
+                english = false,
+                xInKey = 10f,
+                keyWidth = 100f,
+                primaryChar = 'w',
+                leftNeighbor = 'q',
+                rightNeighbor = 'e',
+            ),
+        )
+        // Center tap stays on primary even if illegal; English mode never redirects.
+        assertEquals(
+            'o',
+            pickSpatialHitKey("q", false, false, 50f, 100f, 'o', 'i', 'p'),
+        )
+        assertEquals(
+            'o',
+            pickSpatialHitKey("q", false, true, 5f, 100f, 'o', 'i', 'p'),
+        )
+        // When primary is already legal (after 'n', 'i' is legal), never override to neighbor 'u'.
+        assertEquals(
+            'i',
+            pickSpatialHitKey("n", false, false, 5f, 100f, 'i', 'u', 'o'),
+        )
+        // Xiaohe Flypy accepts qv -> qu; tapping 'v' near 'c' must NOT rewrite legal 'v'.
+        assertEquals(
+            'v',
+            pickSpatialHitKey("q", true, false, 5f, 100f, 'v', 'c', 'b'),
+        )
+    }
+
+    @Test
+    fun hapticStrengthMapsOffAndTiers() {
+        assertEquals(null, hapticParamsFor("off", true))
+        val light = hapticParamsFor("light", true)!!
+        val strong = hapticParamsFor("strong", true)!!
+        assertTrue(strong.first > light.first)
+        assertTrue(strong.second > light.second)
+    }
 }

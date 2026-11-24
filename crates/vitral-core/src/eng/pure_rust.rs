@@ -1,7 +1,7 @@
 use crate::eng::gram::RimeGramDb;
 #[cfg(test)]
 use crate::eng::quanpin::{decode_quanpin_with_fuzzy, decode_xiaohe_long_context};
-use crate::eng::quanpin::{decode_quanpin_context, decode_xiaohe_context, QuanpinCandidate};
+use crate::eng::quanpin::{decode_quanpin_context, decode_xiaohe_context, FuzzyPairs, QuanpinCandidate};
 use crate::eng::{CandidateItem, OpenCcMode, PageInfo, SchemaKind, TypoCorrectionLevel};
 use crate::imp::polyphone::RimeDictCorpus;
 use crate::imp::ImportedLexiconIndex;
@@ -132,6 +132,7 @@ pub struct PureRustEngine {
     pub(super) confirmed_prefix: String,
     pub(super) confirming_initials: bool,
     pub fuzzy_pinyin: bool,
+    pub(crate) fuzzy_pairs: FuzzyPairs,
     pub(crate) typo_correction_level: TypoCorrectionLevel,
     pub syllable_split: bool,
     pub page_index: usize,
@@ -155,6 +156,7 @@ impl PureRustEngine {
             confirmed_prefix: String::new(),
             confirming_initials: false,
             fuzzy_pinyin: false,
+            fuzzy_pairs: FuzzyPairs::ALL,
             typo_correction_level: TypoCorrectionLevel::default(),
             syllable_split: false,
             page_index: 0,
@@ -499,6 +501,7 @@ impl PureRustEngine {
 
         let corpus = self.get_corpus();
         let gram = self.get_gram();
+        let fuzzy = if self.fuzzy_pinyin { self.fuzzy_pairs } else { FuzzyPairs::NONE };
         let mut decoded = match schema {
             SchemaKind::RimeIce => decode_quanpin_context(
                 raw_input,
@@ -507,7 +510,7 @@ impl PureRustEngine {
                 imported,
                 retention,
                 40,
-                self.fuzzy_pinyin,
+                fuzzy,
                 self.syllable_split,
                 &self.confirmed_prefix,
                 self.typo_correction_level,
@@ -519,6 +522,7 @@ impl PureRustEngine {
                 imported,
                 retention,
                 40,
+                fuzzy,
                 &self.confirmed_prefix,
                 self.typo_correction_level,
             ),
@@ -558,6 +562,7 @@ impl PureRustEngine {
             return (Vec::new(), None);
         }
         let corpus = self.get_corpus();
+        let xiaohe_fuzzy = schema == SchemaKind::DoublePinyinFlypy && self.fuzzy_pinyin;
         let exact_reading = |syllables: &[String]| {
             syllables
                 .iter()
@@ -576,11 +581,28 @@ impl PureRustEngine {
             !r.query_user_phrases(raw_input, schema == SchemaKind::DoublePinyinFlypy)
                 .is_empty()
         });
+        let leading_weight = retention.map_or(0, |_| {
+            decoded.iter()
+                .filter(|c| c.consumed_len == raw_input.len() && exact_reading(&c.syllables))
+                .filter_map(|c| corpus.word_weight(&c.text))
+                .max()
+                .unwrap_or(0)
+        });
         let now_ms = RetentionEngine::now_epoch_ms();
         let mut pinned_items = Vec::new();
         let mut ranked = Vec::new();
         let mut seen = HashSet::new();
-        for cand in decoded {
+        // Deduplicate complete exact Xiaohe readings before alternate readings.
+        let exactly_matches = |cand: &&QuanpinCandidate| {
+            cand.consumed_len == raw_input.len() && exact_reading(&cand.syllables)
+        };
+        let (exact, other): (Vec<_>, Vec<_>) = if xiaohe_fuzzy {
+            decoded.iter().partition(exactly_matches)
+        } else {
+            (Vec::new(), decoded.iter().collect())
+        };
+        for cand in exact.into_iter().chain(other) {
+            let flypy = schema == SchemaKind::DoublePinyinFlypy;
             let reading = if schema == SchemaKind::RimeIce {
                 cand.syllables.concat()
             } else {
@@ -588,11 +610,12 @@ impl PureRustEngine {
             };
             if retention.is_some_and(|r| r.erased_words.contains(&cand.text))
                 || imported.is_some_and(|i| {
-                    !i.matches_reading(
-                        &cand.text,
-                        &reading,
-                        schema == SchemaKind::DoublePinyinFlypy,
-                    )
+                    !i.matches_reading(&cand.text, &reading, flypy)
+                        && !(xiaohe_fuzzy && i.matches_reading(
+                            &cand.text,
+                            &crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&cand.syllables.join(" ")),
+                            true,
+                        ))
                 })
             {
                 continue;
@@ -604,14 +627,21 @@ impl PureRustEngine {
             let pinned = retention.is_some_and(|r| r.pinned_words.contains(&cand.text));
             let frec = retention
                 .map(|r| {
-                    r.contextual_score_at(
+                    let score = r.contextual_score_at(
                         &cand.text,
                         &raw_input[..cand.consumed_len],
                         prev_context,
                         app_id,
                         now_ms,
                         adaptive,
-                    )
+                    );
+                    if cand.consumed_len == raw_input.len() {
+                        r.protect_dictionary_rank(
+                            &cand.text, score, corpus.word_weight(&cand.text).unwrap_or(0), leading_weight,
+                        )
+                    } else {
+                        score
+                    }
                 })
                 .unwrap_or(0.0);
             let exact = cand.consumed_len == raw_input.len() && exact_reading(&cand.syllables);
@@ -633,7 +663,7 @@ impl PureRustEngine {
                 canonical: cand.text.clone(),
                 consumed_len: cand.consumed_len,
             };
-            if pinned && decoded.consumed_len == raw_input.len() {
+            if pinned && decoded.consumed_len == raw_input.len() && (!xiaohe_fuzzy || exact) {
                 pinned_items.push(decoded);
             } else {
                 ranked.push((decoded, cand.score, exact, single_syllable));
@@ -648,6 +678,7 @@ impl PureRustEngine {
         ranked.sort_by(|(a, a_score, a_exact, a_single), (b, b_score, b_exact, b_single)| {
             (b.consumed_len == raw_input.len())
                 .cmp(&(a.consumed_len == raw_input.len()))
+                .then_with(|| (xiaohe_fuzzy && *b_exact).cmp(&(xiaohe_fuzzy && *a_exact)))
                 .then_with(|| {
                     (single_query && *b_single && *b_exact)
                         .cmp(&(single_query && *a_single && *a_exact))
@@ -772,6 +803,13 @@ impl PureRustEngine {
             .filter(|_| !self.confirming_initials)
             .and_then(|context| {
                 self.contextual_prefix_candidate(raw_input, schema, imported, retention, context, adaptive)
+            })
+            .filter(|(word, _)| {
+                !retention.is_some_and(|r| {
+                    r.is_provisional_rare_selection(
+                        word, corpus.word_weight(word).unwrap_or(0), leading_weight,
+                    )
+                })
             });
         if let Some((word, syllables)) = &prediction {
             // An explicitly typed sentence wins over an unfinished contextual completion.
@@ -930,6 +968,51 @@ mod device_tests {
     use super::*;
 
     #[test]
+    fn xiaohe_fuzzy_candidates_follow_exact_matches_even_with_personal_weight() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let mut engine = PureRustEngine::new(Some(&assets));
+        engine.typo_correction_level = TypoCorrectionLevel::Off;
+        engine.fuzzy_pairs = FuzzyPairs::from_names(&["sh_s".into()]).unwrap();
+        let mut retention = RetentionEngine::default();
+        retention.record_selection_at("是", RetentionEngine::now_epoch_ms(), 50.0);
+        let query = |engine: &PureRustEngine| engine.query_all_candidates_contextual(
+            "si", SchemaKind::DoublePinyinFlypy, OpenCcMode::Simplified,
+            None, Some(&retention), None, None, true,
+        );
+        let exact = query(&engine);
+        assert!(!exact.iter().any(|c| c.canonical == "是"));
+        engine.fuzzy_pinyin = true;
+        let candidates = query(&engine);
+        assert!(candidates.iter().any(|c| c.canonical == "是"), "{candidates:?}");
+        assert_eq!(candidates[0].canonical, exact[0].canonical);
+        assert_eq!(candidates[0].item.comment, "si");
+        assert!(!candidates.iter().any(|c| c.item.comment == "chi"));
+    }
+
+    #[test]
+    fn xiaohe_fuzzy_keeps_imported_candidate_with_expanded_reading() {
+        let mut engine = PureRustEngine::new(None);
+        engine.typo_correction_level = TypoCorrectionLevel::Off;
+        engine.fuzzy_pairs = FuzzyPairs::from_names(&["sh_s".into()]).unwrap();
+        let mut imported = ImportedLexiconIndex::new(None);
+        imported.inject_hotwords(&[crate::imp::ImportedLexiconEntry {
+            text: "是".into(),
+            pinyin: "shi".into(),
+            toned_pinyin: "shì".into(),
+            xiaohe: "ui".into(),
+            weight: 500_000,
+        }]);
+        let query = |engine: &PureRustEngine| engine.query_all_candidates_contextual(
+            "si", SchemaKind::DoublePinyinFlypy, OpenCcMode::Simplified,
+            Some(&imported), None, None, None, false,
+        );
+        assert!(!query(&engine).iter().any(|c| c.canonical == "是"));
+        engine.fuzzy_pinyin = true;
+        let candidates = query(&engine);
+        assert!(candidates.iter().any(|c| c.canonical == "是" && c.item.comment == "shi"), "{candidates:?}");
+    }
+
+    #[test]
     fn opencc_disambiguates_phrases_and_regional_variants() {
         let text = "头发发财，理发皇后后来；干活干净茶几几乎出丑。方便面/软件/内存/鼠标/信息，兑换说话卫生，𫔶Vitral😀";
         for (mode, expected) in [
@@ -1029,7 +1112,7 @@ mod device_tests {
             None,
             None,
             40,
-            false,
+            FuzzyPairs::NONE,
             false,
             "",
             TypoCorrectionLevel::Standard,
@@ -1041,7 +1124,7 @@ mod device_tests {
             None,
             None,
             40,
-            false,
+            FuzzyPairs::NONE,
             false,
             "我要",
             TypoCorrectionLevel::Standard,
@@ -1107,7 +1190,7 @@ mod device_tests {
             None,
             Some(&retention),
             40,
-            false,
+            FuzzyPairs::NONE,
             false,
             "",
             TypoCorrectionLevel::Standard,

@@ -185,6 +185,16 @@ function apply(settings) {
     }
   }
 
+  const fuzzyGroup = $("#fuzzy-pairs-group");
+  if (fuzzyGroup) {
+    const enabled = Boolean(settings.fuzzy_pinyin);
+    fuzzyGroup.hidden = !enabled;
+    const selected = new Set(Array.isArray(settings.fuzzy_pinyin_pairs) ? settings.fuzzy_pinyin_pairs : []);
+    for (const box of all("[data-fuzzy-pair]")) {
+      box.checked = selected.has(box.dataset.fuzzyPair);
+    }
+  }
+
   renderShortcuts(settings);
   preview();
 
@@ -233,6 +243,9 @@ function switchTab(tabId) {
   if (!dirty) setNotice("");
   if (tabId === "library" && invoke && !clipboardLoaded) {
     loadClipboard(true);
+  }
+  if (tabId === "cloud" && invoke) {
+    api("sync-status").then(renderSyncHealth).catch(() => {});
   }
   if (tabId === "models") {
     loadModels(true);
@@ -285,6 +298,17 @@ all("main [name]").forEach(el => {
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", preview);
 
+all("[data-fuzzy-pair]").forEach(box => {
+  box.onchange = () => markDirty();
+});
+const fuzzyMaster = $("#fuzzy-pinyin-toggle");
+if (fuzzyMaster) {
+  fuzzyMaster.addEventListener("change", () => {
+    const g = $("#fuzzy-pairs-group");
+    if (g) g.hidden = !fuzzyMaster.checked;
+  });
+}
+
 async function saveAll() {
   if (recordingShortcut) finishShortcut(null);
   const conflicts = checkShortcutConflicts();
@@ -299,6 +323,9 @@ async function saveAll() {
         patch[el.name] = read(el);
       }
     }
+    patch.fuzzy_pinyin_pairs = all("[data-fuzzy-pair]")
+      .filter(box => box.checked)
+      .map(box => box.dataset.fuzzyPair);
     patch.shortcuts = readShortcuts();
     const reply = await invoke("save_settings", { patch });
     apply(reply.settings);
@@ -337,6 +364,29 @@ async function loadClipboard(silent = false) {
   );
 }
 
+function tokenizeClipboardText(text) {
+  const bounded = String(text || "").slice(0, 1500);
+  const re = /https?:\/\/[^\s]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|[A-Za-z0-9_./:-]+|[\u4E00-\u9FFF]+|[^\s\u4E00-\u9FFFA-Za-z0-9]+/g;
+  const out = [];
+  for (const m of bounded.matchAll(re)) {
+    if (out.length >= 48) break;
+    const tok = m[0].trim();
+    if (!tok) continue;
+    if (/^[\u4E00-\u9FFF]+$/.test(tok) && tok.length > 4) {
+      let i = 0;
+      while (i < tok.length && out.length < 48) {
+        const rem = tok.length - i;
+        const step = rem <= 4 ? rem : rem === 5 ? 2 : 3;
+        out.push(tok.slice(i, i + step));
+        i += step;
+      }
+    } else {
+      out.push(tok);
+    }
+  }
+  return out;
+}
+
 function createClipRow(item) {
   const row = document.createElement("li");
   row.className = `clip-item${item.pinned ? " is-pinned" : ""}`;
@@ -346,8 +396,8 @@ function createClipRow(item) {
 
   const text = document.createElement("div");
   text.className = "clip-text";
-  text.textContent = item.content;
-  text.title = item.content;
+  text.textContent = item.content.length > 420 ? `${item.content.slice(0, 420)}…` : item.content;
+  text.title = item.content.length > 420 ? `${item.content.slice(0, 420)}…（共 ${item.content.length} 字符）` : item.content;
 
   const meta = document.createElement("div");
   meta.className = "clip-meta";
@@ -414,7 +464,64 @@ function createClipRow(item) {
       setNotice(item.pinned ? "已更新简码" : "已置顶收藏", "ok");
     });
 
-  actions.append(copyBtn, code, pinBtn);
+  const splitBtn = document.createElement("button");
+  splitBtn.type = "button";
+  splitBtn.className = "btn-mini";
+  splitBtn.textContent = "分词";
+  let tokenDrawer = null;
+  splitBtn.onclick = () => {
+    if (tokenDrawer) {
+      tokenDrawer.remove();
+      tokenDrawer = null;
+      splitBtn.textContent = "分词";
+      return;
+    }
+    const tokens = tokenizeClipboardText(item.content);
+    if (!tokens.length) return;
+    tokenDrawer = document.createElement("div");
+    tokenDrawer.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;align-items:center;";
+    const picked = new Set();
+    const copyPickedBtn = document.createElement("button");
+    copyPickedBtn.type = "button";
+    copyPickedBtn.className = "btn-mini";
+    copyPickedBtn.textContent = "复制选中 (0)";
+    copyPickedBtn.disabled = true;
+    copyPickedBtn.onclick = async () => {
+      const joined = tokens.filter((_, i) => picked.has(i)).join("");
+      if (!joined) return;
+      try {
+        await navigator.clipboard.writeText(joined);
+        setNotice(`已复制 ${joined.length} 字符片段`, "ok");
+      } catch {
+        setNotice("无法写入系统剪贴板", "error");
+      }
+    };
+    tokens.forEach((tok, idx) => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "btn-mini";
+      chip.textContent = tok;
+      chip.onclick = () => {
+        if (picked.has(idx)) {
+          picked.delete(idx);
+          chip.style.fontWeight = "";
+          chip.style.outline = "";
+        } else {
+          picked.add(idx);
+          chip.style.fontWeight = "600";
+          chip.style.outline = "1.5px solid var(--accent, #0ea5e9)";
+        }
+        copyPickedBtn.textContent = `复制选中 (${picked.size})`;
+        copyPickedBtn.disabled = picked.size === 0;
+      };
+      tokenDrawer.append(chip);
+    });
+    tokenDrawer.append(copyPickedBtn);
+    body.append(tokenDrawer);
+    splitBtn.textContent = "收起";
+  };
+
+  actions.append(copyBtn, splitBtn, code, pinBtn);
 
   if (item.pinned) {
     const unpinBtn = document.createElement("button");
@@ -627,6 +734,11 @@ all("[data-action]").forEach(b => {
         renderClipboard();
       }
       if (cmd === "storage") renderUsage(data);
+      if (cmd === "sync-status") {
+        renderSyncHealth(data);
+        setNotice("已刷新跨端同步链路状态", "ok");
+        return;
+      }
       if (cmd === "relay-discover") renderDevices(data || []);
       if (cmd === "relay-poll-inbox") {
         const inbox = $("#inbox");
@@ -671,8 +783,9 @@ all("[data-action]").forEach(b => {
         setNotice("已清空个人习惯记忆（置顶词已保留）", "ok");
       } else if (cmd === "poll-services") {
         try {
-          const usage = await api("storage");
+          const [usage, health] = await Promise.all([api("storage"), api("sync-status")]);
           renderUsage(usage);
+          renderSyncHealth(health);
         } catch {}
         setNotice("已完成与 Koofr 云端同步", "ok");
       } else if (cmd === "restore-from-koofr") {
@@ -689,6 +802,40 @@ all("[data-action]").forEach(b => {
     });
   };
 });
+
+function renderSyncHealth(status) {
+  const el = $("#sync-health");
+  if (!el || !status) return;
+  const fmtTs = ms => (ms > 0 ? new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : "尚未同步");
+  const lanText = status.pure_offline
+    ? "纯离线已阻断"
+    : status.last_lan_error
+      ? `异常：${status.last_lan_error}`
+      : `${status.lan_peer_count || 0} 台节点 · ${fmtTs(status.last_lan_sync_ms)}`;
+  const cloudText = status.pure_offline
+    ? "纯离线已阻断"
+    : !status.cloud_configured
+      ? "未配置 WebDAV"
+      : status.last_cloud_error
+        ? `异常：${status.last_cloud_error}`
+        : `正常 · ${fmtTs(status.last_cloud_sync_ms)}`;
+  const cells = [
+    ["局域网通道", lanText],
+    ["私有云通道", cloudText],
+    ["本地词库快照", `${status.backup_count || 0} 份滚动备份`],
+  ];
+  el.replaceChildren();
+  for (const [k, v] of cells) {
+    const div = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = k;
+    const dd = document.createElement("dd");
+    dd.textContent = v;
+    div.append(dt, dd);
+    el.append(div);
+  }
+  el.hidden = false;
+}
 
 // ================= LEXICON IMPORT =================
 async function importPaths(paths) {

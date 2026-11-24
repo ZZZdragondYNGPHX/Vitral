@@ -29,6 +29,30 @@ const KEY_RIGHT: u32 = 0xff53;
 const KEY_END: u32 = 0xff57;
 const KEY_DELETE: u32 = 0xffff;
 
+const DEV_APPS: &[&str] = &[
+    "alacritty", "kitty", "wezterm", "wezterm-gui", "foot", "konsole",
+    "terminal", "gnome-terminal", "gnome-terminal-server", "xfce4-terminal", "tilix",
+    "xterm", "urxvt", "windowsterminal", "wt", "cmd", "powershell", "pwsh",
+    "mintty", "nvim", "vim", "gvim", "tmux", "code", "code-insiders", "code - insiders",
+];
+const IDE_APPS: &[&str] = &[
+    "codium", "cursor", "zed", "idea", "pycharm", "clion", "goland", "webstorm",
+    "rider", "rustrover", "android studio", "android-studio", "studio64", "devenv", "sublime_text",
+    "neovide", "emacs",
+];
+
+fn app_matches(app_id: &str, builtins: &[&str], custom: &[String]) -> bool {
+    let lower = app_id.to_lowercase();
+    let filename = lower.rsplit(['/', '\\']).next().unwrap_or(&lower);
+    let filename = filename.strip_suffix(".exe").unwrap_or(filename);
+    builtins.iter().any(|name| filename.split('.').any(|part| {
+        part == *name || part.strip_suffix("64") == Some(*name)
+    })) || custom.iter().any(|rule| {
+        let rule = rule.trim().to_lowercase();
+        !rule.is_empty() && lower.contains(&rule)
+    })
+}
+
 fn clamp_cursor(text: &str, cursor: usize) -> usize {
     let mut cursor = cursor.min(text.len());
     while !text.is_char_boundary(cursor) {
@@ -117,12 +141,28 @@ pub struct EngineConfig {
     pub adaptive_learning: bool,
     #[serde(default)]
     pub fuzzy_pinyin: bool,
+    #[serde(default)]
+    pub fuzzy_pinyin_pairs: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub undo_commit_on_backspace: bool,
     #[serde(default = "default_typo_correction_level")]
     pub typo_correction_level: String,
     #[serde(default)]
     pub syllable_split: bool,
     #[serde(default = "default_enabled")]
     pub learn_from_clipboard: bool,
+    #[serde(default = "default_enabled")]
+    pub auto_english_for_dev_apps: bool,
+    #[serde(default)]
+    pub default_english_apps: Vec<String>,
+    #[serde(default = "default_enabled")]
+    pub disable_paired_punct_in_ide: bool,
+    #[serde(default)]
+    pub disable_paired_punct_apps: Vec<String>,
+    #[serde(default = "default_quote_style")]
+    pub quote_style: String,
+    #[serde(default)]
+    pub auto_micro_space: bool,
     #[serde(default)]
     pub data_dir: String,
     #[serde(default)]
@@ -203,6 +243,17 @@ impl EngineConfig {
         Ok(())
     }
 
+    pub(crate) fn validated_fuzzy_pairs(&self) -> Result<quanpin::FuzzyPairs, VitralError> {
+        quanpin::FuzzyPairs::from_names(&self.fuzzy_pinyin_pairs)
+    }
+
+    pub(crate) fn validate_quote_style(&self) -> Result<(), VitralError> {
+        if !matches!(self.quote_style.as_str(), "curly" | "corner") {
+            return Err(VitralError::InvalidArgument("quote_style must be curly or corner".into()));
+        }
+        Ok(())
+    }
+
     pub fn shortcut_enabled(&self, action: crate::shortcuts::ShortcutAction) -> bool {
         !(cfg!(target_os = "linux") && !self.linux_english_mode && action == crate::shortcuts::ShortcutAction::ToggleLanguage)
     }
@@ -221,6 +272,8 @@ impl EngineConfig {
         if let Some(url) = config.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { crate::models::validate_url(url)?; }
         config.validate_prediction()?;
         config.validated_typo_correction_level()?;
+        config.validate_quote_style()?;
+        config.validated_fuzzy_pairs()?;
         Ok(config)
     }
 }
@@ -266,6 +319,10 @@ fn default_typo_correction_level() -> String {
 
 fn default_enabled() -> bool { true }
 
+fn default_quote_style() -> String {
+    "curly".into()
+}
+
 fn default_schema() -> SchemaKind {
     SchemaKind::DoublePinyinFlypy
 }
@@ -295,9 +352,17 @@ impl Default for EngineConfig {
             linux_english_mode: true,
             adaptive_learning: true,
             fuzzy_pinyin: false,
+            fuzzy_pinyin_pairs: Vec::new(),
+            undo_commit_on_backspace: true,
             typo_correction_level: default_typo_correction_level(),
             syllable_split: false,
             learn_from_clipboard: true,
+            auto_english_for_dev_apps: true,
+            default_english_apps: Vec::new(),
+            disable_paired_punct_in_ide: true,
+            disable_paired_punct_apps: Vec::new(),
+            quote_style: default_quote_style(),
+            auto_micro_space: false,
             data_dir: String::new(),
             cache_dir: String::new(),
             assets_dir: String::new(),
@@ -376,6 +441,10 @@ pub struct InputAction {
     pub schema: String,
     pub preedit: PreeditState,
     pub commit_text: Option<String>,
+    #[serde(default)]
+    pub undo_commit_chars: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undo_commit_text: Option<String>,
     pub candidates: Vec<CandidateItem>,
     pub page: PageInfo,
     pub paired_punctuation: Option<String>,
@@ -402,6 +471,11 @@ pub fn resolve_assets_dir(configured: &str) -> Option<PathBuf> {
 
 #[derive(Debug, Clone)]
 enum CandidateOrigin {
+    Components {
+        canonical: String,
+        commit_text: String,
+        features: [f64; 9],
+    },
     Overlay {
         features: [f64; 9],
         canonical: String,
@@ -425,7 +499,9 @@ enum CandidateOrigin {
 impl CandidateOrigin {
     fn features(&self) -> &[f64; 9] {
         match self {
-            Self::Overlay { features, .. } | Self::PureRust { features, .. } => features,
+            Self::Components { features, .. }
+            | Self::Overlay { features, .. }
+            | Self::PureRust { features, .. } => features,
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             Self::Rime { features, .. } => features,
         }
@@ -433,7 +509,9 @@ impl CandidateOrigin {
 
     fn set_features(&mut self, value: [f64; 9]) {
         match self {
-            Self::Overlay { features, .. } | Self::PureRust { features, .. } => *features = value,
+            Self::Components { features, .. }
+            | Self::Overlay { features, .. }
+            | Self::PureRust { features, .. } => *features = value,
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             Self::Rime { features, .. } => *features = value,
         }
@@ -441,12 +519,26 @@ impl CandidateOrigin {
 
     fn canonical(&self) -> &str {
         match self {
-            CandidateOrigin::Overlay { canonical, .. }
+            CandidateOrigin::Components { canonical, .. }
+            | CandidateOrigin::Overlay { canonical, .. }
             | CandidateOrigin::PureRust { canonical, .. } => canonical,
             #[cfg(all(target_os = "linux", feature = "native-rime"))]
             CandidateOrigin::Rime { canonical, .. } => canonical,
         }
     }
+}
+
+struct UndoCommit {
+    text: String,
+    previous_char: Option<char>,
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    native: bool,
+}
+
+struct PendingUndoRegret {
+    word: String,
+    code: String,
+    context: Option<String>,
 }
 
 pub struct EngineState {
@@ -461,6 +553,8 @@ pub struct EngineState {
     pub last_committed_code: Option<String>,
     pub last_committed_ms: u64,
     pub last_committed_char: Option<char>,
+    undo_commit: Option<UndoCommit>,
+    pending_undo_regret: Option<PendingUndoRegret>,
     pub regret_backspaces: usize,
     last_commit_context: Option<String>,
     last_commit_window: Vec<char>,
@@ -548,6 +642,7 @@ impl EngineState {
             (!config.data_dir.is_empty()).then(|| Path::new(&config.data_dir)),
         );
         pure_rust.fuzzy_pinyin = config.fuzzy_pinyin;
+        pure_rust.fuzzy_pairs = config.validated_fuzzy_pairs().unwrap_or(quanpin::FuzzyPairs::NONE);
         pure_rust.typo_correction_level = config.validated_typo_correction_level().unwrap_or_default();
         pure_rust.syllable_split = config.syllable_split;
         let mut engine = Self {
@@ -562,6 +657,8 @@ impl EngineState {
             last_committed_code: None,
             last_committed_ms: 0,
             last_committed_char: None,
+            undo_commit: None,
+            pending_undo_regret: None,
             regret_backspaces: 0,
             last_commit_context: None,
             last_commit_window: Vec::new(),
@@ -643,6 +740,7 @@ impl EngineState {
         self.context_window.clear();
         self.refresh_semantic_context();
         self.last_commit_features = None;
+        self.undo_commit = None;
         self.last_committed_word = None;
         self.last_committed_code = None;
         self.last_commit_context = None;
@@ -652,6 +750,10 @@ impl EngineState {
 
     /// Host deletion feedback counts Unicode characters, including whole-word deletion.
     pub fn notify_deleted_chars(&mut self, count: usize) {
+        if count > 0 {
+            self.undo_commit = None;
+            self.last_committed_char = None;
+        }
         if self.raw_input.is_empty()
             && self.last_committed_word.is_some()
             && RetentionEngine::now_epoch_ms().saturating_sub(self.last_committed_ms) <= 5000
@@ -689,6 +791,10 @@ impl EngineState {
         )
     }
 
+    fn is_clipboard_shortcut_candidate(&self, index: usize) -> bool {
+        self.current_candidates.get(index).is_some_and(|item| item.is_clipboard_shortcut)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_candidate_commit(
         &mut self,
@@ -699,6 +805,8 @@ impl EngineState {
         retention: &mut RetentionEngine,
         now_ms: u64,
     ) {
+        self.undo_commit = None;
+        self.settle_undo_regret(Some(canonical), retention);
         let fully_deleted =
             self.last_committed_word.as_ref().is_some_and(|w| {
                 self.regret_backspaces == w.chars().count() && self.regret_backspaces > 0
@@ -1107,6 +1215,7 @@ impl EngineState {
     }
 
     pub(crate) fn clear_composition_state(&mut self) {
+        self.pending_undo_regret = None;
         self.clear_pending_phrase();
         self.pure_rust.confirmed_prefix.clear();
         self.pure_rust.confirming_initials = false;
@@ -1149,19 +1258,14 @@ impl EngineState {
         if self.active_app_id.as_deref() != Some(app_id) {
             self.reset_commit_context();
             self.last_committed_char = None;
+            self.pending_undo_regret = None;
         }
         let prev_lang = self.lang_mode;
         self.active_app_id = Some(app_id.to_string());
         let remembered = self.app_lang_memory.contains_key(app_id);
         let lang_mode = *self.app_lang_memory.entry(app_id.to_string()).or_insert_with(|| {
-            let lower = app_id.to_ascii_lowercase();
-            if lower.contains("terminal")
-                || lower.contains("konsole")
-                || lower.contains("alacritty")
-                || lower.contains("kitty")
-                || lower.contains("code")
-                || lower.contains("vim")
-            {
+            let builtins = if self.config.auto_english_for_dev_apps { DEV_APPS } else { &[] };
+            if app_matches(app_id, builtins, &self.config.default_english_apps) {
                 LangMode::En
             } else {
                 LangMode::Zh
@@ -1184,6 +1288,8 @@ impl EngineState {
             LangMode::En => LangMode::Zh,
         };
         self.lang_mode = next;
+        self.undo_commit = None;
+        self.pending_undo_regret = None;
         if next == LangMode::En {
             self.clear_composition_state();
         }
@@ -1195,6 +1301,7 @@ impl EngineState {
 
     pub fn set_schema(&mut self, schema: SchemaKind) {
         self.schema = schema;
+        self.undo_commit = None;
         self.clear_composition_state();
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         if let (Some(sid), Some(ref assets_dir)) = (self.rime_session_id, &self.resolved_assets_dir)
@@ -1346,13 +1453,24 @@ impl EngineState {
         if keycode == 0x1b {
             self.reset_commit_context();
             self.last_committed_char = None;
+            self.pending_undo_regret = None;
         }
-        if keycode == 0x08 { self.notify_deleted_chars(1); }
+        if keycode == 0x08 && self.raw_input.is_empty() && self.composing.is_empty() {
+            if modifiers == 0 && swipe_dir == SwipeDir::None && self.lang_mode == LangMode::Zh {
+                if let Some(action) = self.undo_candidate_commit(clipboard, imported, retention)? {
+                    return Ok(action);
+                }
+            }
+            self.notify_deleted_chars(1);
+        }
         if keycode == 0x0d {
             if self.config.adaptive_learning {
                 retention.record_english_casing(&self.raw_input);
             }
             self.reset_commit_context();
+        }
+        if keycode == 0x20 && self.raw_input.is_empty() && self.composing.is_empty() {
+            self.last_committed_char = None;
         }
         if !is_cursor_key && char::from_u32(keycode).is_some_and(|c| {
             !c.is_control() && !c.is_ascii_alphanumeric() && c != '\'' && !crate::ret::is_cjk(c)
@@ -1365,6 +1483,7 @@ impl EngineState {
             return Ok(self.empty_action(None));
         }
         if is_cursor_key && self.raw_input.is_empty() && self.composing.is_empty() {
+            self.undo_commit = None;
             return Ok(self.empty_action(None));
         }
 
@@ -1420,8 +1539,22 @@ impl EngineState {
             return Ok(self.empty_action(char::from_u32(keycode).map(|c| c.to_string())));
         }
 
-        if let Some(act) = self.handle_passthrough_or_paired_punct(keycode)? {
+        if let Some(act) = self.handle_passthrough_or_paired_punct(keycode, retention)? {
             return Ok(act);
+        }
+
+        // Xiaohe requires an apostrophe because uu is the code for shu.
+        if self.raw_input.is_empty() && self.schema == SchemaKind::RimeIce && keycode == 'u' as u32 {
+            return self.process_key_pure_rust(keycode, clipboard, imported, retention);
+        }
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if self.schema == SchemaKind::DoublePinyinFlypy && self.rime_input_start == Some(0)
+            && self.raw_input == "u" && keycode == '\'' as u32
+        {
+            self.clear_composition_state();
+            self.raw_input.push('u');
+            self.raw_cursor = 1;
+            return self.process_key_pure_rust(keycode, clipboard, imported, retention);
         }
 
         if self.config.syllable_split && self.schema == SchemaKind::RimeIce {
@@ -1432,7 +1565,10 @@ impl EngineState {
         {
             if let Some(assets_dir) = self.resolved_assets_dir.clone() {
                 if assets_dir.join("rime").is_dir()
-                    && (self.rime_input_start.is_some() || self.raw_input.is_empty())
+                    && (self.rime_input_start.is_some()
+                        || (self.raw_input.is_empty()
+                            && !(self.schema == SchemaKind::DoublePinyinFlypy
+                                && self.config.fuzzy_pinyin)))
                 {
                     return self.process_key_native_rime(
                         &assets_dir,
@@ -1447,6 +1583,89 @@ impl EngineState {
         }
 
         self.process_key_pure_rust(keycode, clipboard, imported, retention)
+    }
+
+    fn undo_candidate_commit(
+        &mut self,
+        clipboard: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Result<Option<InputAction>, VitralError> {
+        let now = RetentionEngine::now_epoch_ms();
+        if !self.config.undo_commit_on_backspace || now.saturating_sub(self.last_committed_ms) > 5000 {
+            return Ok(None);
+        }
+        let Some(undo) = self.undo_commit.take() else {
+            return Ok(None);
+        };
+        let (Some(word), Some(code)) = (
+            self.last_committed_word.take(), self.last_committed_code.take(),
+        ) else {
+            return Ok(None);
+        };
+        let context = self.last_commit_context.take();
+        self.context_window = std::mem::take(&mut self.last_commit_window);
+        self.refresh_semantic_context();
+        self.last_commit_features = None;
+        self.last_committed_char = undo.previous_char;
+        self.regret_backspaces = 0;
+
+        let mut action = self.restore_candidate_code(
+            code.clone(), &undo, clipboard, imported, retention,
+        )?;
+        self.pending_undo_regret = Some(PendingUndoRegret { word, code, context });
+        action.undo_commit_chars = undo.text.chars().count();
+        action.undo_commit_text = Some(undo.text);
+        Ok(Some(action))
+    }
+
+    pub(crate) fn settle_undo_regret(&mut self, selected: Option<&str>, retention: &mut RetentionEngine) {
+        if let Some(regret) = self.pending_undo_regret.take() {
+            if selected != Some(regret.word.as_str()) {
+                retention.penalize_selection(
+                    &regret.code,
+                    &regret.word,
+                    regret.context.as_deref(),
+                    self.active_app_id.as_deref(),
+                    RetentionEngine::now_epoch_ms(),
+                );
+            }
+        }
+    }
+
+    fn restore_candidate_code(
+        &mut self,
+        code: String,
+        _undo: &UndoCommit,
+        clipboard: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Result<InputAction, VitralError> {
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        if _undo.native {
+            if let (Some(sid), Some(assets)) = (self.rime_session_id, &self.resolved_assets_dir) {
+                let snapshot = rime_ffi::with_runtime(
+                    assets, &self.config.cache_dir, &self.config.data_dir, |rt| {
+                        rt.clear_composition(sid);
+                        for ch in code.chars() {
+                            rt.process_key(sid, ch as u32, 0)?;
+                        }
+                        rt.snapshot(sid)
+                    },
+                );
+                if let Ok(snapshot) = snapshot {
+                    if snapshot.commit_text.is_none() && snapshot.raw_input == code {
+                        return Ok(self.apply_rime_snapshot(
+                            snapshot, false, false, clipboard, imported, retention,
+                        ));
+                    }
+                }
+                self.clear_composition_state();
+            }
+        }
+        self.raw_input = code;
+        self.raw_cursor = self.raw_input.len();
+        self.process_key_pure_rust(0, clipboard, imported, retention)
     }
 
     pub fn set_preedit_cursor(
@@ -1594,6 +1813,7 @@ impl EngineState {
     fn handle_passthrough_or_paired_punct(
         &mut self,
         keycode: u32,
+        retention: &mut RetentionEngine,
     ) -> Result<Option<InputAction>, VitralError> {
         let is_backspace = keycode == 0x08 || keycode == 0xFF08;
         let is_escape = keycode == 0x1B || keycode == 0xFF1B;
@@ -1620,8 +1840,9 @@ impl EngineState {
             }
             if is_space || is_return {
                 let committed = self.raw_input.clone();
+                self.settle_undo_regret(None, retention);
                 self.clear_composition_state();
-                return Ok(Some(self.empty_action(Some(committed))));
+                return Ok(Some(self.commit_action(Some(committed), false)));
             }
             if let Some(ch) = char::from_u32(keycode) {
                 if !ch.is_control() {
@@ -1658,19 +1879,36 @@ impl EngineState {
                 return Ok(Some(self.build_passthrough_action()));
             }
 
-            if let Some(pair) = match_paired_punctuation(ch) {
-                if ch != '\'' || self.raw_input.is_empty() {
+            let single_quote = matches!(ch, '\'' | '‘' | '『');
+            if !single_quote || (self.raw_input.is_empty() && self.composing.is_empty()) {
+                let corner = self.config.quote_style == "corner";
+                let pair = match ch {
+                    '"' | '“' => Some(if corner { "「」" } else { "“”" }),
+                    '\'' | '‘' => Some(if corner { "『』" } else { "‘’" }),
+                    '『' => Some("『』"),
+                    _ => match_paired_punctuation(ch),
+                };
+                if let Some(pair) = pair {
+                    let disable_pair = self.active_app_id.as_deref().is_some_and(|app| {
+                        let builtins = if self.config.disable_paired_punct_in_ide { IDE_APPS } else { &[] };
+                        app_matches(app, builtins, &self.config.disable_paired_punct_apps)
+                            || (self.config.disable_paired_punct_in_ide && app_matches(app, DEV_APPS, &[]))
+                    });
                     let prefix = if !self.raw_input.is_empty() {
                         self.current_candidates.first().map(|c| c.text.clone())
                     } else {
                         None
                     };
+                    let allow_micro_space = prefix.is_none() || !self.is_clipboard_shortcut_candidate(0);
+                    self.settle_undo_regret(None, retention);
                     self.clear_composition_state();
-                    let committed = match prefix {
-                        Some(p) => format!("{p}{pair}"),
-                        None => pair.to_string(),
-                    };
-                    let mut act = self.empty_action(Some(committed));
+                    let mut committed = prefix.unwrap_or_default();
+                    if disable_pair {
+                        committed.extend(pair.chars().take(1));
+                        return Ok(Some(self.commit_action(Some(committed), allow_micro_space)));
+                    }
+                    committed.push_str(pair);
+                    let mut act = self.commit_action(Some(committed), allow_micro_space);
                     act.paired_punctuation = Some(pair.to_string());
                     act.cursor_delta = -1;
                     return Ok(Some(act));
@@ -2051,6 +2289,19 @@ impl EngineState {
                     self.score_pair(item, origin, retention, now_ms, *rank);
                 }
             }
+            let corpus = self.pure_rust.get_corpus();
+            let leading_weight = base_pairs.iter()
+                .filter_map(|(_, origin, _)| corpus.word_weight(origin.canonical()))
+                .max()
+                .unwrap_or(0);
+            for (item, origin, _) in &mut base_pairs {
+                let word = origin.canonical();
+                if origin.features()[5] <= 0.0 {
+                    item.frecency_score = retention.protect_dictionary_rank(
+                        word, item.frecency_score, corpus.word_weight(word).unwrap_or(0), leading_weight,
+                    );
+                }
+            }
             base_pairs.sort_by(|a, b| {
                 full_span
                     .contains(b.1.canonical())
@@ -2292,9 +2543,7 @@ impl EngineState {
             None
         };
         if let Some(index) = selection.filter(|i| *i < self.candidate_origins.len()) {
-            let committed =
-                self.select_candidate_on_backend(index, clipboard, imported, retention)?;
-            return Ok(self.empty_action(committed));
+            return self.select_candidate_action(index, clipboard, imported, retention);
         }
 
         if self.raw_input.is_empty() && self.composing.is_empty() {
@@ -2323,6 +2572,9 @@ impl EngineState {
         )?;
 
         let backend_page = snap.page_index;
+        if let Some(committed) = snap.commit_text.as_deref() {
+            self.settle_undo_regret(Some(committed), retention);
+        }
         let mut action = self.apply_rime_snapshot(
             snap, is_return, is_escape, clipboard, imported, retention,
         );
@@ -2361,11 +2613,10 @@ impl EngineState {
         } else if keycode == 0x20 {
             if !self.raw_input.is_empty() {
                 if !self.candidate_origins.is_empty() {
-                    let committed =
-                        self.select_candidate_on_backend(0, clipboard, imported, retention)?;
-                    return Ok(self.empty_action(committed));
+                    return self.select_candidate_action(0, clipboard, imported, retention);
                 }
                 let committed = self.raw_input.clone();
+                self.settle_undo_regret(None, retention);
                 self.clear_composition_state();
                 return Ok(self.empty_action(Some(committed)));
             }
@@ -2374,6 +2625,7 @@ impl EngineState {
             let committed = if self.raw_input.is_empty() {
                 None
             } else {
+                self.settle_undo_regret(None, retention);
                 Some(self.raw_input.clone())
             };
             self.clear_composition_state();
@@ -2395,26 +2647,27 @@ impl EngineState {
                 if (1..=page_size.min(9)).contains(&digit)
                     && self.current_candidates.get(digit - 1).is_some()
                 {
-                    let committed = self.select_candidate_on_backend(
+                    return self.select_candidate_action(
                         digit - 1,
                         clipboard,
                         imported,
                         retention,
-                    )?;
-                    return Ok(self.empty_action(committed));
+                    );
                 }
             } else if let Some(punctuation) = map_zh_punctuation(ch) {
+                let allow_micro_space = self.raw_input.is_empty() || !self.is_clipboard_shortcut_candidate(0);
                 let mut text = if self.raw_input.is_empty() {
                     String::new()
                 } else if !self.candidate_origins.is_empty() {
                     self.select_candidate_on_backend(0, clipboard, imported, retention)?
                         .unwrap_or_default()
                 } else {
+                    self.settle_undo_regret(None, retention);
                     self.raw_input.clone()
                 };
                 self.clear_composition_state();
                 text.push_str(punctuation);
-                return Ok(self.empty_action(Some(text)));
+                return Ok(self.commit_action(Some(text), allow_micro_space));
             } else if !ch.is_control() && self.raw_input.is_empty() {
                 let text = ch.to_string();
                 return Ok(self.empty_action(Some(text)));
@@ -2424,6 +2677,39 @@ impl EngineState {
         if self.raw_input.is_empty() {
             self.clear_composition_state();
             return Ok(self.empty_action(None));
+        }
+
+        if let Some(code) = self.component_code() {
+            let ids = crate::hw::ids_exta::IdsIndex::load_cached(self.resolved_assets_dir.as_deref());
+            let candidates = ids.lookup_component_code(code, imported.corpus());
+            let mut seen = HashSet::new();
+            let pairs = candidates.into_iter().filter_map(|ch| {
+                let canonical = ch.to_string();
+                if retention.erased_words.contains(&canonical) {
+                    return None;
+                }
+                let text = self.convert_opencc(&canonical);
+                if !seen.insert(text.clone()) {
+                    return None;
+                }
+                let comment = imported.char_phonetics(ch).into_iter().next()
+                    .map_or_else(String::new, |(pinyin, xiaohe)| format!("{pinyin} · {xiaohe}"));
+                let item = CandidateItem {
+                    index: 0,
+                    text: text.clone(),
+                    comment,
+                    pinned: retention.pinned_words.contains(&canonical),
+                    is_clipboard_shortcut: false,
+                    quick_paste_id: None,
+                    function_action: None,
+                    shortcut_code: None,
+                    frecency_score: 0.0,
+                };
+                Some((item, CandidateOrigin::Components {
+                    canonical, commit_text: text, features: [0.0; 9],
+                }))
+            }).collect();
+            return Ok(self.show_portable_page(pairs));
         }
 
         let now_ms = RetentionEngine::now_epoch_ms();
@@ -2439,6 +2725,13 @@ impl EngineState {
             self.config.adaptive_learning,
         );
 
+        let corpus = self.pure_rust.get_corpus();
+        let xiaohe_fuzzy = self.schema == SchemaKind::DoublePinyinFlypy && self.pure_rust.fuzzy_pinyin;
+        let leading_weight = base_pairs.iter()
+            .filter(|c| c.consumed_len == self.raw_input.len())
+            .filter_map(|c| corpus.word_weight(&c.canonical))
+            .max()
+            .unwrap_or(0);
         let english_at = base_pairs.iter().position(|c| c.item.comment == "英文");
         let (mut merged, mut seen) =
             self.build_overlay_candidates(clipboard, imported, retention, false);
@@ -2461,6 +2754,13 @@ impl EngineState {
                 };
                 let mut origin = origin;
                 self.score_pair(&mut item, &mut origin, retention, now_ms, base_rank);
+                // Semantic recall in a relevant context has its own evidence.
+                if consumed_len == self.raw_input.len() && origin.features()[5] <= 0.0 {
+                    let word = origin.canonical();
+                    item.frecency_score = retention.protect_dictionary_rank(
+                        word, item.frecency_score, corpus.word_weight(word).unwrap_or(0), leading_weight,
+                    );
+                }
                 merged.push((item, origin));
             }
         }
@@ -2477,12 +2777,17 @@ impl EngineState {
             }
             _ => 1,
         };
+        let exact_xiaohe = |(item, origin): &(CandidateItem, CandidateOrigin)| {
+            xiaohe_fuzzy && (matches!(origin, CandidateOrigin::Overlay { .. })
+                || quanpin::matches_xiaohe_reading(&item.comment, &self.raw_input))
+        };
         merged.sort_by(|a, b| {
             let group = candidate_group(&a.1);
             group.cmp(&candidate_group(&b.1)).then_with(|| {
                 if group == 1 {
                     // Negative personal scores remove a boost; dictionary order breaks ties.
-                    b.0.pinned.cmp(&a.0.pinned).then_with(|| {
+                    exact_xiaohe(b).cmp(&exact_xiaohe(a))
+                        .then_with(|| b.0.pinned.cmp(&a.0.pinned)).then_with(|| {
                         b.0.frecency_score
                             .max(0.0)
                             .total_cmp(&a.0.frecency_score.max(0.0))
@@ -2573,6 +2878,20 @@ impl EngineState {
         if let Some((word, score)) = contextual_prediction {
             self.promote_prefix_prediction(&mut merged, &word, score, retention, now_ms);
         }
+        Ok(self.show_portable_page(merged))
+    }
+
+    fn component_code(&self) -> Option<&str> {
+        let prefix = match self.schema {
+            SchemaKind::RimeIce => "u",
+            SchemaKind::DoublePinyinFlypy => "u'",
+        };
+        self.raw_input.strip_prefix(prefix)
+            .filter(|code| code.len() >= 2 && code.bytes().all(|byte| byte.is_ascii_lowercase()))
+    }
+
+    fn show_portable_page(&mut self, merged: Vec<(CandidateItem, CandidateOrigin)>) -> InputAction {
+        let page_size = self.candidate_page_size();
         let total_pages = merged.len().div_ceil(page_size).max(1);
         if self.pure_rust.page_index >= total_pages {
             self.pure_rust.page_index = 0;
@@ -2591,7 +2910,7 @@ impl EngineState {
             has_prev: self.pure_rust.page_index > 0,
             has_next: self.pure_rust.page_index + 1 < total_pages,
         };
-        Ok(self.empty_action(None))
+        self.empty_action(None)
     }
 
     fn recover_transposition(
@@ -3101,6 +3420,7 @@ impl EngineState {
             let confirmed = self.pure_rust.confirmed_prefix.len();
             self.apply_rime_snapshot(snapshot, false, false, clipboard, imported, retention);
             if self.pure_rust.confirmed_prefix.len() > confirmed {
+                self.settle_undo_regret(Some(canonical), retention);
                 let compact = |code: &str| code.replace(['\'', ' '], "");
                 let before = compact(&before);
                 let tail = compact(&self.raw_input);
@@ -3112,6 +3432,36 @@ impl EngineState {
             self.clear_composition_state();
         }
         None
+    }
+
+    pub(crate) fn select_candidate_action(
+        &mut self,
+        index: usize,
+        clipboard: &ClipboardManager,
+        imported: &ImportedLexiconIndex,
+        retention: &mut RetentionEngine,
+    ) -> Result<InputAction, VitralError> {
+        let allow_micro_space = !self.is_passthrough_active() && !self.is_clipboard_shortcut_candidate(index);
+        let eligible = allow_micro_space && self.component_code().is_none() && !self.raw_input.is_empty()
+            && self.raw_input.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'\'')
+            && self.current_candidates.get(index).is_some_and(|item| {
+                !item.text.is_empty() && item.text.chars().all(crate::ret::is_cjk)
+                    && item.function_action.is_none() && item.quick_paste_id.is_none()
+            });
+        let previous_char = self.last_committed_char;
+        #[cfg(all(target_os = "linux", feature = "native-rime"))]
+        let native = self.rime_input_start.is_some();
+        let committed = self.select_candidate_on_backend(index, clipboard, imported, retention)?;
+        let action = self.commit_action(committed, allow_micro_space);
+        if eligible && self.last_committed_code.as_ref().is_some_and(|code| !code.is_empty()) {
+            self.undo_commit = action.commit_text.clone().map(|text| UndoCommit {
+                text,
+                previous_char,
+                #[cfg(all(target_os = "linux", feature = "native-rime"))]
+                native,
+            });
+        }
+        Ok(action)
     }
 
     pub(crate) fn select_candidate_on_backend(
@@ -3126,6 +3476,12 @@ impl EngineState {
         })?;
 
         match origin {
+            CandidateOrigin::Components { canonical, commit_text, .. } => {
+                self.settle_undo_regret(Some(&canonical), retention);
+                self.clear_composition_state();
+                self.reset_commit_context();
+                Ok(Some(commit_text))
+            }
             CandidateOrigin::Overlay {
                 commit_text,
                 is_clipboard,
@@ -3142,6 +3498,9 @@ impl EngineState {
                     self.learn_current_candidate(&canonical, index, imported, retention);
                     let code = self.raw_input.clone();
                     self.track_phrase_selection(&canonical, &code, true, imported, retention);
+                } else {
+                    self.settle_undo_regret(Some(&canonical), retention);
+                    self.reset_commit_context();
                 }
                 self.clear_composition_state();
                 Ok(Some(final_commit))
@@ -3300,8 +3659,24 @@ impl EngineState {
     }
 
     pub fn empty_action(&mut self, commit_text: Option<String>) -> InputAction {
+        self.commit_action(commit_text, true)
+    }
+
+    pub(crate) fn commit_action(&mut self, mut commit_text: Option<String>, allow_micro_space: bool) -> InputAction {
+        if allow_micro_space && self.config.auto_micro_space && self.lang_mode == LangMode::Zh {
+            if let (Some(previous), Some(text)) = (self.last_committed_char, commit_text.as_mut()) {
+                let starts_cjk = text.chars().next().is_some_and(crate::ret::is_cjk);
+                let english_word = !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphabetic());
+                if (previous.is_ascii_alphanumeric() && starts_cjk)
+                    || (crate::ret::is_cjk(previous) && english_word)
+                {
+                    text.insert(0, ' ');
+                }
+            }
+        }
         if let Some(ch) = commit_text.as_deref().and_then(|text| text.chars().next_back()) {
-            self.last_committed_char = Some(ch);
+            self.undo_commit = None;
+            self.last_committed_char = (!ch.is_whitespace()).then_some(ch);
             if !crate::ret::is_cjk(ch) {
                 self.reset_commit_context();
             }
@@ -3329,6 +3704,8 @@ impl EngineState {
                 retroactive_slots: Vec::new(),
             },
             commit_text,
+            undo_commit_chars: 0,
+            undo_commit_text: None,
             candidates: page_items,
             page: self.current_page.clone(),
             paired_punctuation: None,
@@ -5100,6 +5477,102 @@ mod personalization_tests {
     }
 
     #[test]
+    fn app_rules_preserve_language_memory_and_control_paired_punctuation() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let terminal = r"C:\Windows\System32\PowerShell.EXE";
+        assert_eq!(e.on_app_focus(terminal).unwrap().lang_mode, LangMode::En);
+        e.toggle_lang_mode();
+        let remembered = e.on_app_focus(terminal).unwrap();
+        assert!(remembered.remembered);
+        assert_eq!(remembered.lang_mode, LangMode::Zh);
+        let mut key = |e: &mut EngineState, ch| {
+            e.process_key(ch as u32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap()
+        };
+        let single = key(&mut e, '(');
+        assert_eq!(single.commit_text.as_deref(), Some("("));
+        assert!(single.paired_punctuation.is_none());
+        assert_eq!(single.cursor_delta, 0);
+        e.config.disable_paired_punct_in_ide = false;
+        assert_eq!(key(&mut e, '(').commit_text.as_deref(), Some("()"));
+
+        e.config.auto_english_for_dev_apps = false;
+        e.config.default_english_apps = vec!["My-Editor".into()];
+        e.config.disable_paired_punct_apps = vec!["dev.scratch".into()];
+        assert_eq!(e.on_app_focus("kitty").unwrap().lang_mode, LangMode::Zh);
+        assert_eq!(e.on_app_focus("/usr/bin/my-editor-preview").unwrap().lang_mode, LangMode::En);
+        assert_eq!(e.on_app_focus("Dev.Scratch.Preview").unwrap().lang_mode, LangMode::Zh);
+        assert_eq!(key(&mut e, '[').commit_text.as_deref(), Some("["));
+        e.config.disable_paired_punct_in_ide = true;
+        e.on_app_focus("/opt/idea/bin/idea64.exe").unwrap();
+        assert_eq!(key(&mut e, '{').commit_text.as_deref(), Some("{"));
+    }
+
+    #[test]
+    fn quote_style_handles_pairs_single_fallback_and_pinyin_separator() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let mut key = |e: &mut EngineState, ch| {
+            e.process_key(ch as u32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap()
+        };
+        assert_eq!(key(&mut e, '"').commit_text.as_deref(), Some("“”"));
+        assert_eq!(key(&mut e, '\'').commit_text.as_deref(), Some("‘’"));
+        e.config = EngineConfig::parse_json(r#"{"quote_style":"corner"}"#).unwrap();
+        for (ch, pair) in [('"', "「」"), ('\'', "『』")] {
+            let action = key(&mut e, ch);
+            assert_eq!(action.commit_text.as_deref(), Some(pair));
+            assert_eq!(action.paired_punctuation.as_deref(), Some(pair));
+            assert_eq!(action.cursor_delta, -1);
+        }
+        key(&mut e, 'x');
+        assert!(key(&mut e, '\'').commit_text.is_none());
+        assert!(e.raw_input.ends_with('\''));
+        e.clear_composition_state();
+        e.on_app_focus("pycharm").unwrap();
+        assert_eq!(key(&mut e, '"').commit_text.as_deref(), Some("「"));
+        assert!(EngineConfig::parse_json(r#"{"quote_style":"straight"}"#).is_err());
+    }
+
+    #[test]
+    fn micro_space_applies_to_mixed_language_commits_and_skips_passthrough() {
+        let (mut e, clip, imp, mut r) = fixture();
+        let mut key = |e: &mut EngineState, ch| {
+            e.process_key(ch as u32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap()
+        };
+        assert_eq!(key(&mut e, '7').commit_text.as_deref(), Some("7"));
+        offer(&mut e, "中文", "zhongwen");
+        assert_eq!(key(&mut e, ' ').commit_text.as_deref(), Some("中文"));
+        e.config.auto_micro_space = true;
+        offer(&mut e, "OpenAI", "openai");
+        assert_eq!(key(&mut e, ' ').commit_text.as_deref(), Some(" OpenAI"));
+        offer(&mut e, "中文", "zhongwen");
+        assert_eq!(key(&mut e, ' ').commit_text.as_deref(), Some(" 中文"));
+        for ch in "Rust".chars() {
+            key(&mut e, ch);
+        }
+        assert_eq!(key(&mut e, ' ').commit_text.as_deref(), Some("Rust"));
+        offer(&mut e, "中文", "zhongwen");
+        assert_eq!(key(&mut e, ' ').commit_text.as_deref(), Some(" 中文"));
+        e.toggle_lang_mode();
+        assert_eq!(key(&mut e, 'a').commit_text.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn deleting_a_committed_digit_clears_micro_spacing_context() {
+        let (mut e, clip, imp, mut r) = fixture();
+        e.config.auto_micro_space = true;
+        for host_feedback in [false, true] {
+            e.process_key('7' as u32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            if host_feedback {
+                e.notify_deleted_chars(1);
+            } else {
+                e.process_key(0x08, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            }
+            offer(&mut e, "中文", "zhongwen");
+            let action = e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(action.commit_text.as_deref(), Some("中文"));
+        }
+    }
+
+    #[test]
     fn repeated_consecutive_commits_synthesize_phrase_for_both_schemas() {
         let (mut e, clip, imp, mut r) = fixture();
         for _ in 0..2 {
@@ -5129,8 +5602,239 @@ mod personalization_tests {
     }
 
     #[test]
+    fn undo_candidate_commit_restores_quanpin_and_xiaohe_once() {
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "nihao"),
+            (SchemaKind::DoublePinyinFlypy, "nihc"),
+        ] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.set_schema(schema);
+            e.config.auto_micro_space = true;
+            e.last_committed_char = Some('1');
+            offer(&mut e, "你好", code);
+            let commit = e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+            let original = commit.commit_text.unwrap();
+            assert_eq!(original, " 你好");
+
+            let undo = e.process_key(0xff08, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(undo.undo_commit_text.as_deref(), Some(original.as_str()));
+            assert_eq!(undo.undo_commit_chars, 3);
+            assert_eq!(undo.preedit.text, code);
+            assert_eq!(undo.preedit.cursor_utf8, code.len());
+            assert!(!undo.candidates.is_empty());
+            assert!(e.last_committed_word.is_none());
+            assert!(e.last_committed_code.is_none());
+            assert!(r.code_preferences[code].contains_key("你好"));
+
+            let edit = e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(edit.preedit.text, &code[..code.len() - 1]);
+            assert!(edit.undo_commit_text.is_none());
+            assert_eq!(edit.undo_commit_chars, 0);
+        }
+    }
+
+    #[test]
+    fn undo_regret_is_saved_only_after_a_different_selection_or_raw_commit() {
+        for (key, next_word, penalized) in [
+            (0x1b, None, false),
+            (0x20, Some("你好"), false),
+            (0x20, Some("拟好"), true),
+            (0x0d, None, true),
+        ] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.set_schema(SchemaKind::RimeIce);
+            offer(&mut e, "前", "qian");
+            e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+            offer(&mut e, "你好", "nihao");
+            e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+            let before = serde_json::to_value(&r).unwrap();
+            let session_cache = r.session_cache.clone();
+            let undo = e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(undo.undo_commit_text.as_deref(), Some("你好"));
+            assert_eq!(serde_json::to_value(&r).unwrap(), before);
+            assert_eq!(r.session_cache, session_cache);
+
+            if let Some(word) = next_word {
+                offer(&mut e, word, "nihao");
+            }
+            let action = e.process_key(key, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert!(e.pending_undo_regret.is_none());
+            assert!(action.preedit.text.is_empty());
+            if penalized {
+                assert!(r.frecency["你好"] <= 0.5);
+                assert!(!r.code_preferences["nihao"].contains_key("你好"));
+                assert_eq!(r.context_bigrams["前"]["你好"], 0.5);
+            } else if key == 0x1b {
+                assert_eq!(serde_json::to_value(&r).unwrap(), before);
+                assert_eq!(r.session_cache, session_cache);
+            } else {
+                assert!(r.frecency["你好"] > 1.0);
+                assert!(r.code_preferences["nihao"].contains_key("你好"));
+            }
+        }
+    }
+
+    #[test]
+    fn idle_space_and_host_deletion_clear_micro_space_boundary() {
+        for deleted_by_host in [false, true] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.config.auto_micro_space = true;
+            assert_eq!(e.empty_action(Some("A".into())).commit_text.as_deref(), Some("A"));
+            if deleted_by_host {
+                e.notify_deleted_chars(1);
+            } else {
+                let space = e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+                assert_eq!(space.commit_text.as_deref(), Some(" "));
+            }
+            assert_eq!(e.last_committed_char, None);
+            offer(&mut e, "你好", "nihc");
+            let commit = e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+            assert_eq!(commit.commit_text.as_deref(), Some("你好"));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
+    fn undo_candidate_commit_replays_native_rime_input() {
+        let (mut e, clip, imp, mut r) = fixture();
+        e.resolved_assets_dir = resolve_assets_dir("");
+        for (schema, code) in [
+            (SchemaKind::RimeIce, "nihao"),
+            (SchemaKind::DoublePinyinFlypy, "nihc"),
+        ] {
+            e.set_schema(schema);
+            type_code(&mut e, code, &clip, &imp, &mut r);
+            assert!(e.rime_input_start.is_some());
+            let index = e.current_candidates.iter().position(|c| c.text == "你好").unwrap();
+            let commit = e.select_candidate_action(index, &clip, &imp, &mut r).unwrap();
+            assert_eq!(commit.commit_text.as_deref(), Some("你好"));
+            let undo = e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(undo.undo_commit_text.as_deref(), Some("你好"));
+            assert_eq!(e.raw_input, code);
+            assert_eq!(e.raw_cursor, code.len());
+            assert!(e.rime_input_start.is_some());
+            assert!(!undo.candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn undo_candidate_commit_excludes_clipboard_and_punctuation() {
+        let (mut e, mut clip, imp, mut r) = fixture();
+        let state = clip.push(crate::clip::ClipboardPayload {
+            id: None,
+            content: "剪贴板".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 1,
+        });
+        clip.pin(&state.ring[0].id, Some("ksb")).unwrap();
+
+        offer(&mut e, "你好", "nihao");
+        e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+        type_code(&mut e, "ksb", &clip, &imp, &mut r);
+        let shortcut = e.current_candidates.iter().position(|c| c.is_clipboard_shortcut).unwrap();
+        let paste = e.select_candidate_action(shortcut, &clip, &imp, &mut r).unwrap();
+        assert_eq!(paste.commit_text.as_deref(), Some("剪贴板"));
+        assert_eq!(e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap().undo_commit_chars, 0);
+
+        offer(&mut e, "你好", "nihao");
+        e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+        e.process_key(',' as u32, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+        assert_eq!(e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap().undo_commit_chars, 0);
+
+        offer(&mut e, "你好", "nihao");
+        e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+        e.last_committed_ms = RetentionEngine::now_epoch_ms().saturating_sub(5001);
+        assert_eq!(e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap().undo_commit_chars, 0);
+    }
+
+    #[test]
+    fn component_lookup_accepts_only_the_schema_prefix_and_skips_learning() {
+        for (schema, prefix) in [
+            (SchemaKind::RimeIce, "u"),
+            (SchemaKind::DoublePinyinFlypy, "u'"),
+        ] {
+            let (mut e, clip, imp, mut r) = fixture();
+            e.set_schema(schema);
+            e.resolved_assets_dir = resolve_assets_dir("");
+            if schema == SchemaKind::DoublePinyinFlypy {
+                for code in ["u", "ui", "uo", "un", "ua", "ue", "uu"] {
+                    type_code(&mut e, code, &clip, &imp, &mut r);
+                    assert!(e.component_code().is_none(), "{code}");
+                    assert!(!e.current_candidates.is_empty(), "{code}");
+                    e.clear_composition_state();
+                }
+                for (code, word) in [("uuru", "输入"), ("uujv", "数据"), ("uufa", "书法")] {
+                    type_code(&mut e, code, &clip, &imp, &mut r);
+                    assert!(e.component_code().is_none(), "{code}");
+                    assert!(e.current_candidates.iter().any(|c| c.text == word), "{code}: {:?}", e.current_candidates);
+                    e.clear_composition_state();
+                }
+            }
+            for (code, word, comment) in [
+                ("riyue", "明", "míng · mk"),
+                ("huohuo", "炎", "yán · yj"),
+                ("huohuohuo", "焱", "yàn · yj"),
+                ("shuishuishui", "淼", "miǎo · mn"),
+            ] {
+                let raw = format!("{prefix}{code}");
+                type_code(&mut e, &raw, &clip, &imp, &mut r);
+                let candidate = e.current_candidates.iter().find(|c| c.text == word)
+                    .unwrap_or_else(|| panic!("{raw}: {:?}", e.current_candidates));
+                assert_eq!(candidate.comment, comment);
+                let seq = r.crdt_seq;
+                let commit = e.select_candidate_action(candidate.index, &clip, &imp, &mut r).unwrap();
+                assert_eq!(commit.commit_text.as_deref(), Some(word));
+                assert_eq!(r.crdt_seq, seq);
+                assert!(!r.frecency.contains_key(word));
+                assert!(e.undo_commit.is_none());
+            }
+            let raw = format!("{prefix}riyue");
+            type_code(&mut e, &raw, &clip, &imp, &mut r);
+            let edited = e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(edited.preedit.text, &raw[..raw.len() - 1]);
+            let result = e.process_key(13, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+            assert_eq!(result.commit_text.as_deref(), Some(edited.preedit.text.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_rare_homophone_needs_repeated_selection_or_a_pin_to_overtake() {
+        let (mut e, clip, imp, mut r) = fixture();
+        e.config.platform = "android".into();
+        e.pure_rust.typo_correction_level = TypoCorrectionLevel::Off;
+        let now = RetentionEngine::now_epoch_ms();
+        let candidate_rank = |e: &mut EngineState, r: &mut RetentionEngine| {
+            e.clear_composition_state();
+            e.raw_input = "ni".into();
+            e.raw_cursor = 2;
+            let action = e.process_key_pure_rust(0, &clip, &imp, r).unwrap();
+            action.candidates
+        };
+        let rank = |candidates: &[CandidateItem], word| {
+            candidates.iter().position(|c| c.text == word).unwrap()
+        };
+        let initial = candidate_rank(&mut e, &mut r);
+        let common = rank(&initial, "你");
+        let rare = rank(&initial, "妮");
+        assert!(common < rare);
+        e.select_candidate_action(rare, &clip, &imp, &mut r).unwrap();
+        let once = candidate_rank(&mut e, &mut r);
+        assert!(rank(&once, "你") < rank(&once, "妮"), "{once:?}");
+
+        r.pin_word("妮");
+        assert_eq!(candidate_rank(&mut e, &mut r)[0].text, "妮");
+        r.pinned_words.remove("妮");
+        for _ in 0..3 {
+            r.record_contextual_selection("妮", "ni", None, None, now, 1.0, true);
+        }
+        assert_eq!(candidate_rank(&mut e, &mut r)[0].text, "妮");
+    }
+
+    #[test]
     fn backspace_regret_corrects_original_context_and_preference() {
         let (mut e, clip, imp, mut r) = fixture();
+        e.config.undo_commit_on_backspace = false;
         for (word, code) in [("前", "qian"), ("尼", "ni")] {
             offer(&mut e, word, code);
             e.process_key(32, 0, SwipeDir::None, &clip, &imp, &mut r)

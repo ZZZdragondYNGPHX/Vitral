@@ -95,3 +95,71 @@ internal fun applyShortcutEditorKey(current: String, key: String): String =
             }
         }
     }
+
+internal fun clipboardPreviewText(content: String, maxChars: Int = 220): String {
+    val flattened = content.take(maxChars + 32).replace(Regex("[\\r\\n\\t]+"), " ").trim()
+    return if (content.length > maxChars || flattened.length > maxChars) {
+        flattened.take(maxChars).trimEnd() + "…"
+    } else {
+        flattened
+    }
+}
+
+internal fun filterClipboardItems(
+    items: List<ClipboardItemSnapshot>,
+    query: String,
+    preset: String = "all",
+): List<ClipboardItemSnapshot> {
+    val q = query.trim().lowercase()
+    return items.filter { item ->
+        val matchesPreset =
+            when (preset) {
+                "pinned" -> item.pinned
+                "links" ->
+                    item.content.contains("http://", ignoreCase = true) ||
+                        item.content.contains("https://", ignoreCase = true) ||
+                        item.content.contains("www.", ignoreCase = true)
+                "numbers" -> Regex("\\d{4,}").containsMatchIn(item.content)
+                else -> true
+            }
+        val matchesQuery =
+            q.isEmpty() ||
+                item.content.lowercase().contains(q) ||
+                (item.shortcutCode?.lowercase()?.contains(q) == true)
+        matchesPreset && matchesQuery
+    }
+}
+
+private val SEGMENT_REGEX =
+    Regex(
+        "https?://[^\\s]+|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}|[A-Za-z0-9_./:-]+|[\\u4E00-\\u9FFF]+|[^\\s\\u4E00-\\u9FFFA-Za-z0-9]+",
+    )
+
+/** Big-Bang clipboard segmenter: keeps URLs/emails/codes/numbers intact and splits long CJK runs cleanly. */
+internal fun tokenizeClipboardSegments(text: String, maxSegments: Int = 48): List<String> {
+    val bounded = text.take(1500)
+    val result = ArrayList<String>()
+    for (match in SEGMENT_REGEX.findAll(bounded)) {
+        if (result.size >= maxSegments) break
+        val token = match.value.trim()
+        if (token.isEmpty()) continue
+        val allCjk = token.all { it in '\u4E00'..'\u9FFF' }
+        if (allCjk && token.length > 4) {
+            var idx = 0
+            while (idx < token.length && result.size < maxSegments) {
+                val rem = token.length - idx
+                val step =
+                    when {
+                        rem <= 4 -> rem
+                        rem == 5 -> 2
+                        else -> 3
+                    }
+                result.add(token.substring(idx, idx + step))
+                idx += step
+            }
+        } else {
+            result.add(token)
+        }
+    }
+    return result
+}

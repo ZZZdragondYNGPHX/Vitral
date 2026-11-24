@@ -66,4 +66,32 @@ class ClipboardPanelStateTest {
         val longCode = (1..24).fold("") { acc, _ -> applyShortcutEditorKey(acc, "a") }
         assertEquals(MAX_SHORTCUT_CODE_LENGTH, longCode.length)
     }
+
+    @Test
+    fun clipboardFilterPreviewAndTokenizeHandleLongTextAndSegments() {
+        val items =
+            listOf(
+                ClipboardItemSnapshot("1", "订单号 SF1234567890 请查收", pinned = false, shortcutCode = null),
+                ClipboardItemSnapshot("2", "https://example.com/docs/vitral", pinned = true, shortcutCode = "doc"),
+            )
+        assertEquals(listOf("2"), filterClipboardItems(items, "doc").map { it.id })
+        assertEquals(listOf("2"), filterClipboardItems(items, "", preset = "links").map { it.id })
+        assertEquals(listOf("1"), filterClipboardItems(items, "", preset = "numbers").map { it.id })
+
+        val huge = "甲".repeat(500)
+        val preview = clipboardPreviewText(huge, maxChars = 100)
+        assertTrue(preview.length <= 101)
+        assertTrue(preview.endsWith("…"))
+
+        val segs = tokenizeClipboardSegments("快递单号 SF1234567890 链接 https://vitral.dev/a")
+        assertTrue("SF1234567890" in segs)
+        assertTrue("https://vitral.dev/a" in segs)
+        assertTrue("快递单号" in segs)
+
+        val singleAscii = tokenizeClipboardSegments("A 组 7 号")
+        assertTrue("A" in singleAscii)
+        assertTrue("7" in singleAscii)
+        assertTrue("组" in singleAscii)
+        assertTrue("号" in singleAscii)
+    }
 }

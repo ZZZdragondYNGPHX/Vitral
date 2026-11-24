@@ -135,11 +135,31 @@
 
           <div class="row">
             <div class="row-copy">
-              <label for="fuzzy-pinyin-toggle">模糊音容错</label>
-              <p class="help">支持平翘舌（z/zh、c/ch、s/sh）、前后鼻音（an/ang、en/eng、in/ing）及 l/n、f/h 互通</p>
+              <label for="fuzzy-pinyin-toggle">模糊音容错（全拼 / 小鹤双拼）</label>
+              <p class="help">支持平翘舌、前后鼻音及 l/n、f/h 互通；不选具体分组时默认全部启用，也可按需勾选</p>
+              <div id="fuzzy-pairs-group" class="chip-row" style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px" hidden>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="zh_z"> zh/z</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="ch_c"> ch/c</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="sh_s"> sh/s</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="n_l"> n/l</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="f_h"> f/h</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="an_ang"> an/ang</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="en_eng"> en/eng</label>
+                <label class="chip-check"><input type="checkbox" data-fuzzy-pair="in_ing"> in/ing</label>
+              </div>
             </div>
             <div class="row-ctrl">
               <input id="fuzzy-pinyin-toggle" class="switch" name="fuzzy_pinyin" type="checkbox">
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="undo-commit-toggle">误上屏退格还原拼音</label>
+              <p class="help">刚按空格或数字选错词后，5 秒内按 Backspace 直接撤回并恢复原拼音串重选（桌面键盘还支持全拼 <code>u</code> / 双拼 <code>u'</code> 部件拆字反查，如 <code>uriyue</code> / <code>u'riyue</code> → 明）</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="undo-commit-toggle" class="switch" name="undo_commit_on_backspace" type="checkbox" checked>
             </div>
           </div>
 
@@ -176,6 +196,52 @@
                 </select>
                 <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
               </div>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="quote-style-select">中文引号风格</label>
+              <p class="help">支持传统弯引号（“” / ‘’）或直角引号（「」 / 『』）</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="select-wrap">
+                <select id="quote-style-select" name="quote_style">
+                  <option value="curly" selected>弯引号（“” / ‘’）</option>
+                  <option value="corner">直角引号（「」 / 『』）</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="micro-space-toggle">中英自动微空格</label>
+              <p class="help">在中英文混输切换边界自动插入半角空格（不影响网址与代码直通）</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="micro-space-toggle" class="switch" name="auto_micro_space" type="checkbox">
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="dev-english-toggle">终端与开发工具首次默认英文</label>
+              <p class="help">首次切入终端或 Vim/Neovim 时自动设为英文；手动切换后仍按你的记忆优先</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="dev-english-toggle" class="switch" name="auto_english_for_dev_apps" type="checkbox" checked>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="ide-punct-toggle">代码编辑器自动关闭成对括号</label>
+              <p class="help">在 VS Code、JetBrains、终端等自带括号补全的软件中避免重复打出成对符号</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="ide-punct-toggle" class="switch" name="disable_paired_punct_in_ide" type="checkbox" checked>
             </div>
           </div>
 
@@ -472,9 +538,11 @@
 
           <div class="actions">
             <button type="button" data-action="poll-services" class="online btn-accent-soft">立即同步</button>
+            <button type="button" data-action="sync-status" class="btn-ghost">检查同步链路</button>
             <button type="button" data-action="storage" class="online btn-ghost">查看云盘用量</button>
             <button type="button" data-action="restore-from-koofr" class="online btn-ghost">一键从云端恢复</button>
           </div>
+          <dl id="sync-health" class="usage-grid" hidden></dl>
           <dl id="usage" class="usage-grid" hidden></dl>
         </article>
 

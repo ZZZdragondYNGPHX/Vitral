@@ -404,9 +404,15 @@ impl ClipboardManager {
     pub fn observe_cloud_ring(&mut self, entries: Vec<ClipboardEntry>, _first_read: bool) -> bool {
         let current_changed = entries.iter().max_by_key(|e| copy_order(e))
             .is_some_and(|newest| self.observe_current(newest.clone()));
-        self.ring.clear();
-        for entry in entries.into_iter().rev() { self.push_ring_entry(entry); }
+        self.replace_ring(entries);
         current_changed
+    }
+
+    pub(crate) fn replace_ring(&mut self, entries: Vec<ClipboardEntry>) {
+        self.ring.clear();
+        for entry in entries.into_iter().rev() {
+            self.push_ring_entry(entry);
+        }
     }
 
     pub fn restore_ring_cold_boot(&mut self, entries: Vec<ClipboardEntry>) {

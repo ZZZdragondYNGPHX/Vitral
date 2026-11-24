@@ -359,7 +359,23 @@ class SettingsActivity : ComponentActivity() {
                 )
             }
             var fuzzyPinyin by remember { mutableStateOf(config.optBoolean("fuzzy_pinyin", false)) }
+            var fuzzyPairs by remember {
+                val arr = config.optJSONArray("fuzzy_pinyin_pairs")
+                val initial = LinkedHashSet<String>()
+                if (arr != null) {
+                    for (i in 0 until arr.length()) {
+                        arr.optString(i).takeIf { it.isNotEmpty() }?.let { initial.add(it) }
+                    }
+                }
+                mutableStateOf(initial.toSet())
+            }
+            var undoCommitOnBackspace by remember {
+                mutableStateOf(config.optBoolean("undo_commit_on_backspace", true))
+            }
             var typoLevel by remember { mutableStateOf(config.optString("typo_correction_level", "standard")) }
+            var quoteStyle by remember { mutableStateOf(config.optString("quote_style", "curly")) }
+            var autoMicroSpace by remember { mutableStateOf(config.optBoolean("auto_micro_space", false)) }
+            var hapticStrength by remember { mutableStateOf(config.optString("mobile_haptic_strength", "medium")) }
             var openccMode by remember { mutableStateOf(config.optString("opencc_mode", "simplified")) }
             var sublabelMode by remember { mutableStateOf(config.optString("mobile_sublabel_mode", "dual")) }
             var keyboardHeight by remember { mutableStateOf(config.optString("mobile_keyboard_height", "standard")) }
@@ -380,6 +396,7 @@ class SettingsActivity : ComponentActivity() {
             var profileDistillEnabled by remember { mutableStateOf(config.optBoolean("profile_distill_enabled", true)) }
             var profileState by remember { mutableStateOf<JSONObject?>(null) }
             var offline by remember { mutableStateOf(config.optBoolean("pure_offline")) }
+            var syncHealth by remember { mutableStateOf<JSONObject?>(null) }
             var capacity by remember { mutableFloatStateOf(config.optInt("clipboard_ring_capacity", 50).toFloat()) }
 
             // Models & AI State
@@ -413,7 +430,12 @@ class SettingsActivity : ComponentActivity() {
                 config
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
                     .put("fuzzy_pinyin", fuzzyPinyin)
+                    .put("fuzzy_pinyin_pairs", JSONArray(fuzzyPairs.toList()))
+                    .put("undo_commit_on_backspace", undoCommitOnBackspace)
                     .put("typo_correction_level", typoLevel)
+                    .put("quote_style", quoteStyle)
+                    .put("auto_micro_space", autoMicroSpace)
+                    .put("mobile_haptic_strength", hapticStrength)
                     .put("opencc_mode", openccMode)
                     .put("theme", themeMode)
                     .put("mobile_sublabel_mode", sublabelMode)
@@ -454,6 +476,9 @@ class SettingsActivity : ComponentActivity() {
             fun refreshClipboard() {
                 Core.call(this@SettingsActivity, "clipboard-state", background = true) { r ->
                     r.onSuccess { clipboardState = it as? JSONObject }
+                }
+                Core.call(this@SettingsActivity, "sync-status", background = true) { r ->
+                    r.onSuccess { syncHealth = it as? JSONObject }
                 }
             }
 
@@ -779,13 +804,76 @@ class SettingsActivity : ComponentActivity() {
 
                                         Spacer(Modifier.height(10.dp))
                                         GlassToggleRow(
-                                            "模糊音容错",
-                                            "平翘舌（z/zh、c/ch、s/sh）、前后鼻音（an/ang、en/eng、in/ing）及 l/n、f/h 互通",
+                                            "模糊音容错（全拼 / 小鹤双拼）",
+                                            "不勾选下方分组时默认全开，也可按个人口音只勾选需要的音对",
                                             checked = fuzzyPinyin,
                                             showDivider = false,
                                             onCheckedChange = {
                                                 fuzzyPinyin = it
                                                 persistConfig(if (it) "已开启模糊音容错" else "已关闭模糊音容错")
+                                            },
+                                        )
+                                        if (fuzzyPinyin) {
+                                            val allPairs =
+                                                listOf(
+                                                    "zh_z" to "zh/z",
+                                                    "ch_c" to "ch/c",
+                                                    "sh_s" to "sh/s",
+                                                    "n_l" to "n/l",
+                                                    "f_h" to "f/h",
+                                                    "an_ang" to "an/ang",
+                                                    "en_eng" to "en/eng",
+                                                    "in_ing" to "in/ing",
+                                                )
+                                            Spacer(Modifier.height(6.dp))
+                                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                                allPairs.chunked(4).forEach { rowPairs ->
+                                                    Row(
+                                                        Modifier.fillMaxWidth(),
+                                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                    ) {
+                                                        rowPairs.forEach { (id, labelText) ->
+                                                            val active = id in fuzzyPairs
+                                                            Box(
+                                                                modifier =
+                                                                    Modifier
+                                                                        .weight(1f)
+                                                                        .clip(RoundedCornerShape(10.dp))
+                                                                        .background(
+                                                                            if (active) palette.accentSoft
+                                                                            else palette.elevated,
+                                                                        )
+                                                                        .clickable {
+                                                                            fuzzyPairs =
+                                                                                if (active) fuzzyPairs - id
+                                                                                else fuzzyPairs + id
+                                                                            persistConfig("模糊音分组已更新")
+                                                                        }
+                                                                        .padding(vertical = 7.dp),
+                                                                contentAlignment = Alignment.Center,
+                                                            ) {
+                                                                Text(
+                                                                    labelText,
+                                                                    fontSize = 12.sp,
+                                                                    fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
+                                                                    color = if (active) palette.accentText else palette.textSecondary,
+                                                                )
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        Spacer(Modifier.height(10.dp))
+                                        GlassToggleRow(
+                                            "误上屏退格还原拼音",
+                                            "刚选错词后 5 秒内按退格直接撤回并恢复原拼音重选（键盘还支持全拼 u / 双拼 u' 部件拆字）",
+                                            checked = undoCommitOnBackspace,
+                                            showDivider = false,
+                                            onCheckedChange = {
+                                                undoCommitOnBackspace = it
+                                                persistConfig(if (it) "已开启退格还原拼音" else "已关闭退格还原拼音")
                                             },
                                         )
 
@@ -819,6 +907,30 @@ class SettingsActivity : ComponentActivity() {
                                         )
 
                                         Spacer(Modifier.height(14.dp))
+                                        Text("中文引号风格", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassSegmentedControl(
+                                            options = listOf("curly" to "弯引号（“”）", "corner" to "直角引号（「」）"),
+                                            selected = quoteStyle,
+                                            onSelect = {
+                                                quoteStyle = it
+                                                persistConfig(if (it == "corner") "已切换直角引号" else "已切换弯引号")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(10.dp))
+                                        GlassToggleRow(
+                                            "中英自动微空格",
+                                            "在中英文混输切换边界自动插入半角空格（不影响网址直通）",
+                                            checked = autoMicroSpace,
+                                            showDivider = false,
+                                            onCheckedChange = {
+                                                autoMicroSpace = it
+                                                persistConfig(if (it) "已开启中英自动微空格" else "已关闭中英自动微空格")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(14.dp))
                                         Text("键帽副标风格", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
                                         Spacer(Modifier.height(6.dp))
                                         GlassSegmentedControl(
@@ -827,6 +939,18 @@ class SettingsActivity : ComponentActivity() {
                                             onSelect = {
                                                 sublabelMode = it
                                                 persistConfig("键帽样式已更新")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(14.dp))
+                                        Text("按键震动反馈", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = palette.textPrimary)
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassSegmentedControl(
+                                            options = listOf("off" to "关闭", "light" to "轻柔", "medium" to "标准", "strong" to "强劲"),
+                                            selected = hapticStrength,
+                                            onSelect = {
+                                                hapticStrength = it
+                                                persistConfig("震动反馈已更新")
                                             },
                                         )
 
@@ -1126,7 +1250,7 @@ class SettingsActivity : ComponentActivity() {
                                         }
                                     }
 
-                                    // Offline Mode Hero Toggle
+                                    // Offline Mode Toggle
                                     GlassPanel(tinted = offline) {
                                         GlassToggleRow(
                                             "纯离线模式",
@@ -1138,6 +1262,57 @@ class SettingsActivity : ComponentActivity() {
                                                 persistConfig(if (it) "已进入纯离线模式" else "已恢复网络协同")
                                             },
                                         )
+                                    }
+
+                                    // Sync Health & Android 10+ Background Helper Card
+                                    GlassPanel {
+                                        GlassSectionHeader(
+                                            "跨端同步链路与后台增强",
+                                            "Android 10+ 后台复制限制：可将「Vitral 剪贴板同步」添加到下拉快捷磁贴，或通过系统分享菜单直发跨端",
+                                            trailing = {
+                                                GlassButton(
+                                                    "刷新",
+                                                    style = GlassButtonStyle.Ghost,
+                                                    onClick = {
+                                                        refreshClipboard()
+                                                        showToast("已刷新同步链路状态")
+                                                    },
+                                                )
+                                            },
+                                        )
+                                        syncHealth?.let { st ->
+                                            val lanErr =
+                                                if (st.isNull("last_lan_error")) ""
+                                                else st.optString("last_lan_error", "")
+                                            val cloudErr =
+                                                if (st.isNull("last_cloud_error")) ""
+                                                else st.optString("last_cloud_error", "")
+                                            val lanLabel =
+                                                when {
+                                                    st.optBoolean("pure_offline") -> "纯离线阻断"
+                                                    lanErr.isNotEmpty() -> "异常：$lanErr"
+                                                    else -> "${st.optInt("lan_peer_count")} 台节点"
+                                                }
+                                            val cloudLabel =
+                                                when {
+                                                    st.optBoolean("pure_offline") -> "纯离线阻断"
+                                                    !st.optBoolean("cloud_configured") -> "未配置"
+                                                    cloudErr.isNotEmpty() -> "异常：$cloudErr"
+                                                    else -> "正常"
+                                                }
+                                            Row(
+                                                Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                            ) {
+                                                UsageTile("局域网", lanLabel, Modifier.weight(1f))
+                                                UsageTile("私有云", cloudLabel, Modifier.weight(1f))
+                                                UsageTile(
+                                                    "本地快照",
+                                                    "${st.optInt("backup_count")} 份",
+                                                    Modifier.weight(1f),
+                                                )
+                                            }
+                                        }
                                     }
 
                                     // Koofr WebDAV Sync

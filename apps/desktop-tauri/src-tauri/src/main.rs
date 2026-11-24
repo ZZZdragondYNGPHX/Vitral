@@ -40,9 +40,27 @@ fn public_settings(mut cfg: Value) -> Value {
         "prediction_enabled",
         "profile_distill_enabled",
         "ai_prefer_local",
+        "auto_english_for_dev_apps",
+        "disable_paired_punct_in_ide",
+        "undo_commit_on_backspace",
     ] {
         if cfg.get(key).is_none() {
             cfg[key] = json!(true);
+        }
+    }
+    if cfg.get("auto_micro_space").is_none() {
+        cfg["auto_micro_space"] = json!(false);
+    }
+    if cfg.get("quote_style").is_none() {
+        cfg["quote_style"] = json!("curly");
+    }
+    for key in [
+        "default_english_apps",
+        "disable_paired_punct_apps",
+        "fuzzy_pinyin_pairs",
+    ] {
+        if cfg.get(key).is_none() {
+            cfg[key] = json!([]);
         }
     }
     if cfg.get("prediction_delay_ms").is_none() {
@@ -110,9 +128,41 @@ async fn save_settings(app: tauri::AppHandle, patch: Value) -> Result<Value, Str
                     fields.insert(key.clone(), json!(bindings));
                     continue;
                 }
-                "adaptive_learning" | "learn_from_clipboard" | "prediction_enabled" | "profile_distill_enabled" => {
+                "adaptive_learning"
+                | "learn_from_clipboard"
+                | "prediction_enabled"
+                | "profile_distill_enabled"
+                | "auto_english_for_dev_apps"
+                | "disable_paired_punct_in_ide"
+                | "auto_micro_space"
+                | "undo_commit_on_backspace" => {
                     if !value.is_boolean() {
-                        return Err("学习设置应为开启或关闭".into());
+                        return Err("该开关设置应为开启或关闭".into());
+                    }
+                }
+                "fuzzy_pinyin_pairs" => {
+                    const VALID_FUZZY: &[&str] = &[
+                        "zh_z", "ch_c", "sh_s", "n_l", "f_h", "an_ang", "en_eng", "in_ing",
+                    ];
+                    if !value.as_array().is_some_and(|arr| {
+                        arr.iter().all(|v| {
+                            v.as_str().is_some_and(|pair| VALID_FUZZY.contains(&pair))
+                        })
+                    }) {
+                        return Err("模糊音分组包含无效项".into());
+                    }
+                }
+                "quote_style" => {
+                    if !matches!(value.as_str(), Some("curly" | "corner")) {
+                        return Err("引号风格应为弯引号或直角引号".into());
+                    }
+                }
+                "default_english_apps" | "disable_paired_punct_apps" => {
+                    if !value
+                        .as_array()
+                        .is_some_and(|arr| arr.iter().all(|v| v.is_string()))
+                    {
+                        return Err("应用规则列表应为字符串数组".into());
                     }
                 }
                 "fuzzy_pinyin" => {

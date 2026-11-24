@@ -1,6 +1,6 @@
 use super::raster::{global_bbox, StrokeStats};
 use super::StrokePoint;
-use crate::imp::ImportedLexiconIndex;
+use crate::imp::{polyphone::RimeDictCorpus, xiaohe, ImportedLexiconIndex};
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -28,8 +28,10 @@ pub struct IdsIndex {
     by_pair: HashMap<(IdcOp, char, char), Vec<char>>,
     /// char -> (IdcOp, raw_a, raw_b)
     by_char: HashMap<char, (IdcOp, char, char)>,
-    /// Fallback from radical_pinyin.dict.yaml: (first_syl, second_syl) -> Vec<char>
+    by_triple: HashMap<(char, char, char), Vec<char>>,
     by_radical_pinyin: HashMap<(String, String), Vec<char>>,
+    /// Compact readings from radical_pinyin.dict.yaml (two or three components).
+    by_component_code: HashMap<String, Vec<char>>,
 }
 
 static IDS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<IdsIndex>>>> = OnceLock::new();
@@ -162,6 +164,18 @@ impl IdsIndex {
                 }
                 for raw_seq in parts {
                     let seq = raw_seq.split('[').next().unwrap_or("").trim();
+                    let mut leaves = seq.chars();
+                    if matches!(leaves.next(), Some('⿲' | '⿳')) {
+                        if let (Some(a), Some(b), Some(c), None) =
+                            (leaves.next(), leaves.next(), leaves.next(), leaves.next())
+                        {
+                            if [a, b, c].into_iter().all(is_cjk_ideograph) {
+                                idx.by_triple.entry((
+                                    canonical_radical(a), canonical_radical(b), canonical_radical(c),
+                                )).or_default().push(ch);
+                            }
+                        }
+                    }
                     if let Some((op, a, b)) = parse_binary_ids(seq) {
                         idx.by_char.entry(ch).or_insert((op, a, b));
                         let key_exact = (op, a, b);
@@ -182,7 +196,12 @@ impl IdsIndex {
         }
 
         let rad_path = dir.join("rime").join("radical_pinyin.dict.yaml");
-        if let Ok(content) = fs::read_to_string(&rad_path) {
+        let dictionary = fs::read_to_string(&rad_path).or_else(|error| {
+            dir.parent().map_or(Err(error), |parent| {
+                fs::read_to_string(parent.join("rime").join("radical_pinyin.dict.yaml"))
+            })
+        });
+        if let Ok(content) = dictionary {
             let mut in_body = false;
             for line in content.lines() {
                 let t = line.trim();
@@ -210,11 +229,16 @@ impl IdsIndex {
                     continue;
                 }
                 let parts: Vec<&str> = code_str.trim().split('\'').collect();
-                if parts.len() == 2 {
-                    idx.by_radical_pinyin
-                        .entry((parts[0].to_string(), parts[1].to_string()))
-                        .or_default()
-                        .push(ch);
+                if (2..=3).contains(&parts.len()) && parts.iter().all(|syl| {
+                    !syl.is_empty() && syl.bytes().all(|byte| byte.is_ascii_lowercase())
+                }) {
+                    idx.by_component_code.entry(parts.concat()).or_default().push(ch);
+                    if let [first, second] = parts.as_slice() {
+                        idx.by_radical_pinyin
+                            .entry((first.to_string(), second.to_string()))
+                            .or_default()
+                            .push(ch);
+                    }
                 }
             }
             for list in idx.by_radical_pinyin.values_mut() {
@@ -227,7 +251,7 @@ impl IdsIndex {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.by_char.is_empty() && self.by_radical_pinyin.is_empty()
+        self.by_char.is_empty() && self.by_component_code.is_empty()
     }
 
     pub fn lookup_pair(&self, op: IdcOp, a: char, b: char) -> Vec<char> {
@@ -270,6 +294,81 @@ impl IdsIndex {
             .get(&(sa, sb))
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn lookup_component_code(&self, code: &str, corpus: &RimeDictCorpus) -> Vec<char> {
+        if let Some(matches) = self.by_component_code.get(code) {
+            return matches.clone();
+        }
+        if code.len() < 2 || code.len() > 18 || self.by_pair.is_empty() {
+            return Vec::new();
+        }
+
+        let syllables = xiaohe::canonical_syllable_set();
+        let components = |reading: &str| -> Vec<char> {
+            if !syllables.contains(reading) {
+                return Vec::new();
+            }
+            let mut chars: Vec<_> = corpus.spaced_pinyin_words(reading)
+                .filter_map(|(text, _)| {
+                    let mut chars = text.chars();
+                    let ch = chars.next()?;
+                    chars.next().is_none().then(|| canonical_radical(ch))
+                })
+                .collect();
+            chars.sort_unstable();
+            chars.dedup();
+            chars
+        };
+        let mut matches = Vec::new();
+        for split in 1..code.len() {
+            let (first, rest) = code.split_at(split);
+            let first = components(first);
+            if first.is_empty() {
+                continue;
+            }
+            let second = components(rest);
+            self.match_component_pairs(&first, &second, &mut matches);
+
+            for split in 1..rest.len() {
+                let (second, third) = rest.split_at(split);
+                let second = components(second);
+                let third = components(third);
+                if second.is_empty() || third.is_empty() {
+                    continue;
+                }
+                let mut head = Vec::new();
+                let mut tail = Vec::new();
+                self.match_component_pairs(&first, &second, &mut head);
+                self.match_component_pairs(&second, &third, &mut tail);
+                self.match_component_pairs(&head, &third, &mut matches);
+                self.match_component_pairs(&first, &tail, &mut matches);
+                for &a in &first {
+                    for &b in &second {
+                        for &c in &third {
+                            if let Some(triple) = self.by_triple.get(&(a, b, c)) {
+                                matches.extend(triple);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        matches.sort_by_key(|&c| (cjk_block_priority(c), c as u32));
+        matches.dedup();
+        matches
+    }
+
+    fn match_component_pairs(&self, first: &[char], second: &[char], matches: &mut Vec<char>) {
+        for &a in first {
+            for &b in second {
+                for op in [IdcOp::LeftRight, IdcOp::TopBottom, IdcOp::Other] {
+                    if let Some(pair) = self.by_pair.get(&(op, a, b)) {
+                        matches.extend(pair);
+                    }
+                }
+            }
+        }
     }
 
     pub fn char_decomposition(&self, ch: char) -> Option<(IdcOp, char, char)> {

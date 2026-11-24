@@ -92,6 +92,17 @@ pub struct VoiceResult {
     pub sample_count: usize,
 }
 
+impl VoiceResult {
+    pub(crate) fn empty(sample_count: usize) -> Self {
+        Self {
+            transcript: String::new(),
+            language: "auto".into(),
+            duration_ms: sample_count as u64 / 16,
+            sample_count,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiInlineResult {
     pub mode: AiMode,
@@ -126,6 +137,14 @@ impl VoiceSession {
         recognize_pcm(&samples, &self.model_paths, &SpeechContext::default())
     }
 
+    pub(crate) fn preview_slice(&self) -> &[i16] {
+        const MAX_PREVIEW_SAMPLES: usize = 15 * 16_000;
+        if !self.active {
+            return &[];
+        }
+        &self.samples[self.samples.len().saturating_sub(MAX_PREVIEW_SAMPLES)..]
+    }
+
     pub(crate) fn finish(&mut self) -> Result<Vec<i16>, VitralError> {
         if !self.active {
             return Err(VitralError::NotInitialized);
@@ -135,23 +154,61 @@ impl VoiceSession {
     }
 }
 
+pub(crate) fn trim_silence_vad(samples: &[i16]) -> Option<&[i16]> {
+    const FRAME: usize = 320;
+    const PADDING: usize = 8 * FRAME;
+    const MIN_SPEECH_RMS: f64 = 150.0;
+    const MIN_PEAK_RMS: f64 = 250.0;
+
+    let mut first = None;
+    let mut end = 0;
+    let mut speech_frames = 0;
+    let mut peak_rms = 0.0_f64;
+    for (index, frame) in samples.chunks(FRAME).enumerate() {
+        let power = frame.iter().map(|&s| f64::from(s).powi(2)).sum::<f64>();
+        // Treat an incomplete final frame as zero-padded.
+        let rms = (power / FRAME as f64).sqrt();
+        peak_rms = peak_rms.max(rms);
+        if rms >= MIN_SPEECH_RMS {
+            let start = index * FRAME;
+            first.get_or_insert(start);
+            end = start + frame.len();
+            speech_frames += 1;
+        }
+    }
+    if speech_frames < 3 || peak_rms < MIN_PEAK_RMS {
+        return None;
+    }
+    let start = first?.saturating_sub(PADDING);
+    Some(&samples[start..end.saturating_add(PADDING).min(samples.len())])
+}
+
+pub(crate) fn sanitize_asr_transcript(raw: &str) -> String {
+    let text = raw.trim();
+    let content: Vec<_> = text.chars().filter(|c| c.is_alphanumeric()).collect();
+    let repeated = (1..=3).any(|len| {
+        content.len() >= 6 * len && content.chunks(len).all(|part| part == &content[..len])
+    });
+    if content.is_empty() || repeated {
+        String::new()
+    } else {
+        text.to_owned()
+    }
+}
+
 pub(crate) fn recognize_pcm(
     samples: &[i16],
     paths: &crate::models::ModelPaths,
     ctx: &SpeechContext,
 ) -> Result<VoiceResult, VitralError> {
-    let mut result = VoiceResult {
-        transcript: String::new(),
-        language: "auto".into(),
-        duration_ms: samples.len() as u64 / 16,
-        sample_count: samples.len(),
-    };
+    let mut result = VoiceResult::empty(samples.len());
     // Keep each inference bounded even for continuous recorder input.
     for chunk in samples.chunks(30 * 16_000) {
-        if chunk.len() < 400 || chunk.iter().all(|s| s.unsigned_abs() < 64) {
+        let Some(chunk) = trim_silence_vad(chunk) else {
             continue;
-        }
+        };
         let (text, lang) = SpeechRecognizer::transcribe(chunk, paths, ctx)?;
+        let text = sanitize_asr_transcript(&text);
         if !text.is_empty() {
             if result
                 .transcript
@@ -165,6 +222,10 @@ pub(crate) fn recognize_pcm(
                 result.language = lang;
             }
         }
+    }
+    result.transcript = sanitize_asr_transcript(&result.transcript);
+    if result.transcript.is_empty() {
+        result.language = "auto".into();
     }
     Ok(result)
 }
@@ -533,6 +594,66 @@ pub fn phonetic_correct_transcript(
 #[cfg(test)]
 mod qwen_tests {
     use super::*;
+
+    #[test]
+    fn vad_rejects_silence_weak_noise_and_short_spikes() {
+        assert!(trim_silence_vad(&[]).is_none());
+        assert!(trim_silence_vad(&[0; 16_000]).is_none());
+        let noise: Vec<_> = (0..16_000).map(|i| (i % 161) as i16 - 80).collect();
+        assert!(trim_silence_vad(&noise).is_none());
+        assert!(trim_silence_vad(&[180; 16_000]).is_none());
+        let mut spike = [0; 16_000];
+        spike[320..960].fill(i16::MIN);
+        assert!(trim_silence_vad(&spike).is_none());
+    }
+
+    #[test]
+    fn vad_preserves_padding_and_internal_pauses() {
+        const FRAME: usize = 320;
+        let mut samples = vec![0; 60 * FRAME];
+        samples[12 * FRAME..15 * FRAME].fill(900);
+        samples[30 * FRAME..33 * FRAME].fill(-900);
+        let trimmed = trim_silence_vad(&samples).unwrap();
+        let expected = &samples[4 * FRAME..41 * FRAME];
+        assert_eq!(trimmed.as_ptr(), expected.as_ptr());
+        assert_eq!(trimmed, expected);
+
+        let unpadded = &samples[12 * FRAME..33 * FRAME];
+        assert_eq!(trim_silence_vad(unpadded), Some(unpadded));
+    }
+
+    #[test]
+    fn transcript_filter_removes_empty_output_and_short_token_loops() {
+        for raw in [
+            "  \t\n",
+            "。，？！…「」",
+            "嗯嗯嗯嗯嗯嗯",
+            "你好，你好，你好，你好，你好，你好。",
+            "abc abc abc abc abc abc!",
+        ] {
+            assert!(sanitize_asr_transcript(raw).is_empty(), "{raw:?}");
+        }
+        for raw in ["嗯嗯嗯嗯嗯", "今天想想，明天再说。", "重复 重复 重复 重复 重复 重复 完毕"] {
+            assert_eq!(sanitize_asr_transcript(raw), raw);
+        }
+        assert_eq!(sanitize_asr_transcript("  你好，Vitral！ \n"), "你好，Vitral！");
+    }
+
+    #[test]
+    fn voice_preview_slice_borrows_only_the_latest_fifteen_seconds() {
+        let mut session = VoiceSession::default();
+        session.start();
+        session.push_pcm(&[1, 2]).unwrap();
+        session.push_pcm(&vec![3; 240_000]).unwrap();
+        let preview = session.preview_slice();
+        assert_eq!(preview.len(), 240_000);
+        assert!(preview.iter().all(|&sample| sample == 3));
+        assert!(session.active);
+        assert_eq!(&session.samples[..2], &[1, 2]);
+        assert_eq!(session.finish().unwrap().len(), 240_002);
+        assert!(session.preview_slice().is_empty());
+    }
+
     #[cfg(feature = "native-voice")]
     #[test]
     fn speech_cache_clear_keeps_active_handle_alive() {

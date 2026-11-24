@@ -17,6 +17,66 @@
 using Microsoft::WRL::ComPtr;
 using namespace vitral::tokens;
 namespace {
+class ScopedPanelDpi {
+  using SetContext = DPI_AWARENESS_CONTEXT(WINAPI *)(DPI_AWARENESS_CONTEXT);
+  static SetContext setContext() {
+    static auto fn = reinterpret_cast<SetContext>(GetProcAddress(
+        GetModuleHandleW(L"user32.dll"), "SetThreadDpiAwarenessContext"));
+    return fn;
+  }
+  DPI_AWARENESS_CONTEXT previous = nullptr;
+
+public:
+  ScopedPanelDpi() {
+    if (auto set = setContext()) {
+      previous = set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+      if (!previous)
+        previous = set(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
+    }
+  }
+  ~ScopedPanelDpi() {
+    if (previous)
+      setContext()(previous);
+  }
+  bool perMonitor() const { return previous != nullptr; }
+};
+
+UINT windowDpi(HWND hwnd) {
+  using GetDpi = UINT(WINAPI *)(HWND);
+  static auto getDpi = reinterpret_cast<GetDpi>(
+      GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"));
+  return getDpi && hwnd ? getDpi(hwnd) : 0;
+}
+
+UINT monitorDpi(HMONITOR monitor, HWND fallback) {
+  using GetDpi = HRESULT(WINAPI *)(HMONITOR, int, UINT *, UINT *);
+  struct ShcoreModule {
+    HMODULE handle = LoadLibraryExW(L"Shcore.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    ~ShcoreModule() {
+      if (handle)
+        FreeLibrary(handle);
+    }
+  };
+  static const ShcoreModule shcore;
+  static const auto getDpi = shcore.handle
+      ? reinterpret_cast<GetDpi>(GetProcAddress(shcore.handle, "GetDpiForMonitor"))
+      : nullptr;
+  UINT x = 0, y = 0;
+  if (getDpi && SUCCEEDED(getDpi(monitor, 0, &x, &y)) && x)
+    return x;
+  const UINT dpi = windowDpi(fallback);
+  return dpi ? dpi : 96;
+}
+
+bool coversMonitor(HWND hwnd, const RECT &monitor) {
+  if ((GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION) == WS_CAPTION)
+    return false;
+  RECT bounds{};
+  return GetWindowRect(hwnd, &bounds) && bounds.left <= monitor.left &&
+         bounds.top <= monitor.top && bounds.right >= monitor.right &&
+         bounds.bottom >= monitor.bottom;
+}
+
 const CLSID clsid = {0x7c9e6679,
                      0x7425,
                      0x40de,
@@ -158,10 +218,21 @@ struct Panel {
   std::string preedit;
   const ThemePalette *palette = &currentPalette();
   RECT caret{};
+  UINT dpi = 96;
+  float scale = 1.f;
   ULONGLONG last = GetTickCount64(), glow = 0;
   Candidate candidates[5];
   int totalChoiceWidth = 100;
   std::vector<float> points;
+  int px(float dip) const { return static_cast<int>(std::lround(dip * scale)); }
+  void setDpi(UINT next) {
+    if (dpi == next)
+      return;
+    dpi = next;
+    scale = next / 96.f;
+    status.invalidate();
+    choices.invalidate();
+  }
   void send(int op, int index = 0, const wchar_t *text = nullptr) {
     event(owner, op, index, text, nullptr, 0);
   }
@@ -210,7 +281,7 @@ struct Panel {
       choices.invalidate();
     }
   }
-  int hitChoice(int x) const {
+  int hitChoice(float x) const {
     for (int i = 0; i < count; i++) {
       if (x >= candidates[i].left && x <= candidates[i].right)
         return i;
@@ -308,6 +379,8 @@ void Surface::paint() {
   if (!GetClientRect(wnd, &client) || IsRectEmpty(&client))
     return;
   const int w = client.right, h = client.bottom;
+  const float scale = panel->scale;
+  const float dipWidth = w / scale, dipHeight = h / scale;
   const auto &pal = *panel->palette;
   if (status && faded != panel->idle) {
     ComPtr<IDCompositionEffectGroup> alpha;
@@ -333,7 +406,10 @@ void Surface::paint() {
     for (int i : {selected, nextSelected}) {
       if (i >= 0) {
         const auto &c = panel->candidates[i];
-        RECT bounds{(LONG)c.left - 1, 2, (LONG)c.right + 1, 40};
+        RECT bounds{(LONG)std::floor((c.left - 1.f) * scale),
+                    (LONG)std::floor(2.f * scale),
+                    (LONG)std::ceil((c.right + 1.f) * scale),
+                    (LONG)std::ceil(40.f * scale)};
         UnionRect(&cells, &cells, &bounds);
       }
     }
@@ -373,16 +449,16 @@ void Surface::paint() {
       D2D1_RENDER_TARGET_TYPE_DEFAULT,
       D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
                         D2D1_ALPHA_MODE_PREMULTIPLIED),
-      96, 96);
+      (float)panel->dpi, (float)panel->dpi);
   HRESULT painted =
       panel->d2d->CreateDxgiSurfaceRenderTarget(dx.Get(), props, &rt);
   if (SUCCEEDED(painted)) {
     rt->BeginDraw();
     rt->SetTransform(D2D1::Matrix3x2F::Translation(
-        float(origin.x - damage.left), float(origin.y - damage.top)));
-    rt->PushAxisAlignedClip(D2D1::RectF((float)damage.left, (float)damage.top,
-                                        (float)damage.right,
-                                        (float)damage.bottom),
+        (origin.x - damage.left) / scale, (origin.y - damage.top) / scale));
+    rt->PushAxisAlignedClip(D2D1::RectF(damage.left / scale, damage.top / scale,
+                                        damage.right / scale,
+                                        damage.bottom / scale),
                             D2D1_ANTIALIAS_MODE_ALIASED);
     rt->Clear(D2D1::ColorF(0, 0.f));
     ComPtr<ID2D1SolidColorBrush> b;
@@ -393,9 +469,9 @@ void Surface::paint() {
                                  c.alpha * alphaScale));
       };
       float rad =
-          status ? (std::min)((float)radius::kDesktopStatusCapsulePx, h / 2.f)
+          status ? (std::min)((float)radius::kDesktopStatusCapsulePx, dipHeight / 2.f)
                  : (float)radius::kDesktopCandidateWindowPx;
-      auto rr = D2D1::RoundedRect(D2D1::RectF(1, 1, (float)w - 1, (float)h - 1),
+      auto rr = D2D1::RoundedRect(D2D1::RectF(1, 1, dipWidth - 1, dipHeight - 1),
                                   rad, rad);
       color(status ? pal.surface_panel : pal.surface_popover);
       rt->FillRoundedRectangle(rr, b.Get());
@@ -424,7 +500,7 @@ void Surface::paint() {
         for (int i = 0; i < panel->count; i++) {
           const auto &candidate = panel->candidates[i];
           const float left = candidate.left, right = candidate.right;
-          if (right + 1 <= damage.left || left - 1 >= damage.right)
+          if ((right + 1.f) * scale <= damage.left || (left - 1.f) * scale >= damage.right)
             continue;
           const bool activeItem = i == nextSelected;
           if (activeItem) {
@@ -450,29 +526,29 @@ void Surface::paint() {
         if (panel->ink) {
           // Recessed handwriting surface + subtle guide lines
           auto padRect =
-              D2D1::RoundedRect(D2D1::RectF(10.f, 44.f, (float)w - 10.f, (float)h - 10.f),
+              D2D1::RoundedRect(D2D1::RectF(10.f, 44.f, dipWidth - 10.f, dipHeight - 10.f),
                                 12.f, 12.f);
           color(pal.surface_key_function);
           rt->FillRoundedRectangle(padRect, b.Get());
           color(pal.border_specular, 0.7f);
           rt->DrawRoundedRectangle(padRect, b.Get(), 1.f);
 
-          const float midX = w * 0.5f;
-          const float midY = 44.f + (h - 54.f) * 0.5f;
+          const float midX = dipWidth * 0.5f;
+          const float midY = 44.f + (dipHeight - 54.f) * 0.5f;
           color(pal.text_secondary, 0.22f);
-          rt->DrawLine({20.f, midY}, {(float)w - 20.f, midY}, b.Get(), 1.f);
-          rt->DrawLine({midX, 54.f}, {midX, (float)h - 20.f}, b.Get(), 1.f);
+          rt->DrawLine({20.f, midY}, {dipWidth - 20.f, midY}, b.Get(), 1.f);
+          rt->DrawLine({midX, 54.f}, {midX, dipHeight - 20.f}, b.Get(), 1.f);
 
           color(pal.ink_stroke_primary);
           auto &p = panel->points;
           for (size_t i = 3; i + 2 < p.size(); i += 3)
-            rt->DrawLine({p[i - 3] * w, 44.f + p[i - 2] * (h - 54.f)},
-                         {p[i] * w, 44.f + p[i + 1] * (h - 54.f)}, b.Get(),
+            rt->DrawLine({p[i - 3] * dipWidth, 44.f + p[i - 2] * (dipHeight - 54.f)},
+                         {p[i] * dipWidth, 44.f + p[i + 1] * (dipHeight - 54.f)}, b.Get(),
                          (float)handwriting::kStrokeWidthPx);
         }
         if (nextGlow) {
           color(pal.retroactive_fix_glow);
-          rt->DrawLine({12.f, 40.f}, {(float)w - 12.f, 40.f}, b.Get(), 2.2f);
+          rt->DrawLine({12.f, 40.f}, {dipWidth - 12.f, 40.f}, b.Get(), 2.2f);
         }
       }
     }
@@ -522,38 +598,68 @@ void Surface::show(int x, int y, int w, int h) {
     redraw();
 }
 void Panel::place() {
+  ScopedPanelDpi dpiContext;
   auto fg = GetForegroundWindow();
+  const auto foregroundMonitor = MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST);
   MONITORINFO mi{sizeof(mi)};
-  GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY), &mi);
-  RECT fgbox{};
-  GetWindowRect(fg, &fgbox);
-  if (!active || !fg || EqualRect(&mi.rcMonitor, &fgbox)) {
+  if (!active || !fg || !GetMonitorInfoW(foregroundMonitor, &mi)) {
     ShowWindow(status.wnd, SW_HIDE);
     ShowWindow(choices.wnd, SW_HIDE);
     return;
   }
-  auto a = mi.rcWork;
-  int sw = 88;
+  const bool fullscreen = coversMonitor(fg, mi.rcMonitor);
+  const bool hasCaret = caret.left || caret.top || caret.right || caret.bottom;
+  auto monitor = foregroundMonitor;
+  if (hasCaret) {
+    const POINT anchor{caret.left, caret.bottom};
+    const auto caretMonitor = MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST);
+    if (caretMonitor != monitor && GetMonitorInfoW(caretMonitor, &mi))
+      monitor = caretMonitor;
+  }
+  if (!status.wnd || MonitorFromWindow(status.wnd, MONITOR_DEFAULTTONULL) != monitor) {
+    setDpi(monitorDpi(monitor, fg));
+  } else {
+    const UINT measured = dpiContext.perMonitor() ? windowDpi(status.wnd) : 0;
+    setDpi(measured ? measured : monitorDpi(monitor, fg));
+  }
+  const auto a = mi.rcWork;
   POINT mouse{};
   GetCursorPos(&mouse);
   bool was_idle = idle;
   idle = GetTickCount64() - last >= motion::kDesktopIdleFadeDelayMs;
   if (idle != was_idle)
     status.redraw();
-  bool edge =
-      idle && !(mouse.x >= a.right - sw - 14 && mouse.y >= a.bottom - 65);
-  status.show(edge ? a.right - sw / 2 : a.right - sw - 14, a.bottom - 54, sw,
-              40);
+  const auto placeStatus = [&] {
+    const int sw = px(88);
+    const int margin = px(14);
+    const bool edge = idle && !(mouse.x >= a.right - sw - margin && mouse.y >= a.bottom - px(65));
+    status.show(edge ? a.right - sw / 2 : a.right - sw - margin, a.bottom - px(54),
+                sw, px(40));
+  };
+  if (fullscreen)
+    ShowWindow(status.wnd, SW_HIDE);
+  else
+    placeStatus();
+  // The panel HWND reports effective monitor DPI even in a DPI-unaware TSF host.
+  if (const UINT measured = dpiContext.perMonitor() && status.wnd &&
+                                    MonitorFromWindow(status.wnd, MONITOR_DEFAULTTONULL) == monitor
+                                ? windowDpi(status.wnd)
+                                : 0;
+      measured && measured != dpi) {
+    setDpi(measured);
+    if (!fullscreen)
+      placeStatus();
+  }
   if (!ink && !count) {
     ShowWindow(choices.wnd, SW_HIDE);
     return;
   }
-  int w = ink ? (std::max)(360, totalChoiceWidth) : totalChoiceWidth;
-  int h = ink ? 216 : 44;
-  int x = caret.right || caret.bottom ? caret.left : a.right - w - 14;
-  int y = caret.bottom ? caret.bottom + 4 : a.bottom - h - 66;
+  int w = px(ink ? (std::max)(360, totalChoiceWidth) : totalChoiceWidth);
+  int h = px(ink ? 216 : 44);
+  int x = hasCaret ? caret.left : a.right - w - px(14);
+  int y = hasCaret ? caret.bottom + px(4) : a.bottom - h - px(66);
   if (y + h > a.bottom)
-    y = caret.top - h - 4;
+    y = caret.top - h - px(4);
   choices.show(
       std::clamp(x, (int)a.left, (std::max)((int)a.left, (int)a.right - w)),
       std::clamp(y, (int)a.top, (std::max)((int)a.top, (int)a.bottom - h)), w,
@@ -621,8 +727,8 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
     return 0;
   }
   case WM_MOUSEMOVE:
-    if (!s->status && !p.ink && y <= 44) {
-      int idx = p.hitChoice(x);
+    if (!s->status && !p.ink && y <= p.px(44)) {
+      int idx = p.hitChoice(x / p.scale);
       if (idx >= 0 && p.selected != idx)
         p.send(10, idx);
     }
@@ -630,14 +736,14 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
   case WM_LBUTTONDOWN: {
     p.last = GetTickCount64();
     if (s->status) {
-      if (x < 36)
+      if (x < p.px(36))
         PostMessageW(win, WM_RBUTTONUP, 0, lp);
       else
         p.send(1);
       return 0;
     }
-    if (y <= 44) {
-      int idx = p.hitChoice(x);
+    if (y <= p.px(44)) {
+      int idx = p.hitChoice(x / p.scale);
       if (idx >= 0)
         p.send(0, idx);
       return 0;
@@ -659,7 +765,7 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
     GetClientRect(win, &r);
     p.points.insert(p.points.end(),
                     {std::clamp(float(x) / r.right, 0.f, 1.f),
-                     std::clamp(float(y - 44) / (std::max)(1L, r.bottom - 54),
+                     std::clamp(float(y - p.px(44)) / (std::max)(1L, r.bottom - p.px(54)),
                                 0.f, 1.f),
                      float(GetTickCount64() % 600000)});
     s->invalidate();
@@ -673,6 +779,17 @@ LRESULT CALLBACK procedure(HWND win, UINT msg, WPARAM wp, LPARAM lp) {
   return DefWindowProcW(win, msg, wp, lp);
 }
 } // namespace
+extern "C" void vitral_physical_caret(HWND hwnd, RECT *caret) {
+  using ToPhysical = BOOL(WINAPI *)(HWND, LPPOINT);
+  static auto convert = reinterpret_cast<ToPhysical>(GetProcAddress(
+      GetModuleHandleW(L"user32.dll"), "LogicalToPhysicalPointForPerMonitorDPI"));
+  if (!convert || !hwnd ||
+      !(caret->left || caret->top || caret->right || caret->bottom))
+    return;
+  POINT start{caret->left, caret->top}, end{caret->right, caret->bottom};
+  if (convert(hwnd, &start) && convert(hwnd, &end))
+    *caret = RECT{start.x, start.y, end.x, end.y};
+}
 extern "C" HRESULT vitral_register(bool install) {
   HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(init) && init != RPC_E_CHANGED_MODE)
@@ -698,6 +815,7 @@ extern "C" void *vitral_panel_open(void *owner, Event event) {
   wc.lpszClassName = L"Vitral.Tsf.Panel";
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   RegisterClassW(&wc);
+  ScopedPanelDpi dpiContext;
   for (auto s : {&p->status, &p->choices}) {
     HWND win = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
                                    WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP,
