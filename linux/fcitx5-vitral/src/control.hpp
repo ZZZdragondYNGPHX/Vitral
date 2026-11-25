@@ -51,12 +51,24 @@ private:
       if (command == "panel-state")
         return sd_bus_reply_method_return(msg, "s", self.state_().c_str());
       const bool fullSync = command == "poll-services" || command == "clipboard-poll";
-      if (fullSync || command == "clipboard-poll-current" ||
-          command == "clipboard-push" || command == "clipboard-pin" ||
-          command == "clipboard-unpin" || command == "clipboard-clear-unpinned") {
+      const bool asyncNetworkOrHeavy =
+          command == "storage" || command == "relay-send" ||
+          command == "relay-poll-inbox" || command == "relay-cleanup-orphans" ||
+          command == "relay-discover" || command == "restore-from-koofr" ||
+          command == "models-download" || command == "models-refresh-catalog" ||
+          command == "ai-inline" || command == "profile-distill" ||
+          command == "voice-preview" || command == "voice-stop" ||
+          command == "import-lexicon";
+      if (fullSync || asyncNetworkOrHeavy ||
+          command == "clipboard-poll-current" || command == "clipboard-push" ||
+          command == "clipboard-pin" || command == "clipboard-unpin" ||
+          command == "clipboard-clear-unpinned" ||
+          command == "models-cancel" || command == "models-delete") {
         {
           std::lock_guard lock(self.serviceMutex_);
-          auto &queue = fullSync ? self.fullSyncQueue_ : self.queued_;
+          auto &queue = fullSync             ? self.fullSyncQueue_
+                        : asyncNetworkOrHeavy ? self.asyncQueue_
+                                              : self.queued_;
           queue.emplace_back(msg, std::move(command), args);
           sd_bus_message_ref(msg);
         }
@@ -183,6 +195,9 @@ private:
       std::jthread fullSync([this, fd = wake.fd()](std::stop_token stop) {
         runServices(stop, fd, fullSyncQueue_);
       });
+      std::jthread asyncWork([this, fd = wake.fd()](std::stop_token stop) {
+        runServices(stop, fd, asyncQueue_);
+      });
       using Clock = std::chrono::steady_clock;
       constexpr auto clipboardInterval = std::chrono::milliseconds(40);
       auto nextClipboardCheck = Clock::now();
@@ -199,14 +214,17 @@ private:
       }
       service.request_stop();
       fullSync.request_stop();
+      asyncWork.request_stop();
       service.join();
       fullSync.join();
+      asyncWork.join();
       replyCompleted();
       std::list<ServiceCall> pending;
       {
         std::lock_guard lock(serviceMutex_);
         pending.swap(queued_);
         pending.splice(pending.end(), fullSyncQueue_);
+        pending.splice(pending.end(), asyncQueue_);
       }
       for (auto &call : pending) {
         sd_bus_reply_method_errorf(call.message, "dev.vitral.IME.Error",
@@ -227,6 +245,6 @@ private:
   std::function<std::string()> state_;
   std::mutex serviceMutex_;
   std::condition_variable_any serviceReady_;
-  std::list<ServiceCall> queued_, fullSyncQueue_, completed_;
+  std::list<ServiceCall> queued_, fullSyncQueue_, asyncQueue_, completed_;
   std::jthread thread_;
 };

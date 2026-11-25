@@ -123,6 +123,32 @@ public:
     QJsonObject cfg;
     if (file.open(QIODevice::ReadOnly))
       cfg = QJsonDocument::fromJson(file.readAll()).object();
+    for (auto it = cfg.begin(); it != cfg.end();) {
+      if (it.value().isNull())
+        it = cfg.erase(it);
+      else
+        ++it;
+    }
+    if (cfg.value("known_devices").isArray()) {
+      QJsonArray cleanedDevices;
+      for (const auto &entry : cfg.value("known_devices").toArray()) {
+        if (!entry.isObject()) {
+          cleanedDevices.append(entry);
+          continue;
+        }
+        auto dev = entry.toObject();
+        for (auto it = dev.begin(); it != dev.end();) {
+          if (it.value().isNull())
+            it = dev.erase(it);
+          else
+            ++it;
+        }
+        cleanedDevices.append(dev);
+      }
+      cfg.insert("known_devices", cleanedDevices);
+    }
+    if (!cfg.contains("frecency_half_life_sec"))
+      cfg.insert("frecency_half_life_sec", 604800);
     predictionDelay_ =
         std::clamp(cfg.value("prediction_delay_ms").toInt(380), 150, 2000);
     predictionEnabled_ = cfg.value("prediction_enabled").toBool(true);
@@ -163,8 +189,9 @@ public:
           }
           auto epoch = payload["editor"].toInt(-1);
           auto text = payload["text"].toString().toStdString();
-          dispatcher_.schedule([this, epoch, cmd = std::move(cmd),
-                                text = std::move(text)] {
+          const bool clipboardCommit = payload["clipboard_commit"].toBool(false);
+          dispatcher_.schedule([this, epoch, clipboardCommit,
+                                cmd = std::move(cmd), text = std::move(text)] {
             auto *ic = instance_->lastFocusedInputContext();
             if (epoch != editor_ || !ic || !ic->hasFocus() ||
                 instance_->inputMethod(ic) != "vitral")
@@ -188,13 +215,18 @@ public:
               if (composing_)
                 unpack(vitral_process_key(core_, FcitxKey_Escape, 0,
                                          VITRAL_SWIPE_DIR_NONE));
+              command("reset-commit-context", {});
+              lastCommitCursor_ = -1;
+              lastCommitBefore_.clear();
+              lastCommitAfter_.clear();
               composing_ = false;
               hasPrev_ = hasNext_ = false;
               ic->inputPanel().reset();
               ic->updatePreedit();
               ic->updateUserInterface(UserInterfaceComponent::InputPanel);
               ic->commitString(text);
-              schedulePrediction("live", predictionDelay_);
+              if (!clipboardCommit)
+                schedulePrediction("live", predictionDelay_);
             } else {
               ic->inputPanel().setClientPreedit(
                   Text(text, TextFormatFlag::Underline));
@@ -220,6 +252,19 @@ public:
               .toJson(QJsonDocument::Compact)
               .toStdString();
         });
+    capabilityWatch_ = instance_->watchEvent(
+        EventType::InputContextCapabilityChanged, EventWatcherPhase::Default,
+        [this](Event &event) {
+          auto &icEvent = static_cast<InputContextEvent &>(event);
+          auto *ic = icEvent.inputContext();
+          if (active_.load() && ic && ic == instance_->lastFocusedInputContext() &&
+              instance_->inputMethod(ic) == "vitral") {
+            const bool sensitive =
+                ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive);
+            if (sensitive != lastFocusSensitive_.load())
+              syncFocusState(ic);
+          }
+        });
     startPanel();
   }
 
@@ -244,6 +289,7 @@ public:
   ~Engine() override {
     if (panelPid_ > 0)
       ::kill(static_cast<pid_t>(panelPid_), SIGTERM);
+    capabilityWatch_.reset();
     cancelPrediction(nullptr);
     control_.reset();
     if (aiWorker_.joinable())
@@ -251,22 +297,42 @@ public:
     vitral_shutdown(core_);
   }
 
-  void activate(const InputMethodEntry &, InputContextEvent &event) override {
-    auto *ic = event.inputContext();
-    ++editor_;
-    active_ = true;
-    ++activity_;
-    startPanel();
-    auto focus = unpack(vitral_on_app_focus(
-        core_, ic->program().empty() ? "desktop" : ic->program().c_str()));
+  void syncFocusState(InputContext *ic) {
+    const bool wasSensitive = lastFocusSensitive_.load();
+    const bool sensitive =
+        ic && ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive);
+    lastFocusSensitive_.store(sensitive);
+    if (sensitive)
+      cancelPrediction(ic);
+    if (ic && (sensitive || wasSensitive != sensitive)) {
+      composing_ = false;
+      hasPrev_ = hasNext_ = false;
+      ic->inputPanel().reset();
+      ic->updatePreedit();
+      ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+    }
+    const auto appId =
+        (ic && !ic->program().empty()) ? QString::fromStdString(ic->program()) : QStringLiteral("desktop");
+    auto focus = command("on-app-focus",
+                         {{"app_id", appId}, {"no_personalized_learning", sensitive}});
     english_ = focus["lang_mode"].toString() == "en";
     if (!internalEnglish_ && english_) {
       unpack(vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
       english_ = false;
     }
+  }
+
+  void activate(const InputMethodEntry &, InputContextEvent &event) override {
+    auto *ic = event.inputContext();
+    ++editor_;
+    syncFocusState(ic);
+    active_ = true;
+    ++activity_;
+    startPanel();
     unpack(vitral_on_ime_open(core_));
     render(ic, command("candidate-state"));
-    schedulePrediction("catch_up", 1);
+    if (!lastFocusSensitive_.load())
+      schedulePrediction("catch_up", 1);
   }
 
   void reset(const InputMethodEntry &, InputContextEvent &event) override {
@@ -289,6 +355,7 @@ public:
   void deactivate(const InputMethodEntry &entry,
                   InputContextEvent &event) override {
     ++editor_;
+    lastFocusSensitive_.store(false);
     active_ = false;
     reset(entry, event);
     unpack(vitral_on_ime_close(core_));
@@ -298,6 +365,10 @@ public:
     auto key = event.key();
     auto sym = key.sym();
     auto *ic = event.inputContext();
+    const bool sensitive =
+        ic && ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive);
+    if (sensitive != lastFocusSensitive_.load())
+      syncFocusState(ic);
     if (!event.isRelease()) {
       if (!composing_ && !predictionText_.isEmpty() &&
           !key.states().test(KeyState::Ctrl) && !key.states().test(KeyState::Alt) &&
@@ -310,7 +381,19 @@ public:
         const auto text = predictionText_;
         const auto id = predictionId_;
         const auto current = command("predict-poll", {{"id", id}});
-        if (current["status"].toString() != "ready" || current["text"].toString() != text) {
+        const auto candidates = current["candidates"].toArray();
+        bool valid = current["status"].toString() == "ready" &&
+                     (current["text"].toString() == text ||
+                      current["previous_candidate"].toString() == text);
+        if (!valid && current["status"].toString() == "ready") {
+          for (const auto &cand : candidates) {
+            if (cand.toString() == text) {
+              valid = true;
+              break;
+            }
+          }
+        }
+        if (!valid) {
           cancelPrediction(ic);
           return;
         }
@@ -318,12 +401,11 @@ public:
         command("predict-accept", {{"id", id}, {"text", text}});
         predictionId_ = 0;
         cancelPrediction(ic);
-        schedulePrediction("live", predictionDelay_);
         event.filterAndAccept();
         return;
       }
       if (sym == FcitxKey_Escape && !predictionText_.isEmpty()) {
-        command("predict-dismiss", {{"id", predictionId_}});
+        command("predict-dismiss", {{"id", predictionId_}, {"text", predictionText_}});
         predictionId_ = 0;
         cancelPrediction(ic);
         event.filterAndAccept();
@@ -579,7 +661,7 @@ private:
           if (epoch != editor_ || !active_ || composing_ || !ic || !ic->hasFocus() ||
               instance_->inputMethod(ic) != "vitral" || hasSelection(ic) ||
               ic->capabilityFlags().testAny(CapabilityFlag::PasswordOrSensitive)) {
-            cancelSubmittedPrediction();
+            cancelPrediction(ic);
             return true;
           }
           QJsonObject response;
@@ -599,11 +681,12 @@ private:
             response = command("predict-poll", {{"id", predictionId_}});
           }
           const auto status = response["status"].toString();
+          const bool upgrading = response["upgrading"].toBool(false);
           if (submitting && (status == "pending" || status == "ready"))
             predictionId_ = response["id"].toDouble();
           ++predictionPolls_;
-          if (status == "pending" && predictionPolls_ <= 25) {
-            timer->setNextInterval(120000);
+          if (status == "pending" && predictionPolls_ <= 6) {
+            timer->setNextInterval(100000);
             timer->setOneShot();
             return true;
           }
@@ -626,12 +709,16 @@ private:
               }
               ic->inputPanel().setAuxDown(Text(predictionHint_.toStdString()));
               ic->updateUserInterface(UserInterfaceComponent::InputPanel);
+              if (upgrading && predictionPolls_ <= 5) {
+                timer->setNextInterval(100000);
+                timer->setOneShot();
+              }
               return true;
             }
           }
           if (status == "pending" || status == "ready")
             cancelSubmittedPrediction();
-          predictionId_ = 0;
+          cancelPrediction(ic);
           return true;
         });
     predictionTimer_->setOneShot();
@@ -751,11 +838,12 @@ private:
   }
   void render(InputContext *ic, const QJsonObject &action, bool selectLast = false) {
     english_ = action["lang_mode"].toString() == "en";
+    const bool clipboardCommit = action["clipboard_commit"].toBool(false);
     auto commit = action["commit_text"].toString();
     if (!commit.isEmpty()) {
       const auto commitUtf8 = commit.toStdString();
       const auto &surr = ic->surroundingText();
-      if (composing_ &&
+      if (!clipboardCommit && composing_ &&
           ic->capabilityFlags().test(CapabilityFlag::SurroundingText) &&
           surr.isValid()) {
         const auto start = std::min(surr.cursor(), surr.anchor());
@@ -779,7 +867,7 @@ private:
     auto preedit = action["preedit"].toObject();
     auto text = preedit["text"].toString().toStdString();
     composing_ = !text.empty();
-    if (composing_) cancelPrediction(ic);
+    if (composing_ || clipboardCommit) cancelPrediction(ic);
     else if (!commit.isEmpty()) schedulePrediction("live", predictionDelay_);
     const auto page = action["page"].toObject();
     hasPrev_ = page["has_prev"].toBool();
@@ -841,12 +929,13 @@ private:
   QString lastCommitBefore_, lastCommitAfter_;
   bool predictionEnabled_ = true;
   std::unique_ptr<DesktopControl> control_;
+  std::unique_ptr<HandlerTableEntry<EventHandler>> capabilityWatch_;
   VitralEngine *core_ = nullptr;
   std::jthread aiWorker_;
   bool aiBusy_ = false;
   bool composing_ = false, hasPrev_ = false, hasNext_ = false;
   qint64 panelPid_ = 0;
-  std::atomic<bool> english_{false}, active_{false};
+  std::atomic<bool> english_{false}, active_{false}, lastFocusSensitive_{false};
   std::atomic<bool> internalEnglish_{true};
   std::atomic<int> activity_{0}, editor_{0}, panelTheme_{0};
   bool shiftHeld_ = false;

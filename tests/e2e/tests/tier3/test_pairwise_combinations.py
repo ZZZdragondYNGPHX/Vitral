@@ -627,9 +627,9 @@ def test_t3_f11_x_f10_quick_paste_ram_lifecycle_localsend_and_webdav_ring(
             "clipboard_ring_capacity": 5,
         })
 
-        # Cold-boot history load MUST NOT trigger Quick Paste
+        # Cold-boot restore populates current copy on the new device
         dev_b.clipboard_ingest_remote("cold-boot-history", is_cold_boot=True)
-        assert _qp_content(dev_b.quick_paste_state()) is None
+        assert _qp_content(dev_b.quick_paste_state()) == "cold-boot-history"
         assert "cold-boot-history" in [e["content"] for e in dev_b.clipboard_state()["ring"]]
 
         # Copy on Device A -> remote push to Device B -> per-device independent consumption
@@ -643,11 +643,13 @@ def test_t3_f11_x_f10_quick_paste_ram_lifecycle_localsend_and_webdav_ring(
         assert _qp_content(dev_a.quick_paste_state()) is None
         assert _qp_content(dev_b.quick_paste_state()) == "qp-shared-item"
 
-        # IME open -> close on Device B clears Quick Paste locally only
+        # IME open -> close preserves Quick Paste; dismiss_quick_paste clears locally only
         open_b = dev_b.on_ime_open()
         assert open_b["seen_while_ime_open"] is True
         assert _qp_content(open_b) == "qp-shared-item"
         dev_b.on_ime_close()
+        assert _qp_content(dev_b.quick_paste_state()) == "qp-shared-item"
+        dev_b.dismiss_quick_paste()
         assert _qp_content(dev_b.quick_paste_state()) is None
         dev_b.on_ime_open()
         assert _qp_content(dev_b.quick_paste_state()) is None
@@ -847,7 +849,7 @@ def test_t3_f02_x_f15_f16_android_keyboard_handwriting_tokens_and_apk(
     assert "retroactiveHighlightDurationMs: Int = 600" in kt_tokens
     assert "strokeWidthPx: Float = 3.50f" in kt_tokens
     assert "flypyRows: Int = 4" in kt_tokens
-    assert "quanpinRows: Int = 5" in kt_tokens
+    assert "quanpinRows: Int = 4" in kt_tokens
     assert "spacebarVoiceHoldThresholdMs: Int = 350" in kt_tokens
     assert "toolbarTextLabelsAllowed: Boolean = false" in kt_tokens
     assert design_tokens["ergonomics"]["mobileFloatingWindow"]["minWidthDp"] == 220
@@ -915,7 +917,7 @@ def test_t3_f01_x_f04_toolchain_ffi_jni_abi_symbol_parity(
     m = re.search(r'extern "C" \{(.*?)#ifdef __cplusplus', header, re.S)
     assert m is not None
     declared_ffi = re.findall(r"\b(vitral_\w+)\s*\(", m.group(1))
-    assert len(declared_ffi) == 40
+    assert len(declared_ffi) == 41
     for sym in declared_ffi:
         assert hasattr(cdll, sym), f"Missing C-ABI symbol {sym} in libvitral_ffi.so"
 
@@ -924,7 +926,7 @@ def test_t3_f01_x_f04_toolchain_ffi_jni_abi_symbol_parity(
     assert nm_bin is not None
     jni_rs = (discovered_targets.vitral_root / "crates" / "vitral-jni" / "src" / "lib.rs").read_text(encoding="utf-8")
     expected_jni = set(re.findall(r'pub extern "system" fn (Java_dev_vitral_ime_core_VitralNative_\w+)', jni_rs))
-    assert len(expected_jni) == 38
+    assert len(expected_jni) == 39
 
     for lib_path in jni_libs:
         proc = subprocess.run(

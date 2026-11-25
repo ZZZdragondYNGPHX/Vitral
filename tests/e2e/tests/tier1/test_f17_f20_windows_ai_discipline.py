@@ -155,9 +155,10 @@ def test_f17_windows_tsf_mode1_popover_and_quick_paste_candidate(
     vitral_target.require_windows_tsf()
     tsf_src = vitral_target.targets.vitral_root / "crates" / "vitral-tsf" / "src"
     src_text = _read_dir_text(tsf_src, (".rs", ".cpp", ".hpp", ".h"))
-    assert all(command in src_text for command in ("candidate-state", "quick_paste_id", "select-candidate")), (
-        "Quick Paste candidate integration missing in vitral-tsf"
+    assert all(command in src_text for command in ("candidate-state", "select-candidate")), (
+        "Candidate integration missing in vitral-tsf"
     )
+    assert "quick_paste_id" not in src_text, "Desktop candidate bar must not display Quick Paste"
     assert "on_ime_open" in src_text and "on_ime_close" in src_text
 
 

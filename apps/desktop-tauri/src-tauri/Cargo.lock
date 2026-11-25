@@ -5004,7 +5004,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
 dependencies = [
  "base64 0.23.1",
- "flate2",
  "log",
  "percent-encoding",
  "rustls",
@@ -5098,12 +5097,14 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vitral-core"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
+ "bytes",
  "chacha20poly1305",
  "chrono",
  "ciborium",
  "getrandom 0.2.17",
+ "http-body",
  "kaldi-fbank",
  "mdns-sd",
  "memmap2",
@@ -5121,7 +5122,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tiny_http",
  "tokio",
- "ureq",
  "vitral-tokens",
  "webpki-roots",
  "windows-sys 0.61.2",
@@ -5130,7 +5130,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-desktop"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "base64 0.23.1",
  "gtk",
@@ -5148,7 +5148,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-tokens"
-version = "0.4.14"
+version = "0.4.15"
 dependencies = [
  "serde",
  "serde_json",

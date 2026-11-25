@@ -9,7 +9,10 @@ use ort::{
     session::Session,
     value::{DynTensorValueType, Tensor},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 fn mel_features(samples: &[i16]) -> Vec<f32> {
     let samples: Vec<f32> = samples.iter().map(|&s| f32::from(s) / 32768.0).collect();
@@ -30,26 +33,66 @@ fn mel_features(samples: &[i16]) -> Vec<f32> {
 fn audio_tokens(frames: usize) -> usize {
     (frames / 100) * 13 + (frames % 100).div_ceil(8)
 }
-fn prompt(ctx: &SpeechContext, n: usize) -> String {
+fn prompt(hotwords: &[String], context_before: &str, n: usize) -> String {
     // The official system segment contains space-separated hotwords.
     let clean = |s: &str| s.replace(['<', '>', '\r', '\n'], " ");
-    let mut hints = ctx
-        .hotwords
+    let mut hints = hotwords
         .iter()
-        .take(80)
         .map(|s| clean(s).chars().take(48).collect::<String>())
         .collect::<Vec<_>>()
         .join(" ");
-    if !ctx.context_before.trim().is_empty() {
+    if !context_before.trim().is_empty() {
         hints.push(' ');
         hints.push_str(
-            &clean(&ctx.context_before)
+            &clean(context_before)
                 .chars()
                 .take(128)
                 .collect::<String>(),
         );
     }
     format!("<|im_start|>system\n{hints}<|im_end|>\n<|im_start|>user\n<|audio_start|>{}<|audio_end|><|im_end|>\n<|im_start|>assistant\n","<|audio_pad|>".repeat(n))
+}
+
+fn encode_prompt(
+    ctx: &SpeechContext,
+    valid: usize,
+    max_len: usize,
+    encode: impl Fn(&str) -> Result<Vec<i64>, VitralError>,
+) -> Result<Vec<i64>, VitralError> {
+    let prompt_budget = max_len.saturating_sub(128);
+    let hotwords = &ctx.hotwords[..ctx.hotwords.len().min(80)];
+    let encode_hints = |count, before| encode(&prompt(&hotwords[..count], before, valid));
+    let ids = encode_hints(hotwords.len(), &ctx.context_before)?;
+    if ids.len() <= prompt_budget {
+        return Ok(ids);
+    }
+    if !ctx.context_before.trim().is_empty() {
+        let ids = encode_hints(hotwords.len(), "")?;
+        if ids.len() <= prompt_budget {
+            return Ok(ids);
+        }
+    }
+
+    let mut best = encode_hints(0, "")?;
+    if best.len() > max_len {
+        return Err(error("音频超出语音模型上下文，请缩短录音"));
+    }
+    // Let a long audio-only prompt use the remaining slots when 128 are unavailable.
+    if best.len() > prompt_budget {
+        return Ok(best);
+    }
+    let (mut kept, mut rejected) = (0, hotwords.len());
+    while rejected > kept + 1 {
+        let mid = kept + (rejected - kept) / 2;
+        let ids = encode_hints(mid, "")?;
+        if ids.len() <= prompt_budget {
+            kept = mid;
+            best = ids;
+        } else {
+            rejected = mid;
+        }
+    }
+    Ok(best)
 }
 fn parse_transcript(text: &str) -> (String, String) {
     let (prefix, body) = text.split_once("<asr_text>").unwrap_or(("", text));
@@ -196,10 +239,7 @@ impl Model {
                 vec![1, capacity, shape[2], shape[3]],
             )?);
         }
-        let mut ids = self.tokenizer.encode(&prompt(ctx, valid))?;
-        if ids.len() >= max_len {
-            return Err(error("热词与音频超出语音模型上下文，请缩短录音或热词"));
-        }
+        let mut ids = encode_prompt(ctx, valid, max_len, |text| self.tokenizer.encode(text))?;
         let mut generated = Vec::new();
         let mut position = 0;
         for _ in 0..512 {
@@ -247,21 +287,33 @@ impl Model {
         Ok(parse_transcript(&self.tokenizer.decode(&generated, false)))
     }
 }
-static MODEL: SpeechModelCache<PathBuf, Model> = SpeechModelCache::new();
+static MODEL: OnceLock<SpeechModelCache<PathBuf, Model>> = OnceLock::new();
 pub(super) fn transcribe(
     samples: &[i16],
     dir: &Path,
     ctx: &SpeechContext,
 ) -> Result<(String, String), VitralError> {
-    let handle = MODEL.model(dir.to_path_buf());
-    let mut model = handle.lock();
-    if model.is_none() {
-        *model = Some(Model::load(dir)?);
-    }
-    model.as_mut().unwrap().decode(samples, ctx)
+    MODEL.get_or_init(SpeechModelCache::new).with_model(dir.to_path_buf(), |model| {
+        if model.is_none() {
+            #[cfg(feature = "native-onnx")]
+            if super::current_heavy_memory_policy().mutual_exclusion {
+                super::local_engine().try_unload_if_idle();
+            }
+            *model = Some(Model::load(dir)?);
+        }
+        model.as_mut().unwrap().decode(samples, ctx)
+    })
 }
+pub(super) fn evict_if_idle() {
+    if let Some(cache) = MODEL.get() {
+        cache.try_unload_if_idle();
+    }
+}
+
 pub(super) fn clear_cache() {
-    MODEL.clear();
+    if let Some(cache) = MODEL.get() {
+        cache.clear();
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -286,13 +338,7 @@ mod tests {
     }
     #[test]
     fn prompt_and_parse() {
-        let p = prompt(
-            &SpeechContext {
-                hotwords: vec!["Vitral".into(), "伟创".into()],
-                context_before: "项目".into(),
-            },
-            2,
-        );
+        let p = prompt(&["Vitral".into(), "伟创".into()], "项目", 2);
         assert!(p.contains("system\nVitral 伟创 项目<|im_end|>"));
         assert_eq!(p.matches("<|audio_pad|>").count(), 2);
         assert_eq!(
@@ -305,6 +351,47 @@ mod tests {
         );
         assert_eq!(parse_transcript("hello"), ("hello".into(), "auto".into()));
     }
+
+    #[test]
+    fn prompt_budget_removes_context_then_low_priority_hotwords() {
+        let encode = |text: &str| {
+            let (system, _) = text
+                .strip_prefix("<|im_start|>system\n")
+                .unwrap()
+                .split_once("<|im_end|>")
+                .unwrap();
+            let audio_and_markers = text.matches("<|audio_pad|>").count() + 12;
+            let mut tokens: Vec<_> = system.bytes().map(i64::from).collect();
+            tokens.resize(tokens.len() + audio_and_markers, 0);
+            Ok(tokens)
+        };
+        let valid = 48;
+        let audio_only_len = valid + 12;
+        let hotwords = vec!["primary".into(), "backup".into()];
+        let context = SpeechContext {
+            hotwords: hotwords.clone(),
+            context_before: "previous utterance".into(),
+        };
+        let fit_all = encode_prompt(&context, valid, 256, encode).unwrap();
+        assert_eq!(fit_all, encode(&prompt(&hotwords, "previous utterance", valid)).unwrap());
+
+        let max_len = audio_only_len + 128 + "primary backup".len();
+        let kept = encode(&prompt(&hotwords, "", valid)).unwrap();
+        assert_eq!(encode_prompt(&context, valid, max_len, encode).unwrap(), kept);
+        let mut overloaded = context;
+        overloaded.hotwords.extend((0..78).map(|_| "noisy hotword".repeat(4)));
+        assert_eq!(encode_prompt(&overloaded, valid, max_len, encode).unwrap(), kept);
+        assert_eq!(kept.len(), max_len - 128);
+
+        let bare = encode(&prompt(&[], "", valid)).unwrap();
+        assert_eq!(
+            encode_prompt(&overloaded, valid, audio_only_len + 128, encode).unwrap(),
+            bare
+        );
+        assert_eq!(encode_prompt(&overloaded, valid, audio_only_len, encode).unwrap(), bare);
+        assert!(encode_prompt(&overloaded, valid, audio_only_len - 1, encode).is_err());
+    }
+
     #[test]
     #[ignore = "set VITRAL_QWEN_ASR_SMOKE_DIR to an installed Qwen3-ASR model directory"]
     fn installed_asr_transcribes_mandarin() {
@@ -345,6 +432,6 @@ mod tests {
         assert!(text.contains("天气") || text.contains("你好"));
         assert!(!text.contains("<asr_text>"));
         clear_cache();
-        assert!(MODEL.is_empty());
+        assert!(MODEL.get().unwrap().is_empty());
     }
 }

@@ -12,6 +12,12 @@ import dev.vitral.ime.core.unpack
 import java.util.concurrent.atomic.AtomicBoolean
 import org.json.JSONObject
 
+internal data class VoiceOutcome(
+    val transcript: String,
+    val rawTranscript: String,
+    val cleaned: Boolean,
+)
+
 internal class Microphone {
     private var current: AtomicBoolean? = null
     private var currentCancelled: AtomicBoolean? = null
@@ -31,7 +37,7 @@ internal class Microphone {
     fun start(
         context: Context,
         onPartial: (String) -> Unit = {},
-        done: (Result<String>) -> Unit,
+        done: (Result<VoiceOutcome>) -> Unit,
     ) {
         if (current != null) return
         val capturing = AtomicBoolean(true)
@@ -113,7 +119,15 @@ internal class Microphone {
                 current = null
                 currentCancelled = null
                 if (!cancelled.get()) {
-                    done(result.mapCatching { (it as JSONObject).getString("transcript") })
+                    done(
+                        result.mapCatching {
+                            val obj = it as JSONObject
+                            val transcript = obj.optString("transcript")
+                            val raw = obj.optString("raw_transcript").ifEmpty { transcript }
+                            val cleaned = obj.optBoolean("cleaned", false) && raw.isNotEmpty() && raw != transcript
+                            VoiceOutcome(transcript, raw, cleaned)
+                        }
+                    )
                 }
             }
         }

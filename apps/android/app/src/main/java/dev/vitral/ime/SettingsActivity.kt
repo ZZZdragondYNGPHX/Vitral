@@ -391,8 +391,8 @@ class SettingsActivity : ComponentActivity() {
 
             // Personalization & Sync State
             var adaptive by remember { mutableStateOf(config.optBoolean("adaptive_learning", true)) }
-            var clipLearn by remember { mutableStateOf(config.optBoolean("learn_from_clipboard", true)) }
             var predictionEnabled by remember { mutableStateOf(config.optBoolean("prediction_enabled", true)) }
+            var predictionSkipDevApps by remember { mutableStateOf(config.optBoolean("prediction_skip_dev_apps", true)) }
             var profileDistillEnabled by remember { mutableStateOf(config.optBoolean("profile_distill_enabled", true)) }
             var profileState by remember { mutableStateOf<JSONObject?>(null) }
             var offline by remember { mutableStateOf(config.optBoolean("pure_offline")) }
@@ -404,8 +404,33 @@ class SettingsActivity : ComponentActivity() {
             var confirmDeleteModelId by remember { mutableStateOf<String?>(null) }
             var aiPreferLocal by remember { mutableStateOf(config.optBoolean("ai_prefer_local", true)) }
             var aiTier3 by remember { mutableStateOf(config.optBoolean("ai_tier3_enabled")) }
+            var voiceCleanupMode by remember {
+                mutableStateOf(
+                    config.optString("voice_cleanup_mode", "light").takeIf { it in listOf("off", "light", "polish") }
+                        ?: "light"
+                )
+            }
+            var privacyAppsText by remember {
+                mutableStateOf(
+                    buildList {
+                        val arr = config.optJSONArray("privacy_apps")
+                        if (arr != null) {
+                            for (i in 0 until arr.length()) {
+                                val s = arr.optString(i).trim()
+                                if (s.isNotEmpty()) add(s)
+                            }
+                        }
+                    }.joinToString(", ")
+                )
+            }
             var targetLang by remember { mutableStateOf("en") }
             var source by remember { mutableStateOf("") }
+            var voiceRawSource by remember { mutableStateOf("") }
+            var voiceCleanedSource by remember { mutableStateOf("") }
+            var prevAppliedSource by remember { mutableStateOf("") }
+            var aiOutputRoute by remember { mutableStateOf("") }
+            var aiStreamId by remember { mutableStateOf(0L) }
+            var privacyAudit by remember { mutableStateOf<JSONObject?>(null) }
             var textFieldsDirty by remember { mutableStateOf(false) }
 
             fun persistConfig(feedback: String? = null, onSaved: (() -> Unit)? = null) {
@@ -443,11 +468,22 @@ class SettingsActivity : ComponentActivity() {
                     .put("mobile_aeviou_hand", aeviouHand)
                     .put("pure_offline", offline)
                     .put("adaptive_learning", adaptive)
-                    .put("learn_from_clipboard", clipLearn)
                     .put("prediction_enabled", predictionEnabled)
+                    .put("prediction_skip_dev_apps", predictionSkipDevApps)
                     .put("profile_distill_enabled", profileDistillEnabled)
                     .put("ai_prefer_local", aiPreferLocal)
                     .put("ai_tier3_enabled", aiTier3)
+                    .put("voice_cleanup_mode", voiceCleanupMode)
+                    .put(
+                        "privacy_apps",
+                        JSONArray(
+                            privacyAppsText
+                                .split(',', '，', '、', ';', '；')
+                                .map { it.trim() }
+                                .filter { it.isNotEmpty() }
+                                .distinct()
+                        ),
+                    )
                     .put("candidate_font_px", size.roundToInt())
                     .put("clipboard_ring_capacity", capacity.roundToInt())
                 Core.save(this@SettingsActivity, config) { r ->
@@ -489,6 +525,73 @@ class SettingsActivity : ComponentActivity() {
                 }
             }
 
+            LaunchedEffect(aiStreamId) {
+                val streamId = aiStreamId
+                if (streamId <= 0L) return@LaunchedEffect
+                while (aiStreamId == streamId) {
+                    delay(90)
+                    val done =
+                        kotlinx.coroutines.suspendCancellableCoroutine<Boolean> { cont ->
+                            Core.call(
+                                this@SettingsActivity,
+                                "ai-inline-poll",
+                                json("id" to streamId),
+                                auxiliary = true,
+                            ) { res ->
+                                if (!cont.isActive) return@call
+                                if (aiStreamId != streamId) {
+                                    cont.resumeWith(Result.success(true))
+                                    return@call
+                                }
+                                res.onSuccess { v ->
+                                    val obj = v as JSONObject
+                                    val st = obj.optString("status")
+                                    val route = obj.optString("route")
+                                    if (route.isNotEmpty()) aiOutputRoute = route
+                                    val out = obj.optString("output_text")
+                                    if (out.isNotEmpty()) aiOutput = out
+                                    when (st) {
+                                        "running" -> cont.resumeWith(Result.success(false))
+                                        "done" -> {
+                                            aiStreamId = 0L
+                                            busy = false
+                                            Core.call(this@SettingsActivity, "privacy-audit", background = true) { a ->
+                                                a.onSuccess { privacyAudit = it as? JSONObject }
+                                            }
+                                            showToast(if (route == "local") "本机离线处理完成" else "远端 AI 处理完成")
+                                            cont.resumeWith(Result.success(true))
+                                        }
+                                        "cancelled" -> {
+                                            aiStreamId = 0L
+                                            busy = false
+                                            Core.call(this@SettingsActivity, "privacy-audit", background = true) { a ->
+                                                a.onSuccess { privacyAudit = it as? JSONObject }
+                                            }
+                                            showToast("已停止生成")
+                                            cont.resumeWith(Result.success(true))
+                                        }
+                                        else -> {
+                                            aiStreamId = 0L
+                                            busy = false
+                                            Core.call(this@SettingsActivity, "privacy-audit", background = true) { a ->
+                                                a.onSuccess { privacyAudit = it as? JSONObject }
+                                            }
+                                            showToast(obj.optString("error").ifBlank { "AI 处理失败" })
+                                            cont.resumeWith(Result.success(true))
+                                        }
+                                    }
+                                }.onFailure { err ->
+                                    aiStreamId = 0L
+                                    busy = false
+                                    showToast(err.message.orEmpty())
+                                    cont.resumeWith(Result.success(true))
+                                }
+                            }
+                        }
+                    if (done) break
+                }
+            }
+
             LaunchedEffect(tab) {
                 when (tab) {
                     0 -> Core.call(this@SettingsActivity, "profile-state", background = true) { r ->
@@ -496,6 +599,9 @@ class SettingsActivity : ComponentActivity() {
                     }
                     1 -> refreshClipboard()
                     2 -> refreshModels(true)
+                    3 -> Core.call(this@SettingsActivity, "privacy-audit", background = true) { r ->
+                        r.onSuccess { privacyAudit = it as? JSONObject }
+                    }
                 }
             }
 
@@ -1053,20 +1159,20 @@ class SettingsActivity : ComponentActivity() {
                                             },
                                         )
                                         GlassToggleRow(
-                                            "剪贴板静默识词",
-                                            "本地提取专名与术语，自动跳过密码与网址",
-                                            checked = clipLearn,
+                                            "本地语境预测输入",
+                                            "先以毫秒级本地记忆首显草稿，再限时由本地 Qwen3 升级",
+                                            checked = predictionEnabled,
                                             onCheckedChange = {
-                                                clipLearn = it
+                                                predictionEnabled = it
                                                 persistConfig()
                                             },
                                         )
                                         GlassToggleRow(
-                                            "本地语境预测输入",
-                                            "空闲候选栏给出下一句建议，点击即上屏",
-                                            checked = predictionEnabled,
+                                            "IDE 与终端自动避让预测",
+                                            "在代码编辑器与终端中自动暂停预测（密码管理器始终自动跳过）",
+                                            checked = predictionSkipDevApps,
                                             onCheckedChange = {
-                                                predictionEnabled = it
+                                                predictionSkipDevApps = it
                                                 persistConfig()
                                             },
                                         )
@@ -1078,6 +1184,16 @@ class SettingsActivity : ComponentActivity() {
                                                 profileDistillEnabled = it
                                                 persistConfig()
                                             },
+                                        )
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassTextField(
+                                            value = privacyAppsText,
+                                            onValueChange = {
+                                                privacyAppsText = it
+                                                textFieldsDirty = true
+                                            },
+                                            label = "隐私免打扰应用（逗号分隔，自动暂停学习与预测）",
+                                            placeholder = "如：com.bank.app, org.keepassdx",
                                         )
 
                                         val prof = profileState?.optJSONObject("profile")
@@ -1259,6 +1375,12 @@ class SettingsActivity : ComponentActivity() {
                                             showDivider = false,
                                             onCheckedChange = {
                                                 offline = it
+                                                Core.call(
+                                                    this@SettingsActivity,
+                                                    "set-pure-offline",
+                                                    json("enabled" to it),
+                                                    auxiliary = true,
+                                                )
                                                 persistConfig(if (it) "已进入纯离线模式" else "已恢复网络协同")
                                             },
                                         )
@@ -2027,12 +2149,50 @@ class SettingsActivity : ComponentActivity() {
                                         )
                                         GlassTextField(
                                             value = source,
-                                            onValueChange = { source = it },
+                                            onValueChange = {
+                                                source = it
+                                                if (it != voiceCleanedSource && it != voiceRawSource) {
+                                                    voiceCleanedSource = ""
+                                                    voiceRawSource = ""
+                                                }
+                                            },
                                             label = "",
                                             placeholder = "输入原文，或点击下方「开始录音」进行本机离线听写…",
                                             singleLine = false,
                                             minLines = 3,
                                         )
+                                        if (
+                                            (voiceRawSource.isNotEmpty() && voiceCleanedSource.isNotEmpty() && voiceRawSource != voiceCleanedSource) ||
+                                                prevAppliedSource.isNotEmpty()
+                                        ) {
+                                            Spacer(Modifier.height(6.dp))
+                                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                                if (voiceRawSource.isNotEmpty() && voiceCleanedSource.isNotEmpty() && voiceRawSource != voiceCleanedSource) {
+                                                    val isRaw = source == voiceRawSource
+                                                    GlassButton(
+                                                        if (isRaw) "切回规整" else "还原原话",
+                                                        style = GlassButtonStyle.Ghost,
+                                                        compact = true,
+                                                        onClick = {
+                                                            source = if (isRaw) voiceCleanedSource else voiceRawSource
+                                                            showToast(if (isRaw) "已恢复轻度规整文本" else "已切回原始听写文本")
+                                                        },
+                                                    )
+                                                }
+                                                if (prevAppliedSource.isNotEmpty()) {
+                                                    GlassButton(
+                                                        "撤销替换",
+                                                        style = GlassButtonStyle.Ghost,
+                                                        compact = true,
+                                                        onClick = {
+                                                            source = prevAppliedSource
+                                                            prevAppliedSource = ""
+                                                            showToast("已恢复替换前原文")
+                                                        },
+                                                    )
+                                                }
+                                            }
+                                        }
                                         Spacer(Modifier.height(10.dp))
                                         GlassSegmentedControl(
                                             options = listOf("en" to "译为英语", "zh" to "译为中文", "ja" to "译为日语"),
@@ -2061,9 +2221,17 @@ class SettingsActivity : ComponentActivity() {
                                                         recorder.start(this@SettingsActivity) { result ->
                                                             recording = false
                                                             busy = false
-                                                            result.onSuccess {
-                                                                source = it
-                                                                showToast(if (it.isBlank()) "未识别到语音" else "本机转写完成")
+                                                            result.onSuccess { outcome ->
+                                                                source = outcome.transcript
+                                                                voiceCleanedSource = outcome.transcript
+                                                                voiceRawSource = if (outcome.cleaned) outcome.rawTranscript else ""
+                                                                showToast(
+                                                                    when {
+                                                                        outcome.transcript.isBlank() -> "未识别到语音"
+                                                                        outcome.cleaned -> "本机转写并完成轻度规整（可还原原话）"
+                                                                        else -> "本机转写完成"
+                                                                    }
+                                                                )
                                                             }.onFailure { showToast(it.message.orEmpty()) }
                                                         }
                                                     }
@@ -2074,20 +2242,58 @@ class SettingsActivity : ComponentActivity() {
                                                     label,
                                                     style = GlassButtonStyle.Ghost,
                                                     compact = true,
-                                                    enabled = !busy && source.isNotBlank(),
+                                                    enabled = !busy && aiStreamId == 0L && source.isNotBlank(),
                                                     onClick = {
                                                         busy = true
+                                                        aiOutput = ""
+                                                        aiOutputRoute = ""
                                                         Core.call(
                                                             this@SettingsActivity,
-                                                            "ai-inline",
+                                                            "ai-inline-start",
                                                             json("mode" to m, "text" to source, "target_lang" to targetLang),
-                                                            true,
+                                                            auxiliary = true,
                                                         ) { r ->
-                                                            busy = false
                                                             r.onSuccess {
-                                                                aiOutput = (it as JSONObject).optString("output_text")
-                                                                showToast("处理完成")
-                                                            }.onFailure { showToast(it.message.orEmpty()) }
+                                                                val obj = it as JSONObject
+                                                                val st = obj.optString("status")
+                                                                aiOutputRoute = obj.optString("route")
+                                                                val out = obj.optString("output_text")
+                                                                if (out.isNotEmpty()) aiOutput = out
+                                                                if (st == "running") {
+                                                                    aiStreamId = obj.optLong("id", 0L)
+                                                                } else {
+                                                                    busy = false
+                                                                    Core.call(this@SettingsActivity, "privacy-audit", background = true) { auditRes ->
+                                                                        auditRes.onSuccess { a -> privacyAudit = a as? JSONObject }
+                                                                    }
+                                                                    if (st == "done") {
+                                                                        showToast(if (aiOutputRoute == "local") "本机离线处理完成" else "远端 AI 处理完成")
+                                                                    } else {
+                                                                        showToast(obj.optString("error").ifBlank { "AI 处理失败" })
+                                                                    }
+                                                                }
+                                                            }.onFailure {
+                                                                busy = false
+                                                                showToast(it.message.orEmpty())
+                                                            }
+                                                        }
+                                                    },
+                                                )
+                                            }
+                                            if (aiStreamId > 0L) {
+                                                GlassButton(
+                                                    "停止",
+                                                    style = GlassButtonStyle.DangerGhost,
+                                                    compact = true,
+                                                    onClick = {
+                                                        val id = aiStreamId
+                                                        if (id > 0L) {
+                                                            Core.call(
+                                                                this@SettingsActivity,
+                                                                "ai-inline-cancel",
+                                                                json("id" to id),
+                                                                auxiliary = true,
+                                                            )
                                                         }
                                                     },
                                                 )
@@ -2108,7 +2314,19 @@ class SettingsActivity : ComponentActivity() {
                                                     horizontalArrangement = Arrangement.SpaceBetween,
                                                     verticalAlignment = Alignment.CenterVertically,
                                                 ) {
-                                                    Text("处理结果", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accentText)
+                                                    Row(
+                                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                                        verticalAlignment = Alignment.CenterVertically,
+                                                    ) {
+                                                        Text("处理结果", fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = palette.accentText)
+                                                        if (aiOutputRoute.isNotEmpty()) {
+                                                            GlassPillBadge(
+                                                                if (aiOutputRoute == "local") "本机离线" else "远端 API",
+                                                                if (aiOutputRoute == "local") palette.success else palette.warning,
+                                                                if (aiOutputRoute == "local") palette.successSoft else palette.warningSoft,
+                                                            )
+                                                        }
+                                                    }
                                                     Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                                         GlassButton(
                                                             "复制",
@@ -2125,8 +2343,9 @@ class SettingsActivity : ComponentActivity() {
                                                             style = GlassButtonStyle.Ghost,
                                                             compact = true,
                                                             onClick = {
+                                                                prevAppliedSource = source
                                                                 source = aiOutput
-                                                                showToast("已替换原文")
+                                                                showToast("已替换原文（可撤销替换）")
                                                             },
                                                         )
                                                     }
@@ -2137,7 +2356,18 @@ class SettingsActivity : ComponentActivity() {
                                     }
 
                                     GlassPanel {
-                                        GlassSectionHeader("AI 服务配置", "支持本机 Qwen3 纯离线执行，也可选配远端兼容接口")
+                                        GlassSectionHeader("语音规整与 AI 服务", "本机 Qwen3 纯离线执行，也可选配远端兼容接口")
+                                        Text("语音直出规整模式", fontSize = 12.sp, color = palette.textSecondary)
+                                        Spacer(Modifier.height(6.dp))
+                                        GlassSegmentedControl(
+                                            options = listOf("off" to "原话", "light" to "轻度规整", "polish" to "保真润色"),
+                                            selected = voiceCleanupMode,
+                                            onSelect = {
+                                                voiceCleanupMode = it
+                                                persistConfig()
+                                            },
+                                        )
+                                        Spacer(Modifier.height(10.dp))
                                         GlassToggleRow(
                                             "优先使用本机 Qwen3 模型",
                                             "纯离线模式下同样可执行翻译、润色与摘要",
@@ -2162,6 +2392,65 @@ class SettingsActivity : ComponentActivity() {
                                             ConfigField(config, "ai_endpoint", "服务地址", "http://localhost:11434") { textFieldsDirty = true }
                                             ConfigField(config, "ai_model", "模型名称", "qwen2.5:7b") { textFieldsDirty = true }
                                             ConfigField(config, "ai_api_key", "API 密钥", "本地模型可留空", secret = true) { textFieldsDirty = true }
+                                        }
+                                    }
+
+                                    GlassPanel {
+                                        val loadedAudit = privacyAudit
+                                        val totalOut = loadedAudit?.optLong("total_outbound_bytes", 0L) ?: 0L
+                                        val auditCount = loadedAudit?.optJSONArray("entries")?.length() ?: 0
+                                        GlassSectionHeader(
+                                            "本地隐私活动审计",
+                                            "纯内存核验本机 AI / 语音路由与外发字节，绝不记录原文",
+                                            trailing = {
+                                                GlassPillBadge(
+                                                    if (loadedAudit == null) "读取中…" else "外发 ${totalOut} B",
+                                                    if (loadedAudit == null || totalOut == 0L) palette.success else palette.warning,
+                                                    if (loadedAudit == null || totalOut == 0L) palette.successSoft else palette.warningSoft,
+                                                )
+                                            },
+                                        )
+                                        Text(
+                                            if (loadedAudit == null) {
+                                                "正在读取本会话隐私活动审计…"
+                                            } else {
+                                                "当前会话已记录 $auditCount 条活动 · 纯离线模式下外发严格为 0 B"
+                                            },
+                                            fontSize = 12.sp,
+                                            color = palette.textSecondary,
+                                        )
+                                        Spacer(Modifier.height(8.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            GlassButton(
+                                                "刷新审计",
+                                                style = GlassButtonStyle.Ghost,
+                                                compact = true,
+                                                onClick = {
+                                                    Core.call(this@SettingsActivity, "privacy-audit", background = true) { res ->
+                                                        res.onSuccess {
+                                                            privacyAudit = it as? JSONObject
+                                                            showToast("已刷新本地隐私审计")
+                                                        }.onFailure { showToast(it.message.orEmpty()) }
+                                                    }
+                                                },
+                                            )
+                                            GlassButton(
+                                                "清空记录",
+                                                style = GlassButtonStyle.Ghost,
+                                                compact = true,
+                                                onClick = {
+                                                    Core.call(this@SettingsActivity, "privacy-audit-clear", background = true) { res ->
+                                                        res.onSuccess {
+                                                            privacyAudit =
+                                                                JSONObject()
+                                                                    .put("pure_offline", offline)
+                                                                    .put("total_outbound_bytes", 0L)
+                                                                    .put("entries", JSONArray())
+                                                            showToast("已清空隐私审计记录")
+                                                        }.onFailure { showToast(it.message.orEmpty()) }
+                                                    }
+                                                },
+                                            )
                                         }
                                     }
 

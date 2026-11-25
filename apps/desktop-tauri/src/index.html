@@ -286,21 +286,21 @@
 
           <div class="row">
             <div class="row-copy">
-              <label for="clip-learn-toggle">剪贴板静默识词</label>
-              <p class="help">从日常复制的片段中本地提取中文专名与英文术语（自动跳过密码、密钥与网址），首次打字就能直接命中。</p>
+              <label for="prediction-toggle">Codex 风格本地预测输入</label>
+              <p class="help">先以毫秒级本地记忆首显草稿，再限时由本地 Qwen3 升级；按 <kbd>Tab</kbd> 接受，继续打字立即取消；密码框自动跳过。</p>
             </div>
             <div class="row-ctrl">
-              <input id="clip-learn-toggle" class="switch" name="learn_from_clipboard" type="checkbox" checked>
+              <input id="prediction-toggle" class="switch" name="prediction_enabled" type="checkbox" checked>
             </div>
           </div>
 
           <div class="row">
             <div class="row-copy">
-              <label for="prediction-toggle">Codex 风格本地预测输入</label>
-              <p class="help">在非组词停顿或切回输入框时异步预测下一句，按 <kbd>Tab</kbd> 接受为可编辑草稿，继续打字立即取消；密码框自动跳过。</p>
+              <label for="prediction-skip-dev-toggle">IDE 与终端自动避让预测</label>
+              <p class="help">在代码编辑器与终端中自动暂停本地预测，避免与原生 Tab 缩进或补全冲突（密码管理器与敏感输入框始终自动跳过）。</p>
             </div>
             <div class="row-ctrl">
-              <input id="prediction-toggle" class="switch" name="prediction_enabled" type="checkbox" checked>
+              <input id="prediction-skip-dev-toggle" class="switch" name="prediction_skip_dev_apps" type="checkbox" checked>
             </div>
           </div>
 
@@ -312,6 +312,16 @@
             <div class="row-ctrl range-group">
               <input id="prediction-delay-range" type="range" min="150" max="2000" step="10" value="380" name="prediction_delay_ms">
               <output class="range-val">380 ms</output>
+            </div>
+          </div>
+
+          <div class="row">
+            <div class="row-copy">
+              <label for="privacy-apps-input">隐私免打扰应用（逗号分隔）</label>
+              <p class="help">命中的应用自动暂停词频学习、本地画像与预测输入（常见密码管理器、Tor 与系统无痕标记输入已内置保护；普通桌面浏览器无痕窗口因系统不向输入法暴露标签态，如需保护可将浏览器加入列表）。</p>
+            </div>
+            <div class="row-ctrl">
+              <input id="privacy-apps-input" type="text" placeholder="例如：keepassxc, bank, signal">
             </div>
           </div>
 
@@ -643,6 +653,22 @@
           </div>
           <div class="row">
             <div class="row-copy">
+              <label for="voice-cleanup-select">语音直出规整模式</label>
+              <p class="help">离线语音转写后自动整理口水词、卡壳叠词与改口，并保留原话供一键还原</p>
+            </div>
+            <div class="row-ctrl">
+              <div class="select-wrap">
+                <select id="voice-cleanup-select" name="voice_cleanup_mode">
+                  <option value="off">原汁原味（不规整）</option>
+                  <option value="light" selected>轻度规整（推荐 · 零幻觉纯本地）</option>
+                  <option value="polish">保真润色（本地 Qwen3 限时精修）</option>
+                </select>
+                <svg class="chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+              </div>
+            </div>
+          </div>
+          <div class="row">
+            <div class="row-copy">
               <label for="ai-tier3">允许 AI 辅助连续手写消歧</label>
               <p class="help">仅在已有模糊字位候选中择优，不会凭空改写清晰字</p>
             </div>
@@ -665,6 +691,8 @@
           <div class="workbench-bar">
             <div class="actions">
               <button type="button" id="record" class="btn-accent-soft">开始录音</button>
+              <button type="button" id="restore-raw-source" class="btn-ghost" hidden>还原原话</button>
+              <button type="button" id="undo-apply-source" class="btn-ghost" hidden>撤销替换</button>
               <div class="select-wrap compact">
                 <select id="target-lang" aria-label="翻译目标语言">
                   <option value="en">译为英语</option>
@@ -676,20 +704,44 @@
               <button type="button" class="btn-ghost" data-ai="translate">翻译</button>
               <button type="button" class="btn-ghost" data-ai="polish">润色</button>
               <button type="button" class="btn-ghost" data-ai="summary">摘要</button>
+              <button type="button" id="cancel-ai-stream" class="btn-danger-ghost" hidden>停止生成</button>
             </div>
             <span class="char-count" id="source-count">0 字</span>
           </div>
 
           <div class="result-card" id="result-card" hidden>
             <div class="result-head">
-              <span id="result-title">处理结果</span>
+              <div class="title-with-badge">
+                <span id="result-title">处理结果</span>
+                <span class="badge" id="result-route-badge" hidden>本机离线</span>
+              </div>
               <div class="btn-cluster">
+                <button type="button" class="btn-mini" id="toggle-diff-result" hidden>对比改动</button>
                 <button type="button" class="btn-mini" id="copy-result">复制结果</button>
                 <button type="button" class="btn-mini" id="apply-result">替换原文</button>
               </div>
             </div>
             <p id="result"></p>
+            <div id="result-diff" class="diff-view" hidden></div>
           </div>
+        </article>
+
+        <article class="card">
+          <div class="card-head row-head">
+            <div>
+              <div class="title-with-badge">
+                <h2>本地隐私活动审计</h2>
+                <span class="badge is-ok" id="privacy-audit-badge">外发 0 B</span>
+              </div>
+              <span class="card-sub">仅驻留内存、不记录原文，实时核验每次 AI 与语音请求的本地/远端路由及外发字节数</span>
+            </div>
+            <div class="btn-cluster">
+              <button type="button" class="btn-ghost" id="btn-audit-refresh">刷新</button>
+              <button type="button" class="btn-ghost" id="btn-audit-clear">清空记录</button>
+            </div>
+          </div>
+          <ul id="privacy-audit-list" class="mini-log"></ul>
+          <div id="privacy-audit-empty" class="empty-state compact">本次会话暂无 AI / 语音活动记录</div>
         </article>
       </section>
     </div>

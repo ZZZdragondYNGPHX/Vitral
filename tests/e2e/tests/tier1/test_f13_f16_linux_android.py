@@ -290,8 +290,8 @@ def test_f15_android_xiaohe_4row_vs_quanpin_5row_and_numpad(
     vitral_target.require_android_apk()
     keycaps = design_tokens["ergonomics"]["schemaKeycaps"]
     assert keycaps["double_pinyin_flypy"]["rows"] == 4
-    assert keycaps["rime_ice_quanpin"]["rows"] == 5
-    assert keycaps["rime_ice_quanpin"]["dedicatedTopNumberRow"] is True
+    assert keycaps["rime_ice_quanpin"]["rows"] == 4
+    assert keycaps["rime_ice_quanpin"]["dedicatedTopNumberRow"] is False
 
     android_dir = vitral_target.targets.vitral_root / "apps" / "android"
     kt_src = _read_dir_sources(android_dir, (".kt", ".java"))
@@ -448,9 +448,10 @@ def test_f16_android_compose_settings_and_gradle_unit_tests_pass(
     vitral_target.require_android_apk()
     android_dir = vitral_target.targets.vitral_root / "apps" / "android"
     gradlew = android_dir / "gradlew"
+    env_sh = vitral_target.targets.vitral_root / "scripts" / "env.sh"
     assert gradlew.is_file(), "apps/android/gradlew missing"
     proc = subprocess.run(
-        [str(gradlew), "testDebugUnitTest"],
+        ["bash", "-lc", f"source '{env_sh}' && '{gradlew}' --no-daemon --max-workers=1 testDebugUnitTest"],
         cwd=android_dir,
         capture_output=True,
         text=True,

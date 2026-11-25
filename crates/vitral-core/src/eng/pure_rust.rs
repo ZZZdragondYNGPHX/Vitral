@@ -1682,7 +1682,7 @@ mod device_tests {
                         .map(|suffix| (suffix, weight))
                 })
                 .collect();
-            expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            expected.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
             expected.truncate(if prefix.chars().count() == 1 { 24 } else { 10 });
             assert_eq!(
                 corpus.continuations(prefix).collect::<Vec<_>>(),

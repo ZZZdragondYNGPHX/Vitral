@@ -12,6 +12,8 @@ native-onnx = ["dep:ort"]
 native-voice = ["dep:ort", "dep:kaldi-fbank"]
 
 [dependencies]
+bytes = "1"
+http-body = "1"
 kaldi-fbank = { version = "0.3", optional = true }
 vitral-tokens = { path = "../vitral-tokens" }
 serde.workspace = true
@@ -32,10 +34,12 @@ chacha20poly1305.workspace = true
 getrandom.workspace = true
 zstd.workspace = true
 tiny_http.workspace = true
-ureq.workspace = true
 socket2.workspace = true
 mdns-sd.workspace = true
 chrono = { workspace = true, features = ["clock", "std"] }
+
+[dev-dependencies]
+ureq.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ort = { workspace = true, optional = true, features = ["std", "download-binaries", "tls-rustls", "api-17"] }

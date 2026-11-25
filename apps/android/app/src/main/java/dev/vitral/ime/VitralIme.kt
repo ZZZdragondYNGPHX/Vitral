@@ -98,6 +98,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var inlineRequest = 0
     private var english = false
     private var fieldForceEnglish = false
+    private var noPersonalizedLearning = false
     private var fieldKind = "text" // text | number | email | uri | password
     private var autoCapMode = 0 // 0=none, 1=sentences, 2=words, 3=all
     private var shiftState = 0 // 0=lower, 1=single, 2=capsLock
@@ -118,6 +119,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var voiceActive = false
     private var voicePartialText = ""
     private var lastVoiceCommitted = ""
+    private var lastVoiceRawTranscript = ""
+    private var lastVoiceCleaned = false
     private var lastVoiceCommitAtMs = 0L
     private var voiceCommitEnd = -1
     private var voiceCommitAwaitingCursor = false
@@ -231,6 +234,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
 
     private var alive = false
+    private var thermalListener: Any? = null
     private val pollClipboard =
         object : Runnable {
             override fun run() {
@@ -273,6 +277,19 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             @Suppress("UnspecifiedRegisterReceiverFlag")
             registerReceiver(powerSaveReceiver, powerFilter)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val pm = getSystemService(PowerManager::class.java)
+            if (pm != null) {
+                val listener =
+                    PowerManager.OnThermalStatusChangedListener {
+                        main.post { if (alive) syncPowerSaveState() }
+                    }
+                runCatching {
+                    pm.addThermalStatusListener(listener)
+                    thermalListener = listener
+                }
+            }
+        }
         main.post(pollClipboard)
         clipboard.addPrimaryClipChangedListener(this)
         getSharedPreferences("vitral", 0).registerOnSharedPreferenceChangeListener(preferencesListener)
@@ -280,6 +297,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun clearVoiceCommitAnchor() {
         lastVoiceCommitted = ""
+        lastVoiceRawTranscript = ""
+        lastVoiceCleaned = false
         lastVoiceCommitAtMs = 0L
         voiceCommitEnd = -1
         voiceCommitAwaitingCursor = false
@@ -291,7 +310,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         val pm = getSystemService(PowerManager::class.java)
         val bm = getSystemService(BatteryManager::class.java)
         val pct = bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1
-        val powerSave = (pm?.isPowerSaveMode == true) || (pct in 1..19)
+        val thermalThrottled =
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                (pm?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE) >=
+                    PowerManager.THERMAL_STATUS_MODERATE
+        val powerSave = (pm?.isPowerSaveMode == true) || (pct in 1..19) || thermalThrottled
         if (lastPowerSaveSent == powerSave) return
         lastPowerSaveSent = powerSave
         Core.call(this, "set-power-save", json("enabled" to powerSave), background = true) {}
@@ -300,6 +323,15 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     override fun onDestroy() {
         alive = false
         runCatching { unregisterReceiver(powerSaveReceiver) }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val listener = thermalListener as? PowerManager.OnThermalStatusChangedListener
+            thermalListener = null
+            if (listener != null) {
+                runCatching {
+                    getSystemService(PowerManager::class.java)?.removeThermalStatusListener(listener)
+                }
+            }
+        }
         clearInlineSuggestions(refreshBar = false)
         main.removeCallbacks(pollClipboard)
         invalidateEditor()
@@ -626,6 +658,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 else -> "text"
             }
         fieldForceEnglish = passwordEditor
+        noPersonalizedLearning =
+            passwordEditor ||
+                ((info?.imeOptions ?: 0) and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         numbers = fieldKind == "number"
         autoCapMode =
             when {
@@ -650,7 +685,13 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         manualLangOverride = false
         loadUiPreferences()
         Core.run(this, operation = { unpack(VitralNative.processKey(it, 27, 0, 0)) })
-        call("on-app-focus", json("app_id" to (info?.packageName ?: "android"))) {
+        call(
+            "on-app-focus",
+            json(
+                "app_id" to (info?.packageName ?: "android"),
+                "no_personalized_learning" to noPersonalizedLearning,
+            ),
+        ) {
             english = fieldForceEnglish || it.optString("lang_mode") == "en"
             if (!flypy && aeviouExperimental) {
                 detectedAeviouEnv = detectAeviouEnvFromContext()
@@ -658,10 +699,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
             updateAutoCap(redraw = false)
             render()
-            if (!passwordEditor) schedulePrediction("catch_up", 0)
+            if (!passwordEditor && !noPersonalizedLearning) schedulePrediction("catch_up", 0)
         }
         call("on-ime-open") { updatePaste(it) }
-        onPrimaryClipChanged()
         reconcileClipboard()
         layoutPanel()
         render()
@@ -869,16 +909,19 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         predictionId = 0
         predictionActive = false
         if (hadRemote) Core.call(this, "predict-cancel", auxiliary = true)
-        if (visible) candidates()
+        if (visible) {
+            candidates()
+            refreshAeviouContextHints()
+        }
     }
 
     private fun schedulePrediction(trigger: String, delay: Long = predictionDelay) {
         cancelPrediction()
-        if (!active || composing || passwordEditor || !predictionEnabled || mode != "keys") return
+        if (!active || composing || passwordEditor || noPersonalizedLearning || !predictionEnabled || mode != "keys") return
         val epoch = predictionEpoch
         val session = editor
         val task = Runnable {
-            if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor)
+            if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor || noPersonalizedLearning)
                 return@Runnable
             // Never request surrounding text from a password editor.
             val ic = currentInputConnection
@@ -896,6 +939,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     "trigger" to trigger,
                     "is_composing" to false,
                     "is_password" to false,
+                    "no_personalized_learning" to noPersonalizedLearning,
                 ),
                 auxiliary = true,
             ) {
@@ -924,9 +968,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (!active || session != editor || epoch != predictionEpoch || composing || passwordEditor || mode != "keys")
             return
         predictionId = r.optLong("id")
+        val upgrading = r.optBoolean("upgrading", false)
         when (r.optString("status")) {
             "pending" -> {
-                if (polls >= 25) {
+                if (polls >= 6) {
                     cancelPrediction()
                     return
                 }
@@ -937,7 +982,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         }
                 }
                 predictionTask = task
-                main.postDelayed(task, 120)
+                main.postDelayed(task, 100)
             }
             "ready" -> {
                 val ic = currentInputConnection
@@ -948,14 +993,29 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     cancelPrediction()
                     return
                 }
-                predictionCandidates = parsePredictionCandidates(r)
-                predictionText = predictionCandidates.firstOrNull().orEmpty()
+                val nextCandidates = parsePredictionCandidates(r)
+                val nextText = nextCandidates.firstOrNull().orEmpty()
+                val changed = nextCandidates != predictionCandidates || nextText != predictionText
+                predictionCandidates = nextCandidates
+                predictionText = nextText
                 predictionActive = predictionText.isNotEmpty()
-                candidates()
-                refreshAeviouContextHints()
+                if (changed) {
+                    candidates()
+                    refreshAeviouContextHints()
+                }
+                if (upgrading && polls < 5) {
+                    val task = Runnable {
+                        if (session == editor && epoch == predictionEpoch && !composing && !passwordEditor)
+                            call("predict-poll", json("id" to predictionId), auxiliary = true) {
+                                receivePrediction(it, epoch, session, polls + 1)
+                            }
+                    }
+                    predictionTask = task
+                    main.postDelayed(task, 100)
+                }
             }
             else -> {
-                predictionActive = false
+                cancelPrediction()
             }
         }
     }
@@ -976,10 +1036,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         call("predict-poll", json("id" to id), auxiliary = true) { current ->
             if (epoch != predictionEpoch || predictionId != id || passwordEditor || composing) return@call
             val liveCandidates = parsePredictionCandidates(current)
+            val prevCandidate = current.optString("previous_candidate")
             val liveIc = currentInputConnection
             if (
                 current.optString("status") != "ready" ||
-                    text !in liveCandidates ||
+                    (text !in liveCandidates && (prevCandidate.isEmpty() || text != prevCandidate)) ||
                     liveIc?.getTextBeforeCursor(200, 0)?.toString().orEmpty() != predictionContext ||
                     liveIc?.getTextAfterCursor(80, 0)?.toString().orEmpty() != predictionContextAfter
             ) {
@@ -990,7 +1051,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             invalidateSurroundingCache()
             Core.call(this, "predict-accept", json("id" to id, "text" to text), auxiliary = true)
             cancelPrediction()
-            schedulePrediction("live")
         }
     }
 
@@ -1037,7 +1097,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             return true
         }
         if (keyCode == KeyEvent.KEYCODE_ESCAPE && predictionText.isNotEmpty()) {
-            Core.call(this, "predict-dismiss", json("id" to predictionId), auxiliary = true)
+            Core.call(
+                this,
+                "predict-dismiss",
+                json("id" to predictionId, "text" to predictionText),
+                auxiliary = true,
+            )
             cancelPrediction()
             handledHardwareKeys.add(keyCode)
             return true
@@ -1163,9 +1228,13 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                                 r.optString("commit_text")
                             else ""
                         if (committed.isNotEmpty()) {
+                            val clipboardCommit = r.optBoolean("clipboard_commit", false)
                             currentInputConnection?.commitText(committed, 1)
+                            if (clipboardCommit) cancelPrediction()
                             invalidateSurroundingCache()
-                            if (!passwordEditor) lastCommittedText = committed
+                            if (clipboardCommit) lastCommittedText = ""
+                            else if (!passwordEditor) lastCommittedText = committed
+                            if (aeviouView != null) refreshAeviouContextHints()
                         }
                         onSameEditorPanelSwitched?.invoke(r)
                     }
@@ -1196,9 +1265,13 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                                 r.optString("commit_text")
                             else ""
                         if (committed.isNotEmpty()) {
+                            val clipboardCommit = r.optBoolean("clipboard_commit", false)
                             currentInputConnection?.commitText(committed, 1)
+                            if (clipboardCommit) cancelPrediction()
                             invalidateSurroundingCache()
-                            if (!passwordEditor) lastCommittedText = committed
+                            if (clipboardCommit) lastCommittedText = ""
+                            else if (!passwordEditor) lastCommittedText = committed
+                            if (aeviouView != null) refreshAeviouContextHints()
                         }
                         onSameEditorPanelSwitched?.invoke(r)
                     }
@@ -2791,6 +2864,62 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     candidates()
                 }
             )
+            if (lastVoiceCleaned && lastVoiceRawTranscript.isNotEmpty() && lastVoiceRawTranscript != voiced) {
+                val rawText = lastVoiceRawTranscript
+                addBarItem(
+                    label("↩ 还原原话", subtle = true) {
+                        val ic = currentInputConnection
+                        if (verifyLiveVoiceAnchor(ic)) {
+                            ic!!.beginBatchEdit()
+                            var ok = false
+                            var deletedWithoutRestore = false
+                            try {
+                                if (ic.deleteSurroundingText(voiced.length, 0)) {
+                                    ok = ic.commitText(rawText, 1)
+                                    if (!ok) {
+                                        // Restore deleted transcript if target editor rejects replacement.
+                                        if (!ic.commitText(voiced, 1)) {
+                                            deletedWithoutRestore = true
+                                        }
+                                    }
+                                }
+                            } finally {
+                                ic.endBatchEdit()
+                            }
+                            invalidateSurroundingCache()
+                            if (deletedWithoutRestore) {
+                                lastDeletedText = voiced
+                                lastDeletedAtMs = SystemClock.uptimeMillis()
+                                clearVoiceCommitAnchor()
+                                message("编辑器拒绝替换，可点击「撤销删除」恢复原转写")
+                            } else {
+                                val baseStart = expectedEnd - voiced.length
+                                if (ok && baseStart >= 0 && rawText.length <= 4000) {
+                                    val snapLen = (rawText.length + 32).coerceAtMost(4096)
+                                    val snap = ic.getTextBeforeCursor(snapLen, 0)?.toString().orEmpty()
+                                    if (snap.endsWith(rawText)) {
+                                        lastVoiceCommitted = rawText
+                                        lastVoiceRawTranscript = ""
+                                        lastVoiceCleaned = false
+                                        lastVoiceCommitAtMs = SystemClock.uptimeMillis()
+                                        voiceCommitEnd = baseStart + rawText.length
+                                        voiceCommitAwaitingCursor = true
+                                        voiceCommitSnapshot = snap
+                                        voiceCommitSeq += 1
+                                    } else {
+                                        clearVoiceCommitAnchor()
+                                    }
+                                } else {
+                                    clearVoiceCommitAnchor()
+                                }
+                            }
+                        } else {
+                            clearVoiceCommitAnchor()
+                        }
+                        candidates()
+                    }
+                )
+            }
             addBarItem(
                 label("✨ 润色语音", highlight = true) {
                     val id = editor
@@ -3474,12 +3603,20 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 },
                 "剪切" to {
                     currentInputConnection?.performContextMenuAction(android.R.id.cut)
+                    lastCommittedText = ""
+                    clearUndoCommitAnchor()
+                    Core.call(this, "reset-commit-context")
+                    cancelPrediction()
                     invalidateSurroundingCache()
                     editSelectMode = false
                     message("已剪切")
                 },
                 "粘贴" to {
                     currentInputConnection?.performContextMenuAction(android.R.id.paste)
+                    lastCommittedText = ""
+                    clearUndoCommitAnchor()
+                    Core.call(this, "reset-commit-context")
+                    cancelPrediction()
                     invalidateSurroundingCache()
                     editSelectMode = false
                 },
@@ -3912,6 +4049,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     val codeBadge =
                         label(codeText, highlight = true, mono = true) {
                             currentInputConnection?.commitText(content, 1)
+                            lastCommittedText = ""
+                            Core.call(this, "reset-commit-context")
+                            cancelPrediction()
                             invalidateSurroundingCache()
                             switch("keys")
                         }
@@ -3938,6 +4078,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         )
                         setOnClickListener {
                             currentInputConnection?.commitText(content, 1)
+                            lastCommittedText = ""
+                            Core.call(this@VitralIme, "reset-commit-context")
+                            cancelPrediction()
                             invalidateSurroundingCache()
                             switch("keys")
                         }
@@ -4039,6 +4182,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 val joined = tokens.filterIndexed { i, _ -> i in picked }.joinToString("")
                 if (joined.isNotEmpty()) {
                     currentInputConnection?.commitText(joined, 1)
+                    lastCommittedText = ""
+                    Core.call(this, "reset-commit-context")
+                    cancelPrediction()
                     invalidateSurroundingCache()
                     switch("keys")
                 }
@@ -4914,7 +5060,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private fun refreshAeviouContextHints() {
         val hintEpoch = ++aeviouHintEpoch
         val view = aeviouView ?: return
-        if (passwordEditor) {
+        if (passwordEditor || noPersonalizedLearning) {
             view.setContextHints(emptyMap())
             return
         }
@@ -4943,9 +5089,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 if (init !in fallback) fallback[init] = Triple(v.first, v.second, fallback.size)
             }
         }
-        if (fallback.isNotEmpty()) view.setContextHints(fallback)
-        if (before.isEmpty() && pred.isEmpty()) {
+        if (fallback.isNotEmpty()) {
+            view.setContextHints(fallback)
+        } else {
             view.setContextHints(emptyMap())
+        }
+        if (before.isEmpty() && pred.isEmpty()) {
             return
         }
         val gen = editor
@@ -4982,6 +5131,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private fun applyAction(r: JSONObject) {
         val ic = currentInputConnection ?: return
         val wasComposing = composing
+        val clipboardCommit = r.optBoolean("clipboard_commit", false)
         val committed = if (!r.isNull("commit_text")) r.getString("commit_text") else ""
         if (committed.isNotEmpty()) {
             val baseStart =
@@ -4991,8 +5141,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             val committedOk = ic.commitText(committed, 1)
             invalidateSurroundingCache()
             if (!passwordEditor) {
-                if (committedOk) lastCommittedText = committed
-                if (committedOk && wasComposing && baseStart >= 0) {
+                if (committedOk) lastCommittedText = if (clipboardCommit) "" else committed
+                if (committedOk && !clipboardCommit && wasComposing && baseStart >= 0) {
                     val snapshot = ic.getTextBeforeCursor(40, 0)?.toString().orEmpty()
                     if (snapshot.endsWith(committed)) {
                         lastUndoCommitEnd = baseStart + committed.length
@@ -5036,7 +5186,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             mode = "keys"
             needsRender = true
         }
-        if (composing) cancelPrediction()
+        if (composing || clipboardCommit) cancelPrediction()
         else if (committed.isNotEmpty() && !passwordEditor) schedulePrediction("live")
         val previousEnglish = english
         english = fieldForceEnglish || r.optString("lang_mode") == "en"
@@ -5108,22 +5258,25 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             voicePartialText = ""
             if (active && id == editor && !passwordEditor) {
                 result
-                    .onSuccess {
-                        if (it.isNotEmpty()) {
+                    .onSuccess { outcome ->
+                        val text = outcome.transcript
+                        if (text.isNotEmpty()) {
                             val ic = currentInputConnection
                             val baseStart =
                                 if (currentSelStart >= 0 && currentSelEnd >= 0)
                                     minOf(currentSelStart, currentSelEnd)
                                 else -1
-                            val ok = ic?.commitText(it, 1) == true
+                            val ok = ic?.commitText(text, 1) == true
                             invalidateSurroundingCache()
-                            if (ok && baseStart >= 0 && it.length <= 4000) {
-                                val snapLen = (it.length + 32).coerceAtMost(4096)
+                            if (ok && baseStart >= 0 && text.length <= 4000) {
+                                val snapLen = (text.length + 32).coerceAtMost(4096)
                                 val snap = ic?.getTextBeforeCursor(snapLen, 0)?.toString().orEmpty()
-                                if (snap.endsWith(it)) {
-                                    lastVoiceCommitted = it
+                                if (snap.endsWith(text)) {
+                                    lastVoiceCommitted = text
+                                    lastVoiceRawTranscript = outcome.rawTranscript
+                                    lastVoiceCleaned = outcome.cleaned
                                     lastVoiceCommitAtMs = SystemClock.uptimeMillis()
-                                    voiceCommitEnd = baseStart + it.length
+                                    voiceCommitEnd = baseStart + text.length
                                     voiceCommitAwaitingCursor = true
                                     voiceCommitSnapshot = snap
                                     voiceCommitSeq += 1

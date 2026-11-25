@@ -182,22 +182,22 @@ impl QwenBpe {
     pub fn decode(&self, ids: &[i64], skip_special: bool) -> String {
         let mut bytes = Vec::new();
         for id in ids {
-            if skip_special && self.special_ids.contains(id) {
-                continue;
-            }
-            if let Some(s) = self.tokens.get(id) {
-                if self.specials.contains(s) {
-                    bytes.extend_from_slice(s.as_bytes());
-                } else {
-                    for c in s.chars() {
-                        if let Some(b) = self.reverse.get(&c) {
-                            bytes.push(*b);
-                        }
-                    }
-                }
-            }
+            self.append_token_bytes(*id, skip_special, &mut bytes);
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub(super) fn append_token_bytes(&self, id: i64, skip_special: bool, bytes: &mut Vec<u8>) {
+        if skip_special && self.special_ids.contains(&id) {
+            return;
+        }
+        if let Some(token) = self.tokens.get(&id) {
+            if self.specials.contains(token) {
+                bytes.extend_from_slice(token.as_bytes());
+            } else {
+                bytes.extend(token.chars().filter_map(|ch| self.reverse.get(&ch)));
+            }
+        }
     }
 }
 // Equivalent to Qwen's pre-tokenization pattern. Keep Unicode letters together,

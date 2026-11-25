@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from vitral_e2e.tokens import (
     assert_prototype_reconciled_values,
 )
 
-# All 40 frozen C-ABI symbols declared in crates/vitral-ffi/include/vitral_core.h
+# All 41 frozen C-ABI symbols declared in crates/vitral-ffi/include/vitral_core.h
 EXPECTED_FFI_SYMBOLS: tuple[str, ...] = (
     "vitral_abi_version",
     "vitral_init",
@@ -34,6 +35,7 @@ EXPECTED_FFI_SYMBOLS: tuple[str, ...] = (
     "vitral_free_result",
     "vitral_on_app_focus",
     "vitral_process_key",
+    "vitral_process_touch_key",
     "vitral_select_candidate",
     "vitral_pin_candidate",
     "vitral_erase_candidate",
@@ -64,7 +66,7 @@ EXPECTED_FFI_SYMBOLS: tuple[str, ...] = (
     "vitral_restore_from_koofr",
 )
 
-# All 38 camelCase JNI entrypoints declared in crates/vitral-jni/src/lib.rs
+# All 39 camelCase JNI entrypoints declared in crates/vitral-jni/src/lib.rs
 EXPECTED_JNI_METHODS: tuple[str, ...] = (
     "abiVersion",
     "nativeInit",
@@ -76,6 +78,7 @@ EXPECTED_JNI_METHODS: tuple[str, ...] = (
     "reloadAssets",
     "onAppFocus",
     "processKey",
+    "processTouchKey",
     "selectCandidate",
     "pinCandidate",
     "eraseCandidate",
@@ -562,7 +565,7 @@ def test_f04_ffi_header_declares_frozen_abi_v1_symbols(vitral_target: VitralTarg
     m = re.search(r'extern "C" \{(.*?)#ifdef __cplusplus', header, re.S)
     assert m is not None, 'extern "C" block missing in vitral_core.h'
     declared = re.findall(r"\b(vitral_\w+)\s*\(", m.group(1))
-    assert len(declared) == len(EXPECTED_FFI_SYMBOLS) == 40
+    assert len(declared) == len(EXPECTED_FFI_SYMBOLS) == 41
     assert set(declared) == set(EXPECTED_FFI_SYMBOLS)
 
 
@@ -581,66 +584,94 @@ def test_f04_ffi_cdll_loads_and_reports_abi_version_1(vitral_target: VitralTarge
 @pytest.mark.tier1
 @pytest.mark.requires_core
 def test_f04_ffi_init_shutdown_and_pure_offline_lifecycle(vitral_target: VitralTarget) -> None:
-    cdll = vitral_target.load_ffi_cdll()
-    cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
-    cdll.vitral_init.restype = ctypes.c_int
-    cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
-    cdll.vitral_set_pure_offline.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-    cdll.vitral_set_pure_offline.restype = ctypes.c_int
-    cdll.vitral_is_pure_offline.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool)]
-    cdll.vitral_is_pure_offline.restype = ctypes.c_int
-    cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
+    ffi_lib = vitral_target.require_ffi()
+    script = """
+import ctypes, sys
+cdll = ctypes.CDLL(sys.argv[1])
+cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+cdll.vitral_init.restype = ctypes.c_int
+cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
+cdll.vitral_set_pure_offline.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+cdll.vitral_set_pure_offline.restype = ctypes.c_int
+cdll.vitral_is_pure_offline.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_bool)]
+cdll.vitral_is_pure_offline.restype = ctypes.c_int
+cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
 
-    engine = ctypes.c_void_p()
-    err_ptr = ctypes.c_void_p()
-    status = cdll.vitral_init(b"{}", ctypes.byref(engine), ctypes.byref(err_ptr))
-    assert status == 0
-    assert bool(engine.value)
-    if err_ptr.value:
-        cdll.vitral_free_string(err_ptr)
+engine = ctypes.c_void_p()
+err_ptr = ctypes.c_void_p()
+status = cdll.vitral_init(b"{}", ctypes.byref(engine), ctypes.byref(err_ptr))
+assert status == 0
+assert bool(engine.value)
+if err_ptr.value:
+    cdll.vitral_free_string(err_ptr)
+try:
+    assert cdll.vitral_set_pure_offline(engine, True) == 0
+    flag = ctypes.c_bool(False)
+    assert cdll.vitral_is_pure_offline(engine, ctypes.byref(flag)) == 0
+    assert flag.value is True
 
-    try:
-        assert cdll.vitral_set_pure_offline(engine, True) == 0
-        flag = ctypes.c_bool(False)
-        assert cdll.vitral_is_pure_offline(engine, ctypes.byref(flag)) == 0
-        assert flag.value is True
-
-        assert cdll.vitral_set_pure_offline(engine, False) == 0
-        assert cdll.vitral_is_pure_offline(engine, ctypes.byref(flag)) == 0
-        assert flag.value is False
-    finally:
-        cdll.vitral_shutdown(engine)
+    assert cdll.vitral_set_pure_offline(engine, False) == 0
+    assert cdll.vitral_is_pure_offline(engine, ctypes.byref(flag)) == 0
+    assert flag.value is False
+finally:
+    cdll.vitral_shutdown(engine)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(ffi_lib)],
+        capture_output=True,
+        text=True,
+        env=vitral_target._build_env(),
+        timeout=25,
+        check=False,
+    )
+    assert proc.returncode == 0, f"FFI init/shutdown subprocess failed:\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.tier1
 @pytest.mark.requires_core
 def test_f04_ffi_string_result_and_free_contract(vitral_target: VitralTarget) -> None:
-    cdll = vitral_target.load_ffi_cdll()
-    cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
-    cdll.vitral_init.restype = ctypes.c_int
-    cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
-    cdll.vitral_quick_paste_state.argtypes = [ctypes.c_void_p]
-    cdll.vitral_quick_paste_state.restype = _VitralStringResult
-    cdll.vitral_free_result.argtypes = [_VitralStringResult]
-    cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
+    ffi_lib = vitral_target.require_ffi()
+    script = """
+import ctypes, json, sys
+class _VitralStringResult(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_int), ("json_utf8", ctypes.c_void_p), ("error_message", ctypes.c_void_p)]
 
-    engine = ctypes.c_void_p()
-    err_ptr = ctypes.c_void_p()
-    assert cdll.vitral_init(b"{}", ctypes.byref(engine), ctypes.byref(err_ptr)) == 0
+cdll = ctypes.CDLL(sys.argv[1])
+cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+cdll.vitral_init.restype = ctypes.c_int
+cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
+cdll.vitral_quick_paste_state.argtypes = [ctypes.c_void_p]
+cdll.vitral_quick_paste_state.restype = _VitralStringResult
+cdll.vitral_free_result.argtypes = [_VitralStringResult]
+cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
+
+engine = ctypes.c_void_p()
+err_ptr = ctypes.c_void_p()
+assert cdll.vitral_init(b"{}", ctypes.byref(engine), ctypes.byref(err_ptr)) == 0
+try:
+    res = cdll.vitral_quick_paste_state(engine)
     try:
-        res = cdll.vitral_quick_paste_state(engine)
-        try:
-            assert res.status == 0
-            assert res.json_utf8 is not None
-            assert res.error_message is None
-            raw_json = ctypes.cast(res.json_utf8, ctypes.c_char_p).value.decode("utf-8")
-            parsed = json.loads(raw_json)
-            assert isinstance(parsed, dict)
-        finally:
-            cdll.vitral_free_result(res)
-        cdll.vitral_free_string(None)
+        assert res.status == 0
+        assert res.json_utf8 is not None
+        assert res.error_message is None
+        raw_json = ctypes.cast(res.json_utf8, ctypes.c_char_p).value.decode("utf-8")
+        parsed = json.loads(raw_json)
+        assert isinstance(parsed, dict)
     finally:
-        cdll.vitral_shutdown(engine)
+        cdll.vitral_free_result(res)
+    cdll.vitral_free_string(None)
+finally:
+    cdll.vitral_shutdown(engine)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(ffi_lib)],
+        capture_output=True,
+        text=True,
+        env=vitral_target._build_env(),
+        timeout=25,
+        check=False,
+    )
+    assert proc.returncode == 0, f"FFI string result subprocess failed:\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.tier1
@@ -655,7 +686,7 @@ def test_f04_jni_exports_all_38_camelcase_methods_and_v1_2_hooks(
         r'pub extern "system" fn (Java_dev_vitral_ime_core_VitralNative_\w+)',
         text,
     )
-    assert len(found_syms) == 38, f"Expected 38 JNI exports, found {len(found_syms)}"
+    assert len(found_syms) == 39, f"Expected 39 JNI exports, found {len(found_syms)}"
     assert all("_1" not in sym for sym in found_syms), (
         f"Underscore-mangled JNI symbol detected: {[s for s in found_syms if '_1' in s]}"
     )

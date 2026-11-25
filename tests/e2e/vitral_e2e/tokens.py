@@ -248,9 +248,9 @@ def assert_schema_keycaps_invariants(tokens: dict[str, Any]) -> None:
 
     quanpin = keycaps.get("rime_ice_quanpin")
     assert isinstance(quanpin, dict)
-    assert _is_strict_int(quanpin.get("rows")) and quanpin["rows"] == 5
-    assert quanpin.get("dedicatedTopNumberRow") is True
-    assert quanpin.get("topRightSublabel") == "swipe-up-symbol"
+    assert _is_strict_int(quanpin.get("rows")) and quanpin["rows"] == 4
+    assert quanpin.get("dedicatedTopNumberRow") is False
+    assert quanpin.get("topRightSublabel") == "swipe-up-number-or-symbol"
 
 
 def assert_prototype_reconciled_values(tokens: dict[str, Any]) -> None:

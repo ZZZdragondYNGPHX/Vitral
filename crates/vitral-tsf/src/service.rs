@@ -177,6 +177,7 @@ struct Editor {
     cookie: Cell<Option<u32>>,
     composition: RefCell<Option<(ITfContext, ITfComposition)>>,
     commit_end: RefCell<Option<(ITfContext, ITfRange)>>,
+    prediction_anchor: RefCell<Option<(ITfContext, ITfRange)>>,
     panel: Cell<*mut c_void>,
     view: RefCell<View>,
     shift_held: Cell<bool>,
@@ -279,7 +280,8 @@ impl Editor {
             )
         }
     }
-    fn clear_prediction(&self) -> (u64, bool) {
+    fn clear_prediction(&self) -> (u64, String) {
+        self.prediction_anchor.replace(None);
         let timer = self.prediction_timer.replace(0);
         if timer != 0 {
             unsafe {
@@ -291,20 +293,25 @@ impl Editor {
         }
         let mut v = self.view.borrow_mut();
         let id = std::mem::take(&mut v.prediction_id);
-        let visible = !v.prediction_text.is_empty();
-        v.prediction_text.clear();
-        (id, visible)
+        let text = std::mem::take(&mut v.prediction_text);
+        (id, text)
     }
     fn cancel_prediction(&self, dismissed: bool) {
-        let (id, visible) = self.clear_prediction();
+        let (id, text) = self.clear_prediction();
+        let visible = !text.is_empty();
         if id != 0 {
+            let payload = if dismissed && visible {
+                json!({"id": id, "text": text})
+            } else {
+                json!({"id": id})
+            };
             let _ = self.call(
                 if dismissed {
                     "predict-dismiss"
                 } else {
                     "predict-cancel"
                 },
-                json!({"id":id}),
+                payload,
             );
         }
         if self.ipc_failed.get() {
@@ -435,14 +442,20 @@ impl Editor {
             });
         }
     }
-    fn schedule_prediction(self: &Rc<Self>, catch_up: bool) {
+    fn schedule_prediction(
+        self: &Rc<Self>,
+        catch_up: bool,
+        anchor: Option<(ITfContext, ITfRange)>,
+    ) {
         self.cancel_prediction(false);
         if !self.view.borrow().active
             || self.composition.borrow().is_some()
             || self.view.borrow().mode != 0
+            || self.view.borrow().context_before.trim().is_empty()
         {
             return;
         }
+        self.prediction_anchor.replace(anchor);
         self.prediction_polls.set(0);
         self.prediction_trigger.set(catch_up);
         let Ok(state) = self.call("profile-state", json!({})) else {
@@ -469,6 +482,7 @@ impl Editor {
         if !self.view.borrow().active
             || self.composition.borrow().is_some()
             || self.view.borrow().mode != 0
+            || self.view.borrow().context_before.trim().is_empty()
         {
             return;
         }
@@ -491,16 +505,23 @@ impl Editor {
             return;
         };
         self.view.borrow_mut().prediction_id = r["id"].as_u64().unwrap_or(0);
+        let upgrading = r["upgrading"].as_bool().unwrap_or(false);
         if r["status"] == "pending" {
-            if polls >= 25 {
+            if polls >= 6 {
                 self.cancel_prediction(false);
                 return;
             }
             self.prediction_polls.set(polls + 1);
-            self.arm_prediction(120);
+            self.arm_prediction(100);
         } else if r["status"] == "ready" {
             self.view.borrow_mut().prediction_text = r["text"].as_str().unwrap_or("").into();
             self.draw(false, false);
+            if upgrading && polls < 5 {
+                self.prediction_polls.set(polls + 1);
+                self.arm_prediction(100);
+            }
+        } else {
+            self.cancel_prediction(false);
         }
     }
     fn refresh_shortcuts(&self) -> Result<()> {
@@ -551,7 +572,28 @@ impl Editor {
                 self.recover_ipc_failure();
                 return;
             }
-            self.schedule_prediction(true);
+            let mut catch_up_anchor = None;
+            if self.view.borrow().active && self.composition.borrow().is_none() {
+                if let Some(ctx) = self.current_context().filter(|c| !input_disabled(c)) {
+                    let out = Rc::new(RefCell::new(None));
+                    let session: ITfEditSession = FocusContextCheck {
+                        ctx: ctx.clone(),
+                        out: out.clone(),
+                        _live: Live::new(),
+                    }
+                    .into();
+                    let ok = unsafe {
+                        ctx.RequestEditSession(self.tid.get(), &session, TF_ES_SYNC | TF_ES_READ)
+                    };
+                    if ok.is_ok_and(|hr| hr.is_ok()) {
+                        if let Some((text, anchor)) = out.borrow_mut().take() {
+                            self.view.borrow_mut().context_before = text;
+                            catch_up_anchor = Some((ctx, anchor));
+                        }
+                    }
+                }
+            }
+            self.schedule_prediction(true, catch_up_anchor);
         } else {
             self.cancel_prediction(false);
             self.on_ime_close();
@@ -650,6 +692,57 @@ impl ITfEditSession_Impl for InputScopeCheck_Impl {
         Ok(())
     }
 }
+fn read_focus_context(ctx: &ITfContext, ec: u32) -> Result<Option<(String, ITfRange)>> {
+    if read_input_scope(ctx, ec)? != InputAccess::Allowed {
+        return Ok(None);
+    }
+    unsafe {
+        let mut selection = [TF_SELECTION::default()];
+        let mut fetched = 0;
+        let selected = ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
+        let range = ManuallyDrop::take(&mut selection[0].range);
+        selected?;
+        let Some(range) = range.filter(|_| fetched == 1) else {
+            return Ok(None);
+        };
+        if selection[0].style.fInterimChar.as_bool() || !range.IsEmpty(ec)?.as_bool() {
+            return Ok(None);
+        }
+        let probe = range.Clone()?;
+        let mut shifted = 0;
+        probe.ShiftStart(ec, -160, &mut shifted, ptr::null())?;
+        if shifted >= 0 {
+            return Ok(None);
+        }
+        let len = (-shifted) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let mut read = 0;
+        probe.GetText(ec, 0, &mut buf, &mut read)?;
+        let mut units = &buf[..(read as usize).min(len)];
+        if units.first().is_some_and(|u| (0xDC00..=0xDFFF).contains(u)) {
+            units = &units[1..];
+        }
+        let text = String::from_utf16_lossy(units);
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        let anchor = range.Clone()?;
+        anchor.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD)?;
+        Ok(Some((text, anchor)))
+    }
+}
+#[implement(ITfEditSession)]
+struct FocusContextCheck {
+    ctx: ITfContext,
+    out: Rc<RefCell<Option<(String, ITfRange)>>>,
+    _live: Live,
+}
+impl ITfEditSession_Impl for FocusContextCheck_Impl {
+    fn DoEditSession(&self, ec: u32) -> Result<()> {
+        *self.out.borrow_mut() = read_focus_context(&self.ctx, ec)?;
+        Ok(())
+    }
+}
 #[implement(ITfEditSession)]
 struct Finish {
     comp: ITfComposition,
@@ -699,6 +792,7 @@ impl Service {
                 cookie: Cell::new(None),
                 composition: Default::default(),
                 commit_end: Default::default(),
+                prediction_anchor: Default::default(),
                 panel: Cell::new(ptr::null_mut()),
                 view: Default::default(),
                 shift_held: Cell::new(false),
@@ -1171,6 +1265,67 @@ unsafe fn verified_commit_range(
     Ok((read as usize == expected.len() && actual[..expected.len()] == expected).then_some(range))
 }
 
+unsafe fn verified_prediction_caret(
+    ctx: &ITfContext,
+    ec: u32,
+    anchor: Option<&(ITfContext, ITfRange)>,
+    context_before: &str,
+) -> Result<Option<ITfRange>> {
+    let mut selection = [TF_SELECTION::default()];
+    let mut fetched = 0;
+    let selected = ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
+    let range = ManuallyDrop::take(&mut selection[0].range);
+    selected?;
+    let Some(range) = range.filter(|_| fetched == 1) else {
+        return Ok(None);
+    };
+    if selection[0].style.fInterimChar.as_bool() || !range.IsEmpty(ec)?.as_bool() {
+        return Ok(None);
+    }
+    if let Some((anchor_ctx, anchor_range)) = anchor {
+        if anchor_ctx != ctx || !range.IsEqualStart(ec, anchor_range, TF_ANCHOR_END)?.as_bool() {
+            return Ok(None);
+        }
+        return Ok(Some(range));
+    }
+    if context_before.is_empty() {
+        return Ok(None);
+    }
+    let tail: String = context_before
+        .chars()
+        .rev()
+        .take(16)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    let expected: Vec<u16> = tail.encode_utf16().collect();
+    let Ok(length) = i32::try_from(expected.len()) else {
+        return Ok(None);
+    };
+    let probe = range.Clone()?;
+    let mut shifted = 0;
+    probe.ShiftStart(ec, -length, &mut shifted, ptr::null())?;
+    if shifted != -length {
+        return Ok(None);
+    }
+    let mut actual = vec![0; expected.len() + 1];
+    let mut read = 0;
+    probe.GetText(ec, 0, &mut actual, &mut read)?;
+    Ok((read as usize == expected.len() && actual[..expected.len()] == expected).then_some(range))
+}
+
+fn prediction_contains_candidate(current: &Value, expected: &str) -> bool {
+    if current["status"] != "ready" {
+        return false;
+    }
+    current["text"].as_str() == Some(expected)
+        || current["previous_candidate"].as_str() == Some(expected)
+        || current["candidates"]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|item| item.as_str() == Some(expected)))
+}
+
 #[implement(ITfEditSession)]
 struct Edit {
     ctx: ITfContext,
@@ -1214,13 +1369,27 @@ impl ITfEditSession_Impl for Edit_Impl {
             return Ok(());
         }
         let commit_end = ed.commit_end.take();
+        let mut prediction_caret: Option<ITfRange> = None;
         let r = if a.cmd == "prediction-accept" {
+            let expected = a.args["text"].as_str().unwrap_or("");
+            let anchor = ed.prediction_anchor.borrow().clone();
+            let context_before = ed.view.borrow().context_before.clone();
+            let verified = unsafe {
+                verified_prediction_caret(&self.ctx, ec, anchor.as_ref(), &context_before)
+                    .ok()
+                    .flatten()
+            };
+            let Some(caret_range) = verified else {
+                ed.cancel_prediction(false);
+                return Ok(());
+            };
             let current = ed.call("predict-poll", json!({"id":a.args["id"]}))?;
-            if current["status"] != "ready" || current["text"] != a.args["text"] {
+            if expected.is_empty() || !prediction_contains_candidate(&current, expected) {
                 ed.cancel_prediction(false);
                 return Ok(());
             }
-            json!({"commit_text":a.args["text"]})
+            prediction_caret = Some(caret_range);
+            json!({"commit_text":expected})
         } else if a.cmd == "insert" {
             a.args.clone()
         } else {
@@ -1275,6 +1444,7 @@ impl ITfEditSession_Impl for Edit_Impl {
             }
             return Ok(());
         }
+        let mut next_prediction_anchor: Option<(ITfContext, ITfRange)> = None;
         if edits_text {
             unsafe {
                 let (range, composition) = if let Some(range) = undo_range {
@@ -1305,6 +1475,8 @@ impl ITfEditSession_Impl for Edit_Impl {
                     (range, Some(comp))
                 } else if let Some((_, comp)) = old {
                     (comp.GetRange()?, Some(comp))
+                } else if let Some(range) = prediction_caret {
+                    (range, None)
                 } else {
                     let insert: ITfInsertAtSelection = self.ctx.cast()?;
                     let range = insert.InsertTextAtSelection(ec, TF_IAS_QUERYONLY, &[])?;
@@ -1377,7 +1549,13 @@ impl ITfEditSession_Impl for Edit_Impl {
                 let sel = self.ctx.SetSelection(ec, std::slice::from_ref(&selection));
                 ManuallyDrop::drop(&mut selection.range);
                 sel?;
-                if a.anchor_commit && commit.is_some() && pre.is_empty() && delta == 0 {
+                let clipboard_commit = r["clipboard_commit"].as_bool().unwrap_or(false);
+                if a.anchor_commit
+                    && !clipboard_commit
+                    && commit.is_some()
+                    && pre.is_empty()
+                    && delta == 0
+                {
                     // Keep the anchor at the original end when text is inserted there.
                     if let Ok(end) = caret.Clone() {
                         if end.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD).is_ok() {
@@ -1385,13 +1563,28 @@ impl ITfEditSession_Impl for Edit_Impl {
                         }
                     }
                 }
+                if commit.is_some()
+                    && !clipboard_commit
+                    && a.cmd != "prediction-accept"
+                    && ed.composition.borrow().is_none()
+                    && pre.is_empty()
+                {
+                    if let Ok(anchor) = caret.Clone() {
+                        if anchor.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD).is_ok() {
+                            next_prediction_anchor = Some((self.ctx.clone(), anchor));
+                        }
+                    }
+                }
             }
         }
+        let clipboard_commit = r["clipboard_commit"].as_bool().unwrap_or(false);
         if a.cmd == "prediction-accept" && commit.is_some() {
             ed.call(
                 "predict-accept",
                 json!({"id":a.args["id"],"text":a.args["text"]}),
             )?;
+            ed.cancel_prediction(false);
+        } else if clipboard_commit {
             ed.cancel_prediction(false);
         }
         let mut v = ed.view.borrow_mut();
@@ -1465,8 +1658,12 @@ impl ITfEditSession_Impl for Edit_Impl {
             }
             _ => {}
         }
-        if commit.is_some() && ed.composition.borrow().is_none() {
-            ed.schedule_prediction(false);
+        if commit.is_some()
+            && !clipboard_commit
+            && a.cmd != "prediction-accept"
+            && ed.composition.borrow().is_none()
+        {
+            ed.schedule_prediction(false, next_prediction_anchor);
         }
         ed.draw(glow, true);
         self.handled.set(true);

@@ -675,7 +675,7 @@ select option {
 .chip-btn.is-active {
   background: var(--vitral-accent-soft);
   color: var(--vitral-accent-text);
-  border-color: rgba(14, 165, 233, 0.32);
+  border-color: var(--vitral-surface-key-pressed-glow);
 }
 
 input[type="range"] {
@@ -747,7 +747,7 @@ button.primary {
   border: 1px solid rgba(255, 255, 255, 0.16);
   color: #fff;
   padding: 9px 18px;
-  box-shadow: 0 4px 14px rgba(14, 165, 233, 0.32);
+  box-shadow: 0 4px 14px rgba(14, 165, 233, 0.34);
 }
 button.primary:hover:not(:disabled) {
   filter: brightness(1.08);
@@ -1270,7 +1270,7 @@ body.is-offline .online-card {
   gap: 11px;
 }
 .model-card.is-active {
-  border-color: rgba(14, 165, 233, 0.32);
+  border-color: var(--vitral-surface-key-pressed-glow);
 }
 .model-head {
   display: flex;
@@ -1471,6 +1471,30 @@ body.is-offline .online-card {
   line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.diff-view {
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--vitral-surface-popover);
+  border: 1px solid var(--border-subtle);
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff-del {
+  background: var(--danger-soft);
+  color: var(--danger);
+  text-decoration: line-through;
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.diff-ins {
+  background: rgba(16, 185, 129, 0.16);
+  color: var(--success);
+  border-radius: 4px;
+  padding: 0 3px;
 }
 
 /* Sticky Bottom Save Bar */

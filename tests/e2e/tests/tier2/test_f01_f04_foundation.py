@@ -721,67 +721,99 @@ def test_f04_ffi_null_pointer_boundary_safety(vitral_target: VitralTarget) -> No
 
 @pytest.mark.requires_core
 def test_f04_ffi_invalid_utf8_and_json_rejection(vitral_target: VitralTarget, tmp_path: Path) -> None:
-    cdll = vitral_target.load_ffi_cdll()
-    cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
-    cdll.vitral_init.restype = ctypes.c_int32
-    cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
-    cdll.vitral_on_app_focus.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    cdll.vitral_on_app_focus.restype = _VitralStringResult
-    cdll.vitral_clipboard_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    cdll.vitral_clipboard_push.restype = _VitralStringResult
-    cdll.vitral_free_result.argtypes = [_VitralStringResult]
-    cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
+    ffi_lib = vitral_target.require_ffi()
+    script = """
+import ctypes, json, sys
+class _VitralStringResult(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_int32), ("json_utf8", ctypes.c_void_p), ("error_message", ctypes.c_void_p)]
 
-    eng_ptr = ctypes.c_void_p()
-    err_ptr = ctypes.c_void_p()
-    assert cdll.vitral_init(b"{bad", ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) in (3, 7)
-    if err_ptr.value:
-        cdll.vitral_free_string(err_ptr)
+cdll = ctypes.CDLL(sys.argv[1])
+cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+cdll.vitral_init.restype = ctypes.c_int32
+cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
+cdll.vitral_on_app_focus.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+cdll.vitral_on_app_focus.restype = _VitralStringResult
+cdll.vitral_clipboard_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+cdll.vitral_clipboard_push.restype = _VitralStringResult
+cdll.vitral_free_result.argtypes = [_VitralStringResult]
+cdll.vitral_free_string.argtypes = [ctypes.c_void_p]
 
-    cfg = json.dumps({"state_dir": str(tmp_path / "ffi_state")}).encode("utf-8")
-    assert cdll.vitral_init(cfg, ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) == 0
-    try:
-        res_utf8 = cdll.vitral_on_app_focus(eng_ptr, b"\xff\xfe\xfd")
-        assert res_utf8.status == 2
-        cdll.vitral_free_result(res_utf8)
+eng_ptr = ctypes.c_void_p()
+err_ptr = ctypes.c_void_p()
+assert cdll.vitral_init(b"{bad", ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) in (3, 7)
+if err_ptr.value:
+    cdll.vitral_free_string(err_ptr)
 
-        res_bad_json = cdll.vitral_clipboard_push(eng_ptr, b"{bad_json")
-        assert res_bad_json.status in (3, 7)
-        cdll.vitral_free_result(res_bad_json)
-    finally:
-        cdll.vitral_shutdown(eng_ptr)
+cfg = json.dumps({"state_dir": sys.argv[2]}).encode("utf-8")
+assert cdll.vitral_init(cfg, ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) == 0
+try:
+    res_utf8 = cdll.vitral_on_app_focus(eng_ptr, b"\\xff\\xfe\\xfd")
+    assert res_utf8.status == 2
+    cdll.vitral_free_result(res_utf8)
+
+    res_bad_json = cdll.vitral_clipboard_push(eng_ptr, b"{bad_json")
+    assert res_bad_json.status in (3, 7)
+    cdll.vitral_free_result(res_bad_json)
+finally:
+    cdll.vitral_shutdown(eng_ptr)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(ffi_lib), str(tmp_path / "ffi_state")],
+        capture_output=True,
+        text=True,
+        env=vitral_target._build_env(),
+        timeout=25,
+        check=False,
+    )
+    assert proc.returncode == 0, f"FFI utf8/json rejection subprocess failed:\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.requires_core
 def test_f04_ffi_uninitialized_and_oob_index_errors(vitral_target: VitralTarget, tmp_path: Path) -> None:
-    cdll = vitral_target.load_ffi_cdll()
-    cdll.vitral_set_pure_offline.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-    cdll.vitral_set_pure_offline.restype = ctypes.c_int32
-    cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
-    cdll.vitral_init.restype = ctypes.c_int32
-    cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
-    cdll.vitral_select_candidate.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
-    cdll.vitral_select_candidate.restype = _VitralStringResult
-    cdll.vitral_hw_override_slot.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
-    cdll.vitral_hw_override_slot.restype = _VitralStringResult
-    cdll.vitral_free_result.argtypes = [_VitralStringResult]
+    ffi_lib = vitral_target.require_ffi()
+    script = """
+import ctypes, json, sys
+class _VitralStringResult(ctypes.Structure):
+    _fields_ = [("status", ctypes.c_int32), ("json_utf8", ctypes.c_void_p), ("error_message", ctypes.c_void_p)]
 
-    assert cdll.vitral_set_pure_offline(None, True) in (1, 4)
+cdll = ctypes.CDLL(sys.argv[1])
+cdll.vitral_set_pure_offline.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+cdll.vitral_set_pure_offline.restype = ctypes.c_int32
+cdll.vitral_init.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_void_p)]
+cdll.vitral_init.restype = ctypes.c_int32
+cdll.vitral_shutdown.argtypes = [ctypes.c_void_p]
+cdll.vitral_select_candidate.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+cdll.vitral_select_candidate.restype = _VitralStringResult
+cdll.vitral_hw_override_slot.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+cdll.vitral_hw_override_slot.restype = _VitralStringResult
+cdll.vitral_free_result.argtypes = [_VitralStringResult]
 
-    eng_ptr = ctypes.c_void_p()
-    err_ptr = ctypes.c_void_p()
-    cfg = json.dumps({"state_dir": str(tmp_path / "ffi_oob")}).encode("utf-8")
-    assert cdll.vitral_init(cfg, ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) == 0
-    try:
-        res_sel = cdll.vitral_select_candidate(eng_ptr, 9999)
-        assert res_sel.status in (3, 8)
-        cdll.vitral_free_result(res_sel)
+assert cdll.vitral_set_pure_offline(None, True) in (1, 4)
 
-        res_ovr = cdll.vitral_hw_override_slot(eng_ptr, 9999, 0)
-        assert res_ovr.status in (3, 4, 8)
-        cdll.vitral_free_result(res_ovr)
-    finally:
-        cdll.vitral_shutdown(eng_ptr)
+eng_ptr = ctypes.c_void_p()
+err_ptr = ctypes.c_void_p()
+cfg = json.dumps({"state_dir": sys.argv[2]}).encode("utf-8")
+assert cdll.vitral_init(cfg, ctypes.byref(eng_ptr), ctypes.byref(err_ptr)) == 0
+try:
+    res_sel = cdll.vitral_select_candidate(eng_ptr, 9999)
+    assert res_sel.status in (3, 8)
+    cdll.vitral_free_result(res_sel)
+
+    res_ovr = cdll.vitral_hw_override_slot(eng_ptr, 9999, 0)
+    assert res_ovr.status in (3, 4, 8)
+    cdll.vitral_free_result(res_ovr)
+finally:
+    cdll.vitral_shutdown(eng_ptr)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(ffi_lib), str(tmp_path / "ffi_oob")],
+        capture_output=True,
+        text=True,
+        env=vitral_target._build_env(),
+        timeout=25,
+        check=False,
+    )
+    assert proc.returncode == 0, f"FFI oob subprocess failed:\n{proc.stdout}\n{proc.stderr}"
 
 
 @pytest.mark.requires_android

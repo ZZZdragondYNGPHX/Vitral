@@ -10,6 +10,9 @@ pub(super) fn call_engine(command: &str, payload: &Value) -> Result<Value, Strin
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     vitral_core::windows_host::request(&exe, "", command, payload).map_err(|e| e.to_string())
 }
+pub(super) fn probe_engine_raw(command: &str, payload: &Value) -> Result<Value, String> {
+    vitral_core::windows_host::probe(command, payload).map_err(|e| e.to_string())
+}
 #[tauri::command]
 pub(super) fn choose_file(lexicon: bool) -> Option<String> {
     let filter = if lexicon {

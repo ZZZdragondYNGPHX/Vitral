@@ -33,6 +33,8 @@ class VitralCommandError(RuntimeError):
 class VitralTarget:
     """Opaque-box adapter over Vitral CLI, FFI library, and platform artifacts."""
 
+    _live_instances: list["VitralTarget"] = []
+
     def __init__(
         self,
         targets: DiscoveredTargets | None = None,
@@ -57,6 +59,7 @@ class VitralTarget:
 
         self.env_overrides: dict[str, str] = dict(env_overrides or {})
         self._initialized = False
+        VitralTarget._live_instances.append(self)
 
     # ------------------------------------------------------------------
     # Clean Fail-Fast Target Requirements (NEVER skip, NEVER ImportError)
@@ -426,11 +429,16 @@ class VitralTarget:
         return self._invoke_cli("restore-from-koofr", {"config": cfg})
 
     def close(self) -> None:
-        if self._initialized and self.targets.vitral_cli is not None:
+        had_session = self._initialized or (self.state_dir / ".vitral-session").is_dir()
+        if had_session and self.targets.vitral_cli is not None:
             try:
                 self.shutdown()
             except Exception:
                 pass
         self._initialized = False
+        try:
+            VitralTarget._live_instances.remove(self)
+        except ValueError:
+            pass
         if self._owns_state_dir:
             shutil.rmtree(self.state_dir, ignore_errors=True)

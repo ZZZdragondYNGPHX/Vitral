@@ -10,7 +10,6 @@ use vitral_tokens::TOKENS;
 
 pub const DEFAULT_FRECENCY_HALF_LIFE_SEC: f64 = 604_800.0;
 const MAX_USER_PHRASES: usize = 4096;
-const MAX_CLIPBOARD_PHRASES: usize = 8;
 
 fn default_half_life_sec() -> f64 {
     DEFAULT_FRECENCY_HALF_LIFE_SEC
@@ -1006,82 +1005,6 @@ impl RetentionEngine {
         self.enforce_bounds();
     }
 
-    pub fn harvest_clipboard_text(
-        &mut self,
-        text: &str,
-        annotate: impl Fn(&str) -> (String, String),
-    ) {
-        // Without dictionary boundaries, a whole long segment is too large to learn.
-        self.harvest_clipboard_text_with_known(text, |_| false, annotate);
-    }
-
-    /// Learn short copied phrases and unknown runs between known words in longer text.
-    pub fn harvest_clipboard_text_with_known(
-        &mut self,
-        text: &str,
-        is_known_word: impl Fn(&[char]) -> bool,
-        annotate: impl Fn(&str) -> (String, String),
-    ) {
-        self.apply_clipboard_candidates(
-            ClipboardCandidates::extract(text, is_known_word),
-            annotate,
-        );
-    }
-
-    pub(crate) fn apply_clipboard_candidates<'a, Reading: AsRef<str>>(
-        &mut self,
-        candidates: ClipboardCandidates<'a>,
-        annotate: impl Fn(&'a str) -> (Reading, Reading),
-    ) {
-        if candidates.is_empty() {
-            return;
-        }
-        let now_ms = Self::now_epoch_ms().max(self.learned_reset_ms);
-        let mut harvested = 0;
-        for (phrase, is_oov) in candidates.phrases {
-            if self.erased_words.contains(phrase)
-                || self.user_phrases.contains_key(phrase)
-                || (!is_oov && self.decayed_score_at(phrase, now_ms) > 0.35)
-            {
-                continue;
-            }
-            let (quanpin, xiaohe) = annotate(phrase);
-            let (quanpin, xiaohe) = (quanpin.as_ref(), xiaohe.as_ref());
-            if quanpin.is_empty() || xiaohe.is_empty() {
-                continue;
-            }
-            self.user_phrases.insert(
-                phrase.to_string(),
-                UserPhrase {
-                    word: phrase.to_string(),
-                    quanpin: quanpin
-                        .split_whitespace()
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                        .to_ascii_lowercase(),
-                    xiaohe: normalize(xiaohe),
-                    acronym: UserPhrase::derive_acronym(phrase, quanpin, xiaohe),
-                    count: 1,
-                    updated_ms: now_ms,
-                    source: "clipboard".into(),
-                },
-            );
-            if self.decayed_score_at(phrase, now_ms) < 0.35 {
-                self.frecency.insert(phrase.to_string(), 0.35);
-                self.frecency_updated_ms.insert(phrase.to_string(), now_ms);
-            }
-            self.crdt_seq = self.crdt_seq.saturating_add(1);
-            harvested += 1;
-            if harvested == MAX_CLIPBOARD_PHRASES {
-                break;
-            }
-        }
-        for token in candidates.english {
-            self.record_valid_english_casing(token);
-        }
-        self.enforce_bounds();
-    }
-
     fn user_phrase_index(&self) -> &UserPhraseIndex {
         self.user_phrases.index.get_or_init(|| {
             let mut index = UserPhraseIndex::default();
@@ -1323,13 +1246,7 @@ impl RetentionEngine {
     }
 
     pub fn record_english_casing(&mut self, raw: &str) {
-        if valid_english(raw) {
-            self.record_valid_english_casing(raw);
-        }
-    }
-
-    fn record_valid_english_casing(&mut self, raw: &str) {
-        if self.erased_words.contains(raw) {
+        if !valid_english(raw) || self.erased_words.contains(raw) {
             return;
         }
         let key = raw.to_ascii_lowercase();
@@ -1470,6 +1387,49 @@ impl RetentionEngine {
         self.crdt_seq = self.crdt_seq.saturating_add(1);
     }
 
+    pub(crate) fn purge_clipboard_phrases(&mut self) -> bool {
+        let remove: HashSet<String> = self
+            .user_phrases
+            .iter()
+            .filter(|(_, phrase)| phrase.source == "clipboard")
+            .map(|(word, _)| word.clone())
+            .collect();
+        if remove.is_empty() {
+            return false;
+        }
+        for word in &remove {
+            self.user_phrases.remove(word);
+            self.frecency.remove(word);
+            self.frecency_updated_ms.remove(word);
+            self.pinned_words.remove(word);
+            self.pending_phrase_pairs.remove(word);
+        }
+        for (prefix, buckets) in [
+            ("b:", &mut self.context_bigrams),
+            ("a:", &mut self.app_frecency),
+            ("c:", &mut self.code_preferences),
+        ] {
+            buckets.retain(|key, values| {
+                // Preserve unrelated empty correction buckets and their deletion clocks.
+                let was_empty = values.is_empty();
+                values.retain(|word, _| !remove.contains(word));
+                let keep =
+                    !(prefix == "b:" && remove.contains(key)) && (was_empty || !values.is_empty());
+                if !keep {
+                    self.habit_updated_ms.remove(&format!("{prefix}{key}"));
+                }
+                keep
+            });
+        }
+        self.semantic_memories
+            .retain(|entry| !remove.contains(&entry.word));
+        self.session_cache
+            .retain(|(_, word, _)| !remove.contains(word));
+        // Standalone legacy English casing has identical storage for typed and copied text.
+        self.crdt_seq = self.crdt_seq.saturating_add(1);
+        true
+    }
+
     pub fn export_crdt_delta(&self, device_id: &str) -> RetentionCrdtDelta {
         self.clone().into_crdt_delta(device_id.to_string(), Self::now_epoch_ms())
     }
@@ -1497,11 +1457,19 @@ impl RetentionEngine {
     }
 
     pub fn merge_crdt_delta(&mut self, delta: &RetentionCrdtDelta) {
+        let remote_clipboard: HashSet<&str> = delta
+            .user_phrases
+            .iter()
+            .filter(|(_, phrase)| phrase.source == "clipboard")
+            .map(|(word, _)| word.as_str())
+            .collect();
         for word in &delta.erased_words {
             self.erase_word(word);
         }
         for word in &delta.pinned_words {
-            self.pin_word(word);
+            if !remote_clipboard.contains(word.as_str()) {
+                self.pin_word(word);
+            }
         }
         if delta.learned_reset_ms > self.learned_reset_ms {
             self.clear_learned_habits();
@@ -1509,7 +1477,7 @@ impl RetentionEngine {
             self.reranker.reset(self.learned_reset_ms);
         }
         for (word, &remote_score) in &delta.frecency {
-            if self.erased_words.contains(word) {
+            if remote_clipboard.contains(word.as_str()) || self.erased_words.contains(word) {
                 continue;
             }
             let remote_ts = delta
@@ -1533,27 +1501,47 @@ impl RetentionEngine {
                 ("c:", &mut self.code_preferences, &delta.code_preferences),
             ] {
                 for (key, values) in remote {
+                    if prefix == "b:" && remote_clipboard.contains(key.as_str()) {
+                        continue;
+                    }
+                    let mut values_to_merge = values
+                        .iter()
+                        .filter(|(word, weight)| {
+                            weight.is_finite()
+                                && **weight > 0.0
+                                && !self.erased_words.contains(*word)
+                                && !remote_clipboard.contains(word.as_str())
+                        })
+                        .peekable();
+                    if !values.is_empty() && values_to_merge.peek().is_none() {
+                        continue;
+                    }
                     let clock_key = format!("{prefix}{key}");
                     let remote_ts = delta.habit_updated_ms.get(&clock_key).copied().unwrap_or(0);
                     let local_ts = self.habit_updated_ms.get(&clock_key).copied().unwrap_or(0);
                     if remote_ts < self.learned_reset_ms || remote_ts < local_ts {
                         continue;
                     }
+                    if values.is_empty() && remote_ts == 0 {
+                        continue;
+                    }
+                    // An explicitly empty remote bucket carries an existing deletion clock.
+                    // Buckets emptied by filtering clipboard words were skipped above.
                     let entry = local.entry(key.clone()).or_default();
                     if remote_ts > local_ts {
-                        entry.clear();
+                        entry.retain(|word, _| remote_clipboard.contains(word.as_str()));
                     }
-                    for (word, weight) in values {
-                        if weight.is_finite() && *weight > 0.0 && !self.erased_words.contains(word)
-                        {
-                            let score = entry.entry(word.clone()).or_default();
-                            *score = score.max(*weight);
-                        }
+                    for (word, weight) in values_to_merge {
+                        let score = entry.entry(word.clone()).or_default();
+                        *score = score.max(*weight);
                     }
                     self.habit_updated_ms.insert(clock_key, remote_ts);
                 }
             }
             for (word, phrase) in &delta.user_phrases {
+                if phrase.source == "clipboard" {
+                    continue;
+                }
                 if !self.erased_words.contains(word)
                     && phrase.updated_ms >= self.learned_reset_ms
                     && valid_phrase(word)
@@ -1620,6 +1608,7 @@ impl RetentionEngine {
                         && !e.word.is_empty()
                         && e.updated_ms >= self.learned_reset_ms
                         && !self.erased_words.contains(&e.word)
+                        && !remote_clipboard.contains(e.word.as_str())
                 })
                 .cloned()
                 .map(|mut e| {
@@ -1711,85 +1700,6 @@ pub(crate) fn is_cjk(ch: char) -> bool {
 
 fn valid_phrase(word: &str) -> bool {
     (2..=8).contains(&word.chars().count()) && word.chars().all(is_cjk)
-}
-
-#[derive(Default)]
-pub(crate) struct ClipboardCandidates<'a> {
-    phrases: Vec<(&'a str, bool)>,
-    english: Vec<&'a str>,
-}
-
-impl<'a> ClipboardCandidates<'a> {
-    pub(crate) fn extract(text: &'a str, is_known_word: impl Fn(&[char]) -> bool) -> Self {
-        if text.is_empty()
-            || text.len() > 4096
-            || text.contains("://")
-            || text.lines().any(secret_line)
-        {
-            return Self::default();
-        }
-        let mut phrases = Vec::new();
-        let mut seen = HashSet::new();
-        for segment in text.split(|c: char| !is_cjk(c)) {
-            match segment.chars().take(9).count() {
-                2..=8 if seen.insert((segment, false)) => phrases.push((segment, false)),
-                9 => {
-                    for phrase in clipboard_oov_phrases(segment, &is_known_word) {
-                        if seen.insert((phrase, true)) {
-                            phrases.push((phrase, true));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        let english = text
-            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-'))
-            .filter(|token| valid_english(token))
-            .collect();
-        Self { phrases, english }
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.phrases.is_empty() && self.english.is_empty()
-    }
-
-    pub(crate) fn annotate(
-        &self,
-        annotate: impl Fn(&str) -> (String, String),
-    ) -> HashMap<&'a str, (String, String)> {
-        let mut readings = HashMap::new();
-        for &(word, _) in &self.phrases {
-            readings.entry(word).or_insert_with(|| annotate(word));
-        }
-        readings
-    }
-}
-
-fn clipboard_oov_phrases(seg: &str, is_known_word: impl Fn(&[char]) -> bool) -> Vec<&str> {
-    let (mut offsets, chars): (Vec<_>, Vec<_>) = seg.char_indices().unzip();
-    offsets.push(seg.len());
-    let mut phrases = Vec::new();
-    let mut oov_start = 0;
-    let mut i = 0;
-    while i < chars.len() {
-        let known_len = (2..=6.min(chars.len() - i))
-            .rev()
-            .find(|&len| is_known_word(&chars[i..i + len]));
-        if let Some(len) = known_len {
-            if (2..=6).contains(&(i - oov_start)) {
-                phrases.push(&seg[offsets[oov_start]..offsets[i]]);
-            }
-            i += len;
-            oov_start = i;
-        } else {
-            i += 1;
-        }
-    }
-    if (2..=6).contains(&(i - oov_start)) {
-        phrases.push(&seg[offsets[oov_start]..]);
-    }
-    phrases
 }
 
 fn valid_english(raw: &str) -> bool {
@@ -1977,6 +1887,209 @@ mod personalization_tests {
                 retention.query_knn_semantic(&query, word, Some(" EDITOR "), now_ms),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn legacy_clipboard_migration_removes_all_chinese_traces_and_blocks_replay() {
+        let mut source = RetentionEngine::default();
+        let words = ["剪贴", "置顶", "重选", "同频", "编码", "上下文", "语义"];
+        for word in words.into_iter().chain(["手打"]) {
+            let mut phrase = crdt_phrase(word, 1, 10);
+            if word != "手打" {
+                phrase.source = "clipboard".into();
+            }
+            source.user_phrases.insert(word.into(), phrase);
+            source.frecency.insert(word.into(), 0.35);
+            source.frecency_updated_ms.insert(word.into(), 10);
+            source
+                .context_bigrams
+                .insert(word.into(), HashMap::from([("手打".into(), 1.0)]));
+            for (prefix, buckets) in [
+                ("b:", &mut source.context_bigrams),
+                ("a:", &mut source.app_frecency),
+                ("c:", &mut source.code_preferences),
+            ] {
+                buckets
+                    .entry("混合".into())
+                    .or_default()
+                    .insert(word.into(), 1.0);
+                buckets.insert(format!("桶{word}"), HashMap::from([(word.into(), 1.0)]));
+                source.habit_updated_ms.insert(format!("{prefix}混合"), 40);
+                source
+                    .habit_updated_ms
+                    .insert(format!("{prefix}桶{word}"), 40);
+            }
+            source.habit_updated_ms.insert(format!("b:{word}"), 40);
+            source.record_semantic_memory([4; 32], word, Some("editor"), 40);
+            source
+                .session_cache
+                .push_back(("editor".into(), word.into(), 40));
+            source.pending_phrase_pairs.insert(word.into(), 1);
+        }
+        source.user_english.insert("vitral".into(), "Vitral".into());
+        source.habit_updated_ms.insert("e:vitral".into(), 40);
+        source.pin_word("置顶");
+        source.pin_word("手打");
+        source.record_selection_at("重选", 20, 1.0);
+        source.frecency_updated_ms.insert("同频".into(), 30);
+        let typed = source.user_phrases["手打"].clone();
+        let delta = source.export_crdt_delta("legacy");
+        let mut merged = RetentionEngine::default();
+        merged.merge_crdt_delta(&delta);
+        let seq = source.crdt_seq;
+        assert!(source.purge_clipboard_phrases());
+        assert_eq!(source.crdt_seq, seq + 1);
+        assert!(!source.purge_clipboard_phrases());
+        for engine in [&mut source, &mut merged] {
+            // Repeated stale deltas must not reintroduce any copied Chinese word.
+            engine.merge_crdt_delta(&delta);
+            engine.merge_crdt_delta(&delta);
+            for word in words {
+                assert!(!engine.user_phrases.contains_key(word), "{word}");
+                assert!(!engine.frecency.contains_key(word), "{word}");
+                assert!(!engine.frecency_updated_ms.contains_key(word), "{word}");
+                assert!(!engine.pinned_words.contains(word), "{word}");
+                assert!(!engine.erased_words.contains(word), "{word}");
+                assert!(!engine.context_bigrams.contains_key(word), "{word}");
+                assert!(!engine.habit_updated_ms.contains_key(&format!("b:{word}")));
+                for (prefix, buckets) in [
+                    ("b:", &engine.context_bigrams),
+                    ("a:", &engine.app_frecency),
+                    ("c:", &engine.code_preferences),
+                ] {
+                    assert!(buckets
+                        .values()
+                        .all(|values| !values.is_empty() && !values.contains_key(word)));
+                    assert!(!buckets.contains_key(&format!("桶{word}")));
+                    assert!(!engine
+                        .habit_updated_ms
+                        .contains_key(&format!("{prefix}桶{word}")));
+                    assert_eq!(buckets["混合"]["手打"], 1.0);
+                    assert_eq!(engine.habit_updated_ms[&format!("{prefix}混合")], 40);
+                }
+                assert!(engine.semantic_memories.iter().all(|e| e.word != word));
+                assert!(engine
+                    .session_cache
+                    .iter()
+                    .all(|(_, cached, _)| cached != word));
+                assert!(!engine.pending_phrase_pairs.contains_key(word));
+            }
+            assert_eq!(engine.user_phrases["手打"], typed);
+            assert_eq!(engine.frecency["手打"], 0.35);
+            assert_eq!(engine.frecency_updated_ms["手打"], 10);
+            assert!(engine.pinned_words.contains("手打"));
+            assert!(engine.semantic_memories.iter().any(|e| e.word == "手打"));
+            assert_eq!(engine.user_english, delta.user_english);
+            assert_eq!(engine.habit_updated_ms["e:vitral"], 40);
+        }
+        assert!(source
+            .session_cache
+            .iter()
+            .any(|(_, word, _)| word == "手打"));
+        assert_eq!(source.pending_phrase_pairs["手打"], 1);
+        // Purging must still allow a later genuine typed registration.
+        source.register_typed_phrase("剪贴", "jian tie", "jmtp", 50);
+        assert_eq!(source.user_phrases["剪贴"].source, "typed");
+    }
+
+    #[test]
+    fn clipboard_purge_preserves_unrelated_correction_deletion_clocks() {
+        let mut source = RetentionEngine::default();
+        let mut phrase = crdt_phrase("剪贴", 1, 10);
+        phrase.source = "clipboard".into();
+        source.user_phrases.insert("剪贴".into(), phrase);
+        source
+            .code_preferences
+            .insert("corrected".into(), HashMap::new());
+        source.habit_updated_ms.insert("c:corrected".into(), 40);
+        assert!(source.purge_clipboard_phrases());
+        assert!(source.code_preferences["corrected"].is_empty());
+        assert_eq!(source.habit_updated_ms["c:corrected"], 40);
+        let mut merged = RetentionEngine::default();
+        merged.merge_crdt_delta(&source.export_crdt_delta("corrected"));
+        let mut stale = source.export_crdt_delta("stale");
+        stale
+            .code_preferences
+            .insert("corrected".into(), HashMap::from([("错词".into(), 1.0)]));
+        stale.habit_updated_ms.insert("c:corrected".into(), 10);
+        merged.merge_crdt_delta(&stale);
+        assert!(merged.code_preferences["corrected"].is_empty());
+        assert_eq!(merged.habit_updated_ms["c:corrected"], 40);
+    }
+
+    #[test]
+    fn remote_clipboard_does_not_replace_local_typed_phrase_or_empty_valid_buckets() {
+        let mut remote = RetentionEngine::default();
+        let mut phrase = crdt_phrase("手打", 100, 100);
+        phrase.source = "clipboard".into();
+        remote.user_phrases.insert("手打".into(), phrase.clone());
+        phrase.word = "剪贴".into();
+        remote.user_phrases.insert("剪贴".into(), phrase);
+        remote.pin_word("手打");
+        remote.frecency.insert("手打".into(), 2.0);
+        remote.frecency_updated_ms.insert("手打".into(), 100);
+        remote
+            .app_frecency
+            .insert("editor".into(), HashMap::from([("剪贴".into(), 9.0)]));
+        remote.habit_updated_ms.insert("a:editor".into(), 100);
+        remote.context_bigrams.insert("empty".into(), HashMap::new());
+        let mut local = RetentionEngine::default();
+        let typed = crdt_phrase("手打", 1, 10);
+        local.user_phrases.insert("手打".into(), typed.clone());
+        local
+            .app_frecency
+            .insert("editor".into(), HashMap::from([("手打".into(), 1.0)]));
+        local.habit_updated_ms.insert("a:editor".into(), 10);
+        local.merge_crdt_delta(&remote.export_crdt_delta("legacy"));
+        assert_eq!(local.user_phrases["手打"], typed);
+        assert!(!local.pinned_words.contains("手打"));
+        assert!(!local.frecency.contains_key("手打"));
+        assert!(!local.frecency_updated_ms.contains_key("手打"));
+        assert_eq!(
+            local.app_frecency["editor"],
+            HashMap::from([("手打".into(), 1.0)])
+        );
+        assert_eq!(local.habit_updated_ms["a:editor"], 10);
+        assert!(!local.user_phrases.contains_key("剪贴"));
+        assert!(!local.context_bigrams.contains_key("empty"));
+        assert!(!local.habit_updated_ms.contains_key("b:empty"));
+
+        // Newer mixed buckets replace ordinary words while preserving the local typed word.
+        for (prefix, local_buckets, remote_buckets) in [
+            ("b:", &mut local.context_bigrams, &mut remote.context_bigrams),
+            ("a:", &mut local.app_frecency, &mut remote.app_frecency),
+            ("c:", &mut local.code_preferences, &mut remote.code_preferences),
+        ] {
+            local_buckets.insert("mixed".into(), HashMap::from([
+                ("手打".into(), 1.0), ("旧词".into(), 2.0),
+            ]));
+            local.habit_updated_ms.insert(format!("{prefix}mixed"), 10);
+            remote_buckets.insert("mixed".into(), HashMap::from([
+                ("手打".into(), 9.0), ("剪贴".into(), 8.0), ("普通".into(), 3.0),
+            ]));
+            remote.habit_updated_ms.insert(format!("{prefix}mixed"), 100);
+        }
+        local.frecency.insert("手打".into(), 0.5);
+        local.frecency_updated_ms.insert("手打".into(), 10);
+        let delta = remote.export_crdt_delta("legacy");
+        for _ in 0..2 {
+            local.merge_crdt_delta(&delta);
+            assert_eq!(local.user_phrases["手打"], typed);
+            assert!(!local.pinned_words.contains("手打"));
+            assert_eq!(local.frecency["手打"], 0.5);
+            assert_eq!(local.frecency_updated_ms["手打"], 10);
+            assert!(!local.erased_words.contains("手打"));
+            for (prefix, buckets) in [
+                ("b:", &local.context_bigrams),
+                ("a:", &local.app_frecency),
+                ("c:", &local.code_preferences),
+            ] {
+                assert_eq!(buckets["mixed"], HashMap::from([
+                    ("手打".into(), 1.0), ("普通".into(), 3.0),
+                ]));
+                assert_eq!(local.habit_updated_ms[&format!("{prefix}mixed")], 100);
+            }
         }
     }
 
@@ -2208,9 +2321,7 @@ mod personalization_tests {
     #[test]
     fn acronym_phrases_use_spaced_initials_and_legacy_xiaohe_fallback() {
         let mut r = RetentionEngine::default();
-        r.harvest_clipboard_text("项目管理", |_| {
-            ("xiang mu guan li".into(), "xlmugrli".into())
-        });
+        r.register_typed_phrase("项目管理", "xiang mu guan li", "xlmugrli", 1);
         assert!(r.query_acronym_phrases("xmgl").is_empty());
         r.pin_word("项目管理");
         assert_eq!(r.query_acronym_phrases(" XMGL ")[0].acronym, "xmgl");
@@ -2339,68 +2450,6 @@ mod personalization_tests {
             r.contextual_score_at("好", "hk", Some("你"), Some("chat"), 1000, true),
             0.0
         );
-    }
-
-    #[test]
-    fn clipboard_harvest_extracts_only_bounded_unknown_runs_from_long_segments() {
-        let mut r = RetentionEngine::default();
-        let known = |chars: &[char]| {
-            matches!(
-                chars,
-                ['今', '天']
-                    | ['开', '会']
-                    | ['开', '会', '讨', '论', '了']
-                    | ['输', '入']
-                    | ['输', '入', '法']
-                    | ['架', '构']
-            )
-        };
-        let annotate = |word: &str| match word {
-            "云璃" => ("yun li".into(), "yyli".into()),
-            "今天" => ("jin tian".into(), "jbtm".into()),
-            _ => panic!("unexpected clipboard annotation: {word}"),
-        };
-        let sentence = "今天开会讨论了云璃输入法架构";
-        r.harvest_clipboard_text(sentence, annotate);
-        assert!(r.user_phrases.is_empty());
-        r.record_selection_at("云璃", RetentionEngine::now_epoch_ms(), 1.0);
-        r.harvest_clipboard_text_with_known(
-            &format!("云璃。{sentence}。今天。今天开会讨论了甲乙丙丁戊己庚输入法架构"),
-            known,
-            annotate,
-        );
-        assert_eq!(r.user_phrases.len(), 2);
-        assert_eq!(r.user_phrases["今天"].source, "clipboard");
-        let phrase = &r.user_phrases["云璃"];
-        assert_eq!(phrase.source, "clipboard");
-        assert_eq!(phrase.spaced_quanpin().as_deref(), Some("yun li"));
-        assert_eq!(phrase.acronym, "yl");
-
-        r.harvest_clipboard_text_with_known(sentence, known, |_| panic!("already harvested"));
-        r.user_phrases.remove("云璃");
-        r.erase_word("云璃");
-        r.harvest_clipboard_text_with_known(sentence, known, |_| panic!("erased"));
-        assert!(!r.user_phrases.contains_key("云璃"));
-    }
-
-    #[test]
-    fn clipboard_harvest_shares_one_limit_between_short_phrases_and_unknown_runs() {
-        let long_segments: Vec<_> = (0..9)
-            .map(|i| format!("今天开会讨论甲{}输入法", char::from_u32(0x4e00 + i).unwrap()))
-            .collect();
-        let text = format!("你好。{}", long_segments.join("。"));
-        let mut r = RetentionEngine::default();
-        r.harvest_clipboard_text_with_known(
-            &text,
-            |chars| {
-                matches!(chars, ['今', '天'] | ['开', '会', '讨', '论'] | ['输', '入', '法'])
-            },
-            |_| ("test reading".into(), "test".into()),
-        );
-        assert_eq!(r.user_phrases.len(), 8);
-        assert!(r.user_phrases.contains_key("你好"));
-        assert!(r.user_phrases.contains_key("甲一"));
-        assert!(!r.user_phrases.contains_key("甲万"));
     }
 
     #[test]
@@ -2610,28 +2659,13 @@ mod personalization_tests {
     }
 
     #[test]
-    fn clipboard_harvest_filters_secrets_and_clear_preserves_explicit_choices() {
+    fn clear_learned_habits_preserves_explicit_choices() {
         let mut r = RetentionEngine::default();
-        let annotate = |_: &str| ("nihao".into(), "nihk".into());
-        for text in [
-            "你好 https://example.org",
-            "你好 sk-123456",
-            "你好 gho_abc",
-            "你好 Bearer xyz",
-            "密码=你好",
-            "你好 a8B2c9D3e7F1g6H4i5J0k2L9",
-        ] {
-            r.harvest_clipboard_text(text, annotate);
-        }
-        assert_eq!(r.stats().phrase_count, 0);
-        r.harvest_clipboard_text("你好 Vitral OpenAI aBcDef", annotate);
-        assert_eq!(r.query_user_phrases("nihk", true)[0].source, "clipboard");
-        assert_eq!(r.query_user_phrases("nihao", false)[0].word, "你好");
-        assert_eq!(r.query_user_english("openai"), Some("OpenAI"));
-        assert_eq!(r.query_user_english("abcdef"), None);
-        let score = r.frecency["你好"];
-        r.harvest_clipboard_text("你好 Vitral", annotate);
-        assert_eq!(r.frecency["你好"], score);
+        r.register_typed_phrase("你好", "ni hao", "nihk", 1);
+        r.record_english_casing("OpenAI");
+        r.record_contextual_selection("你好", "nihao", Some("同学"), Some("editor"), 1, 1.0, true);
+        assert_eq!(r.stats().phrase_count, 1);
+        assert_eq!(r.stats().english_count, 1);
         r.pin_word("保留");
         r.erase_word("删除");
         r.clear_learned_habits();

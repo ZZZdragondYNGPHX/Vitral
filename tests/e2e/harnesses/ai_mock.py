@@ -429,6 +429,13 @@ class AIMockServer:
             if key == "*" or key in text:
                 return mode, val
 
+        m_user = re.search(r"<user_text>\s*(.*?)\s*</user_text>", text, flags=re.S)
+        user_body = (
+            m_user.group(1).replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+            if m_user is not None
+            else text
+        )
+
         if mode == "slot_choice":
             if slot_override is not None:
                 idx = slot_override
@@ -439,13 +446,13 @@ class AIMockServer:
             return mode, json.dumps({"slot_index": idx}, separators=(",", ":"))
 
         if mode == "translate":
-            return mode, _render_translation(text, lowered)
+            return mode, _render_translation(user_body, lowered)
 
         if mode == "polish":
-            return mode, _render_polish(text)
+            return mode, _render_polish(user_body)
 
         if mode == "summary":
-            return mode, _render_summary(text)
+            return mode, _render_summary(user_body)
 
         return mode, "Vitral AI mock response."
 

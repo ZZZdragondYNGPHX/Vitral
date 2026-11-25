@@ -22,7 +22,10 @@ pub mod predict;
 pub mod sync;
 pub mod shortcuts;
 
-use crate::ai::{AiClient, AiInlineResult, AiMode, VoiceResult, VoiceSession};
+use crate::ai::{
+    AiChat, AiClient, AiInlineResult, AiMode, InlineRequest, InlineTasks, PrivacyAudit, VoiceResult,
+    VoiceSession,
+};
 use crate::clip::{
     ClipboardManager, ClipboardPayload, ClipboardState, QuickPasteConsumeResult, QuickPasteState,
 };
@@ -48,7 +51,7 @@ use crate::imp::{
 };
 use crate::lan::send_via_relay_with_config;
 use crate::offline_guard::OfflineGuard;
-use crate::ret::{ClipboardCandidates, RetentionEngine, DEFAULT_FRECENCY_HALF_LIFE_SEC};
+use crate::ret::{RetentionEngine, DEFAULT_FRECENCY_HALF_LIFE_SEC};
 use crate::sync::{
     sort_devices_mru, CleanupResult, LexiconSnapshotPayload, ProfileBackup, RelayDevice,
     RelayPollResult, RelaySendResult, RestoreResult,
@@ -149,6 +152,8 @@ pub struct VitralCore {
     tier1_upload: Mutex<()>,
     lan_session: Mutex<Option<lan::DiscoverySession>>,
     ai: RwLock<Arc<AiClient>>,
+    ai_inline_tasks: InlineTasks,
+    privacy_audit: PrivacyAudit,
     offline_guard: OfflineGuard,
     imported_lexicon: Arc<RwLock<ImportedLexiconIndex>>,
     input: Arc<Mutex<InputState>>,
@@ -174,6 +179,7 @@ pub struct ContextNextHint {
 impl Drop for VitralCore {
     fn drop(&mut self) {
         self.prediction.cancel();
+        self.ai_inline_tasks.cancel(None);
         #[cfg(feature = "native-onnx")]
         {
             let handles = {
@@ -264,8 +270,17 @@ impl VitralCore {
                 }
                 sort_devices_mru(&mut devices);
             }
-            if let Some(snapshot) = local::load::<LexiconSnapshotPayload>(dir,"lexicon-state.json")? {
-                retention=snapshot.retention;
+            if let Some(mut snapshot) =
+                local::load::<LexiconSnapshotPayload>(dir, "lexicon-state.json")?
+            {
+                if snapshot.retention.purge_clipboard_phrases() {
+                    local::save(dir, "lexicon-state.json", &snapshot)
+                        .map_err(|e| VitralError::Io(format!("lexicon-state.json: {e}")))?;
+                }
+                retention = snapshot.retention;
+                if let Some(seconds) = engine.config.frecency_half_life_sec {
+                    retention.set_half_life_sec(seconds);
+                }
                 imported_lexicon.write().inject_hotwords(&snapshot.imported_entries);
             }
             if let Some(memory)=local::load(dir,"app-languages.json")? {engine.app_lang_memory=memory;}
@@ -281,8 +296,10 @@ impl VitralCore {
             None => Default::default(),
         };
         let profile = profile::ProfileEngine::new(local_dir.clone())?;
+        let privacy_audit = PrivacyAudit::default();
+        let offline_guard = OfflineGuard::new(pure_offline);
         Ok(Self {
-            prediction: predict::PredictEngine::default(),
+            prediction: predict::PredictEngine::with_audit(privacy_audit.clone(), offline_guard.clone()),
             local_dir,
             retention_backup_dir,
             clipboard_io: Mutex::new(()),
@@ -292,7 +309,9 @@ impl VitralCore {
             tier1_upload: Mutex::new(()),
             lan_session: Mutex::new(None),
             ai: RwLock::new(Arc::new(ai)),
-            offline_guard: OfflineGuard::new(pure_offline),
+            ai_inline_tasks: InlineTasks::default(),
+            privacy_audit,
+            offline_guard,
             power_save_mode: AtomicBool::new(false),
             profile_distill_model: Mutex::new(()),
             imported_lexicon,
@@ -802,19 +821,31 @@ impl VitralCore {
     }
 
     /// Apply settings without replacing composing, clipboard or retention state.
-    pub fn apply_preferences(&self, mut cfg: EngineConfig) -> Result<(), VitralError> {
+    pub fn apply_preferences(&self, cfg: EngineConfig) -> Result<(), VitralError> {
+        self.apply_preferences_clearing_secrets(cfg, false)
+    }
+
+    /// Apply settings, optionally clearing a blank Koofr password explicitly.
+    pub fn apply_preferences_clearing_secrets(
+        &self,
+        mut cfg: EngineConfig,
+        clear_koofr_password: bool,
+    ) -> Result<(), VitralError> {
         cfg.validate_prediction()?;
         cfg.validate_quote_style()?;
+        cfg.validate_voice_cleanup_mode()?;
         let fuzzy_pairs = cfg.validated_fuzzy_pairs()?;
         let typo_correction_level = cfg.validated_typo_correction_level()?;
-        self.prediction.clear_cache();
         if let Some(url) = cfg.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { models::validate_url(url)?; }
         shortcuts::normalize(&mut cfg.shortcuts).map_err(VitralError::InvalidArgument)?;
-        if !(20..=200).contains(&cfg.clipboard_ring_capacity) {
-            return Err(VitralError::InvalidArgument("clipboard capacity must be 20..200".into()));
+        if cfg.clipboard_ring_capacity == 0 {
+            return Err(VitralError::InvalidArgument(
+                "clipboard_ring_capacity must be >= 1".into(),
+            ));
         }
         let _tier1_io = self.tier1_io.lock();
         let mut st = self.input.lock();
+        self.prediction.clear_cache();
         let mut io = self.sync_state_io.lock();
         let mut sync = self.sync.lock();
         cfg.koofr_endpoint = cfg.koofr_endpoint.map(|s| s.trim().to_string());
@@ -826,7 +857,8 @@ impl VitralCore {
             .koofr_password
             .map(|s| s.trim_matches(['\r', '\n']).to_string())
             .filter(|s| !s.is_empty());
-        if cfg.koofr_password.is_none()
+        if !clear_koofr_password
+            && cfg.koofr_password.is_none()
             && cfg.koofr_endpoint.as_deref().is_some_and(|s| !s.is_empty())
             && cfg.koofr_endpoint.as_deref()
                 == st.engine.config.koofr_endpoint.as_deref().map(str::trim)
@@ -834,10 +866,15 @@ impl VitralCore {
             cfg.koofr_password
                 .clone_from(&st.engine.config.koofr_password);
         }
-        self.offline_guard.set_pure_offline(cfg.pure_offline);
-        let stopped_lan = cfg.pure_offline.then(|| self.lan_session.lock().take()).flatten();
+        self.offline_guard.set_pure_offline_with(cfg.pure_offline, |was_offline| {
+            if !was_offline {
+                self.ai_inline_tasks.cancel_remote();
+            }
+            self.lan_session.lock().take();
+        });
         if st.engine.schema != cfg.schema { st.engine.set_schema(cfg.schema); }
         st.engine.set_opencc_mode(cfg.opencc_mode);
+        let previous_half_life_sec = st.retention.half_life_sec;
         if let Some(seconds) = cfg.frecency_half_life_sec { st.retention.set_half_life_sec(seconds); }
         sync.clipboard.set_capacity(cfg.clipboard_ring_capacity);
         let next = DavConfig::from_engine_config(&cfg);
@@ -882,11 +919,19 @@ impl VitralCore {
         let split_changed = st.engine.config.syllable_split != cfg.syllable_split;
         let correction_changed = st.engine.pure_rust.typo_correction_level != typo_correction_level;
         let result = (|| {
+            let was_private = st.engine.is_active_privacy_app();
+            st.engine.config.privacy_apps = cfg.privacy_apps;
+            if st.engine.is_active_privacy_app() != was_private {
+                st.engine.clear_composition_state();
+                st.engine.reset_commit_context();
+                st.engine.last_committed_char = None;
+            }
             st.engine.set_syllable_split(cfg.syllable_split)?;
             st.engine.pure_rust.typo_correction_level = typo_correction_level;
             st.engine.pure_rust.fuzzy_pinyin = cfg.fuzzy_pinyin;
             st.engine.pure_rust.fuzzy_pairs = fuzzy_pairs;
             let active = &mut st.engine.config;
+            active.frecency_half_life_sec = cfg.frecency_half_life_sec;
             active.model_catalog_url = cfg.model_catalog_url.clone();
             active.shortcuts = cfg.shortcuts;
             active.linux_english_mode = cfg.linux_english_mode;
@@ -897,9 +942,10 @@ impl VitralCore {
             active.undo_commit_on_backspace = cfg.undo_commit_on_backspace;
             active.typo_correction_level = cfg.typo_correction_level;
             active.prediction_enabled = cfg.prediction_enabled;
+            active.prediction_skip_dev_apps = cfg.prediction_skip_dev_apps;
             active.prediction_delay_ms = cfg.prediction_delay_ms;
             active.profile_distill_enabled = cfg.profile_distill_enabled;
-            active.learn_from_clipboard = cfg.learn_from_clipboard;
+            active.voice_cleanup_mode = cfg.voice_cleanup_mode;
             active.auto_english_for_dev_apps = cfg.auto_english_for_dev_apps;
             active.default_english_apps = cfg.default_english_apps;
             active.disable_paired_punct_in_ide = cfg.disable_paired_punct_in_ide;
@@ -926,9 +972,20 @@ impl VitralCore {
             }
             Ok(())
         })();
+        let snapshot = (result.is_ok()
+            && st.retention.half_life_sec != previous_half_life_sec
+            && self.local_dir.is_some())
+            .then(|| LexiconSnapshotPayload {
+                schema_version: 1,
+                retention: st.retention.clone(),
+                imported_entries: self.imported_lexicon.read().export_entries(),
+            });
         drop(sync);
         drop(st);
-        drop(stopped_lan);
+        if let (Some(dir), Some(snapshot)) = (&self.local_dir, snapshot) {
+            local::save(dir, "lexicon-state.json", &snapshot)
+                .map_err(|e| VitralError::Io(format!("lexicon-state.json: {e}")))?;
+        }
         if let Some((backup_pending, writes)) = sync_settings {
             self.save_local("backup-pending.json", &backup_pending);
             self.save_clipboard(&mut io, writes);
@@ -948,8 +1005,12 @@ impl VitralCore {
     }
 
     pub fn set_pure_offline(&self, enabled: bool) {
-        self.offline_guard.set_pure_offline(enabled);
-        if enabled { self.lan_session.lock().take(); }
+        self.offline_guard.set_pure_offline_with(enabled, |was_offline| {
+            if !was_offline {
+                self.ai_inline_tasks.cancel_remote();
+            }
+            self.lan_session.lock().take();
+        });
     }
 
     pub fn is_pure_offline(&self) -> bool {
@@ -958,10 +1019,12 @@ impl VitralCore {
 
     pub fn set_power_save(&self, enabled: bool) {
         let was_enabled = self.power_save_mode.swap(enabled, Ordering::AcqRel);
+        ai::set_ai_power_save(enabled);
         if enabled {
             if !was_enabled {
                 self.predict_cancel();
             }
+            ai::evict_idle_speech_models();
             // An in-flight distillation must finish before unloading its model.
             let _distill = self.profile_distill_model.lock();
             ai::unload_local_llm();
@@ -1069,9 +1132,18 @@ impl VitralCore {
     }
 
     pub fn on_app_focus(&self, app_id: &str) -> Result<AppFocusState, VitralError> {
-        self.prediction.cancel();
+        self.on_app_focus_with_learning_flag(app_id, false)
+    }
+
+    pub(crate) fn on_app_focus_with_learning_flag(
+        &self,
+        app_id: &str,
+        no_personalized_learning: bool,
+    ) -> Result<AppFocusState, VitralError> {
         let mut st = self.input.lock();
-        st.engine.on_app_focus(app_id)
+        let state = st.engine.on_app_focus_with_learning_flag(app_id, no_personalized_learning)?;
+        self.prediction.cancel();
+        Ok(state)
     }
 
     pub fn set_syllable_split(&self, enabled: bool) -> Result<InputAction, VitralError> {
@@ -1112,10 +1184,13 @@ impl VitralCore {
         };
         self.save_clipboard(&mut io, writes);
         engine.clear_composition_state();
-        if committed.is_some() {
+        let clipboard_commit = committed.is_some();
+        if clipboard_commit {
             engine.reset_commit_context();
         }
-        Some(engine.commit_action(committed, false))
+        let mut action = engine.commit_action(committed, false);
+        action.clipboard_commit = clipboard_commit;
+        Some(action)
     }
 
     fn select_function(engine: &mut EngineState, index: usize) -> Option<InputAction> {
@@ -1214,15 +1289,17 @@ impl VitralCore {
             if changed && background_sync {
                 self.mark_tier1_dirty(&mut sync_st, true);
             }
+            if let Some(text) = act.commit_text.as_deref().filter(|_| !raw_commit && !act.clipboard_commit) {
+                self.record_profile_commit(&mut st, text);
+            }
             (act, changed && !background_sync, raw_commit)
         };
         self.schedule_neural_rerank();
         if sync_now {
             self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
-        if let Some(text) = act.commit_text.as_deref().filter(|_| !raw_commit) {
+        if act.commit_text.is_some() && !raw_commit && !act.clipboard_commit {
             self.schedule_semantic_context();
-            self.record_profile_commit(text);
         }
         Ok(act)
     }
@@ -1233,6 +1310,10 @@ impl VitralCore {
         let sync = self.sync.lock();
         let imported = self.imported_lexicon.read();
         engine.set_preedit_cursor(cursor_utf8, &sync.clipboard, &imported, retention)
+    }
+
+    pub fn reset_commit_context(&self) {
+        self.input.lock().engine.reset_commit_context();
     }
 
     pub fn notify_deleted_chars(&self, count: usize) {
@@ -1264,15 +1345,17 @@ impl VitralCore {
             if changed && background_sync {
                 self.mark_tier1_dirty(&mut sync_st, true);
             }
+            if let Some(text) = action.commit_text.as_deref().filter(|_| !action.clipboard_commit) {
+                self.record_profile_commit(&mut st, text);
+            }
             (action, changed && !background_sync)
         };
         self.schedule_neural_rerank();
         if sync_now {
             self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
-        if let Some(text) = act.commit_text.as_deref() {
+        if act.commit_text.is_some() && !act.clipboard_commit {
             self.schedule_semantic_context();
-            self.record_profile_commit(text);
         }
         Ok(act)
     }
@@ -1350,7 +1433,7 @@ impl VitralCore {
     }
 
     pub fn hw_end(&self) -> Result<HandwritingPayload, VitralError> {
-        let (payload, revision, refine) = {
+        let (payload, revision, refine, app_id, private) = {
             let mut st = self.input.lock();
             if st.hw.active_mode.is_none() {
                 return Err(VitralError::NotInitialized);
@@ -1362,7 +1445,9 @@ impl VitralCore {
             }
             let gram = st.engine.model_paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
             let imported = self.imported_lexicon.read();
-            let refine = st.engine.config.ai_tier3_enabled && (!self.is_pure_offline() || ai::local_llm::LocalLlmEngine::available(st.engine.model_paths.local_llm.as_ref()));
+            let private = st.engine.is_active_privacy_app();
+            let app_id = st.engine.active_app_id.clone();
+            let refine = st.engine.config.ai_tier3_enabled && !private;
             let InputState { hw, retention, .. } = &mut *st;
             let ctx = HwDecodeContext {imported:&imported,gram:gram.as_deref(),retention,tier3:None,offline_guard:Some(&self.offline_guard)};
             let payload = hw.end_with_context(&ctx)?;
@@ -1371,19 +1456,29 @@ impl VitralCore {
             if let HandwritingPayload::Mode1(result) = &payload {
                 st.engine.lookup_hints.clone_from(&result.candidates);
             }
-            (payload, revision, refine)
+            (payload, revision, refine, app_id, private)
         };
         let HandwritingPayload::Mode2(local) = &payload else { return Ok(payload) };
         let mut choices = Vec::new();
         let local_llm = self.input.lock().engine.model_paths.local_llm.clone();
         let ai = Arc::clone(&self.ai.read());
-        let local_refine = ai.uses_local(&self.offline_guard, local_llm.as_ref());
+        let local_model = local_llm.as_ref().filter(|model| ai.uses_local(&self.offline_guard, Some(model)));
+        let local_refine = local_model.is_some();
         if refine {
+            let pure_offline = self.is_pure_offline();
             for slot in local.slots.iter().filter(|s| !s.locked_by_entropy && !s.manually_locked && s.top8.len() > 1) {
+                if pure_offline && !local_refine {
+                    self.privacy_audit.record("handwriting_refine", "blocked_offline", true);
+                    break;
+                }
                 let options:Vec<_> = slot.top8.iter().map(|c| c.ch.as_str()).collect();
                 let prompt = "Choose one character from these handwriting candidates. Return JSON with slot_index equal to its zero-based array index. Preserve the local choice if uncertain.";
                 let question = serde_json::json!({"candidates":options,"local_choice":slot.ch,"text":local.composing_text,"position":slot.slot_idx});
-                let choice = ai.chat_with_local(&self.offline_guard, local_llm.as_ref(), prompt, &question.to_string()).ok()
+                let activity = self.privacy_audit.record(
+                    "handwriting_refine", if local_refine { "local" } else { "remote" }, self.is_pure_offline(),
+                );
+                let chat = AiChat { guard: &self.offline_guard, local_model, activity: Some(&activity) };
+                let choice = ai.chat_with_route(chat, prompt, &question.to_string()).ok()
                     .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
                     .and_then(|v| v["slot_index"].as_u64())
                     .and_then(|i| usize::try_from(i).ok())
@@ -1414,12 +1509,15 @@ impl VitralCore {
             }
             let snapshot = hw.snapshot()?;
             let newly_confirmed = !hw.confirmed_since_edit;
-            let committed = Self::confirm_handwriting(hw, engine, retention, &imported);
+            let learn = !private && app_id == engine.active_app_id;
+            let committed = Self::confirm_handwriting(hw, engine, retention, &imported, learn);
+            if let Some(text) = committed.as_deref().filter(|_| newly_confirmed && learn) {
+                self.record_profile_commit(&mut st, text);
+            }
             (snapshot, newly_confirmed && committed.is_some())
         };
         if confirmed {
             self.schedule_semantic_context();
-            if let HandwritingPayload::Mode2(result) = &payload { self.record_profile_commit(&result.composing_text); }
             self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
         Ok(payload)
@@ -1444,11 +1542,13 @@ impl VitralCore {
         engine: &mut EngineState,
         retention: &mut RetentionEngine,
         imported: &ImportedLexiconIndex,
+        learn: bool,
     ) -> Option<String> {
         let newly_confirmed = !hw.confirmed_since_edit;
         let mut learned = RetentionEngine::default();
-        let committed = hw.confirm_result(&mut learned)?;
-        if newly_confirmed {
+        let learn = learn && !engine.is_active_privacy_app();
+        let committed = hw.confirm_result_with_learning(learn.then_some(&mut learned))?;
+        if newly_confirmed && learn {
             let code = engine.raw_input.clone();
             engine.record_candidate_commit(
                 &committed,
@@ -1487,12 +1587,13 @@ impl VitralCore {
                 retention,
                 ..
             } = &mut *st;
-            Self::confirm_handwriting(hw, engine, retention, &imported)
-                .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))?
+            let committed = Self::confirm_handwriting(hw, engine, retention, &imported, true)
+                .ok_or_else(|| VitralError::NotFound("no handwriting result to confirm".into()))?;
+            self.record_profile_commit(&mut st, &committed);
+            committed
         };
         self.schedule_semantic_context();
         self.sync_tier1_best_effort(Tier1Sync::Changed);
-        self.record_profile_commit(&committed);
         Ok(committed)
     }
 
@@ -1539,9 +1640,8 @@ impl VitralCore {
     }
 
     pub fn clipboard_push(&self, payload: ClipboardPayload) -> ClipboardState {
-        let state = self.enqueue_clipboard_copy(payload.clone());
+        let state = self.enqueue_clipboard_copy(payload);
         let first_current = self.poll_clipboard_current().map(|_| ());
-        self.harvest_clipboard_payload(&payload);
         let background_sync = self.input.lock().engine.config.background_sync;
         if !background_sync {
             let _ = self.poll_clipboard_history(first_current);
@@ -1551,9 +1651,7 @@ impl VitralCore {
 
     #[cfg(any(test, windows))]
     fn clipboard_push_local(&self, payload: ClipboardPayload) -> ClipboardState {
-        let state = self.enqueue_clipboard_copy(payload.clone());
-        self.harvest_clipboard_payload(&payload);
-        state
+        self.enqueue_clipboard_copy(payload)
     }
 
     fn enqueue_clipboard_copy(&self, mut payload: ClipboardPayload) -> ClipboardState {
@@ -1643,88 +1741,31 @@ impl VitralCore {
         payload: ClipboardPayload,
         is_cold_boot: bool,
     ) -> QuickPasteState {
-        let harvest = payload.clone();
-        let state = {
-            let mut io = self.sync_state_io.lock();
-            let (state, writes) = {
-                let mut sync = self.sync.lock();
-                let state = sync.clipboard.ingest_remote(payload, is_cold_boot);
-                let writes = ClipboardWrites {
-                    changes: None,
-                    history: self.local_dir.as_ref().map(|_| sync.clipboard.export_ring()),
-                    current: self.local_dir.as_ref().map(|_| sync.clipboard.current().clone()),
-                };
-                (state, writes)
+        let mut io = self.sync_state_io.lock();
+        let (state, writes) = {
+            let mut sync = self.sync.lock();
+            let state = sync.clipboard.ingest_remote(payload, is_cold_boot);
+            let writes = ClipboardWrites {
+                changes: None,
+                history: self.local_dir.as_ref().map(|_| sync.clipboard.export_ring()),
+                current: self.local_dir.as_ref().map(|_| sync.clipboard.current().clone()),
             };
-            self.save_clipboard(&mut io, writes);
-            state
+            (state, writes)
         };
-        self.harvest_clipboard_payload(&harvest);
+        self.save_clipboard(&mut io, writes);
         state
     }
 
-    fn harvest_clipboard_payload(&self, payload: &ClipboardPayload) {
-        if !payload.mime_type.starts_with("text/plain") {
+    fn record_profile_commit(&self, st: &mut InputState, text: &str) {
+        if !st.engine.config.adaptive_learning || !st.engine.config.profile_distill_enabled
+            || st.engine.is_active_privacy_app()
+        {
             return;
         }
-        let reset_ms = {
-            let st = self.input.lock();
-            if !st.engine.config.adaptive_learning || !st.engine.config.learn_from_clipboard {
-                return;
-            }
-            st.retention.learned_reset_ms
-        };
-        // Annotation may initialize a corpus; hold neither input nor sync while it runs.
-        let cached_annotator = std::cell::OnceCell::new();
-        let annotator = || {
-            cached_annotator.get_or_init(|| {
-                let corpus = Arc::clone(self.imported_lexicon.read().corpus());
-                imp::polyphone::PolyphoneAnnotator::new(corpus)
-            })
-        };
-        let candidates = ClipboardCandidates::extract(&payload.content, |chars| {
-            annotator().corpus().lookup_word_chars(chars).is_some()
-                || self
-                    .imported_lexicon
-                    .read()
-                    .lookup_imported_score_chars(chars)
-                    .is_some()
-        });
-        if candidates.is_empty() {
-            return;
-        }
-        let readings = candidates.annotate(|phrase| {
-            let ann = annotator().annotate_text(phrase);
-            (ann.untoned, ann.xiaohe)
-        });
-        let changed = {
-            let mut st = self.input.lock();
-            if !st.engine.config.adaptive_learning
-                || !st.engine.config.learn_from_clipboard
-                || st.retention.learned_reset_ms != reset_ms
-            {
-                return;
-            }
-            let before = st.retention.crdt_seq;
-            st.retention
-                .apply_clipboard_candidates(candidates, |word| {
-                    let (quanpin, xiaohe) = &readings[word];
-                    (quanpin.as_str(), xiaohe.as_str())
-                });
-            st.retention.crdt_seq != before
-        };
-        if changed {
-            self.sync_tier1_best_effort(Tier1Sync::Changed);
-        }
-    }
-
-    fn record_profile_commit(&self, text: &str) {
-        let mut st = self.input.lock();
-        if !st.engine.config.adaptive_learning || !st.engine.config.profile_distill_enabled { return; }
         let app = st.engine.active_app_id.clone().unwrap_or_else(|| "unknown".into());
         st.profile.record(&app, text);
         if st.profile.needs_distill {
-            let InputState { profile, retention, .. } = &mut *st;
+            let InputState { profile, retention, .. } = st;
             // The bounded statistical pass does no model inference or disk I/O on keys.
             profile.statistical(retention);
             let snapshot = profile.clone();
@@ -1737,14 +1778,23 @@ impl VitralCore {
 
     pub fn profile_state(&self) -> serde_json::Value {
         let st = self.input.lock();
-        serde_json::json!({"profile":st.profile.profile,"needs_distill":st.profile.needs_distill,"reason":st.profile.last_reason,
-            "prediction_enabled":st.engine.config.prediction_enabled,"prediction_delay_ms":st.engine.config.prediction_delay_ms,"profile_distill_enabled":st.engine.config.profile_distill_enabled})
+        serde_json::json!({
+            "profile": st.profile.profile,
+            "needs_distill": st.profile.needs_distill,
+            "reason": st.profile.last_reason,
+            "prediction_enabled": st.engine.config.prediction_enabled,
+            "prediction_skip_dev_apps": st.engine.config.prediction_skip_dev_apps,
+            "prediction_delay_ms": st.engine.config.prediction_delay_ms,
+            "profile_distill_enabled": st.engine.config.profile_distill_enabled,
+            "voice_cleanup_mode": st.engine.config.voice_cleanup_mode,
+            "privacy_apps": st.engine.config.privacy_apps,
+        })
     }
     pub fn profile_update(&self, update: profile::ProfileUpdate) -> Result<(), VitralError> {
         self.prediction.clear_cache(); self.input.lock().profile.update_profile(update)
     }
     pub fn profile_clear(&self) -> Result<(), VitralError> {
-        self.prediction.clear_cache(); self.input.lock().profile.clear_profile()
+        self.prediction.clear_feedback(); self.input.lock().profile.clear_profile()
     }
     pub fn profile_distill(&self) -> Result<(), VitralError> {
         let (mut snapshot, ret, model, revision) = {
@@ -1755,11 +1805,11 @@ impl VitralCore {
         {
             let model = model.as_ref().filter(|_| !self.is_power_save());
             let _distill = model.map(|_| self.profile_distill_model.lock());
-            snapshot.distill(
-                &ret,
-                model.filter(|_| !self.is_power_save()),
-                ai::local_engine(),
-            )?;
+            let model = model.filter(|_| !self.is_power_save());
+            if ai::local_llm::LocalLlmEngine::available(model) {
+                self.privacy_audit.record("profile_distill", "local", self.is_pure_offline());
+            }
+            snapshot.distill(&ret, model, ai::local_engine())?;
         }
         let mut st = self.input.lock();
         // A manual edit or clear wins over a late distillation result.
@@ -1784,6 +1834,9 @@ impl VitralCore {
         let Some(st) = self.input.try_lock() else {
             return Vec::new();
         };
+        if st.engine.is_active_privacy_app() {
+            return Vec::new();
+        }
         let corpus = st.engine.pure_rust.get_corpus();
         let gram = st.engine.pure_rust.cached_gram();
         let canonical = crate::imp::xiaohe::canonical_syllable_set();
@@ -1894,27 +1947,36 @@ impl VitralCore {
         ranked.into_iter().map(|(_, _, hint)| hint).collect()
     }
 
-    pub fn predict_request(&self, request: predict::PredictRequest) -> predict::PredictResult {
+    pub fn predict_request(&self, mut request: predict::PredictRequest) -> predict::PredictResult {
         let skipped = self.prediction.cancel();
-        if request.is_password || request.is_composing {
+        if request.is_password || request.is_composing || request.no_personalized_learning {
             return skipped;
         }
         let st = self.input.lock();
+        if request.app_id.trim().is_empty() {
+            request.app_id = st.engine.active_app_id.clone().unwrap_or_default();
+        }
         // Host claims cannot bypass the core composition gate.
         if !st.engine.config.prediction_enabled
             || !st.engine.raw_input.is_empty()
             || !st.engine.composing.is_empty()
+            || st.engine.is_active_privacy_app()
+            || eng::is_privacy_app(&request.app_id, &st.engine.config.privacy_apps)
+            || (st.engine.config.prediction_skip_dev_apps && eng::is_dev_app(&request.app_id))
         {
             return skipped;
         }
-        let clipboard = self.sync.lock().clipboard.current().current_copy.as_ref().map(|c| c.content.clone()).unwrap_or_default();
         let latest = st.profile.latest(&request.app_id);
+        if request.context_before.trim().is_empty()
+            && latest.is_none_or(|context| context.trim().is_empty())
+        {
+            return skipped;
+        }
         self.prediction.request(
             request,
             &st.engine.config,
             &st.profile.profile,
             latest,
-            &clipboard,
             &st.retention,
             st.engine
                 .model_paths
@@ -1934,6 +1996,9 @@ impl VitralCore {
     pub fn predict_accept(&self, id: u64, text: &str) -> Result<bool, VitralError> {
         let (learned, persisted) = {
             let mut st = self.input.lock();
+            if st.engine.is_active_privacy_app() {
+                return Ok(false);
+            }
             let Some(request) = self.prediction.accept(id, text) else {
                 return Ok(false);
             };
@@ -1963,8 +2028,17 @@ impl VitralCore {
         Ok(true)
     }
     pub fn predict_dismiss(&self, id: u64) -> Result<bool, VitralError> {
-        if !self.prediction.dismiss(id) { return Ok(false); }
-        let mut st = self.input.lock(); st.profile.feedback(None, false); st.profile.persist()?; Ok(true)
+        self.predict_dismiss_with_text(id, None)
+    }
+
+    pub(crate) fn predict_dismiss_with_text(&self, id: u64, text: Option<&str>) -> Result<bool, VitralError> {
+        let mut st = self.input.lock();
+        if st.engine.is_active_privacy_app() || !self.prediction.dismiss(id, text) {
+            return Ok(false);
+        }
+        st.profile.feedback(None, false);
+        st.profile.persist()?;
+        Ok(true)
     }
 
     pub fn personalization_stats(&self) -> ret::PersonalizationStats {
@@ -1972,7 +2046,7 @@ impl VitralCore {
     }
 
     pub fn clear_learned_habits(&self) -> ret::PersonalizationStats {
-        self.prediction.clear_cache();
+        self.prediction.clear_feedback();
         let stats = {
             let _tier1_io = self.tier1_io.lock();
             let mut st = self.input.lock();
@@ -2322,15 +2396,61 @@ impl VitralCore {
     }
 
     pub fn voice_stop(&self) -> Result<VoiceResult, VitralError> {
-        let (samples, paths, ctx) = {
+        let (samples, paths, ctx, mode, app_id, private) = {
             let mut st = self.input.lock();
-            let ctx = ai::speech_context(&st.retention, st.engine.active_app_id.as_deref(), st.engine.speech_context_before());
-            (st.voice.finish()?, st.engine.model_paths.clone(), ctx)
+            let ctx = ai::speech_context(
+                &st.retention,
+                st.engine.active_app_id.as_deref(),
+                st.engine.speech_context_before(),
+            );
+            (
+                st.voice.finish()?,
+                st.engine.model_paths.clone(),
+                ctx,
+                st.engine.config.voice_cleanup_mode.clone(),
+                st.engine.active_app_id.clone(),
+                st.engine.is_active_privacy_app(),
+            )
         };
+        self.privacy_audit
+            .record("voice_asr", "local", self.is_pure_offline());
         let mut result = ai::recognize_pcm(&samples, &paths, &ctx)?;
-        let gram = paths.grammar.as_ref().and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
-        result.transcript = ai::phonetic_correct_transcript(&result.transcript, &self.input.lock().retention, gram.as_deref());
-        self.record_profile_commit(&result.transcript);
+        let gram = paths
+            .grammar
+            .as_ref()
+            .and_then(|p| crate::eng::gram::RimeGramDb::open_cached(p).ok());
+        let correct = |text: &str| {
+            ai::phonetic_correct_transcript(text, &self.input.lock().retention, gram.as_deref())
+        };
+        result.clean(&mode, correct, |text| {
+            let model = paths.local_llm.as_ref()?;
+            if self.is_power_save() || !ai::local_llm::LocalLlmEngine::available(Some(model)) {
+                return None;
+            }
+            let generated = ai::local_engine().generate(
+                model,
+                &ai::local_llm::LocalLlmRequest {
+                    system: AiMode::Polish.instructions("", None),
+                    prompt: ai::user_text_prompt(text),
+                    max_new_tokens: 512,
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(2500),
+                    ),
+                    ..Default::default()
+                },
+            );
+            match generated {
+                Ok(text) => Some(text),
+                Err(err) => {
+                    eprintln!("Vitral: local voice polish failed: {err}");
+                    None
+                }
+            }
+        });
+        let mut st = self.input.lock();
+        if !private && st.engine.active_app_id == app_id {
+            self.record_profile_commit(&mut st, &result.transcript);
+        }
         Ok(result)
     }
 
@@ -2340,9 +2460,106 @@ impl VitralCore {
         text: &str,
         target_lang: &str,
     ) -> Result<AiInlineResult, VitralError> {
-        let ai = Arc::clone(&self.ai.read());
-        let model = self.input.lock().engine.model_paths.local_llm.clone();
-        ai.run_with_local(&self.offline_guard, model.as_ref(), mode, text, target_lang)
+        self.ai_inline_in_app(mode, text, target_lang, None)
+    }
+
+    pub(crate) fn ai_inline_in_app(
+        &self,
+        mode: AiMode,
+        text: &str,
+        target_lang: &str,
+        app_id: Option<&str>,
+    ) -> Result<AiInlineResult, VitralError> {
+        let (client, model, tone) = self.ai_inline_context(app_id);
+        let mut chat = AiChat {
+            guard: &self.offline_guard,
+            local_model: model.as_ref(),
+            activity: None,
+        };
+        let pure_offline = self.is_pure_offline();
+        let activity =
+            self.privacy_audit
+                .record("ai_inline", chat.audit_route(pure_offline), pure_offline);
+        chat.activity = Some(&activity);
+        client.run_inline(
+            chat,
+            InlineRequest {
+                mode,
+                text,
+                target_lang,
+                app_tone: tone.as_deref(),
+            },
+        )
+    }
+
+    fn ai_inline_context(
+        &self,
+        app_id: Option<&str>,
+    ) -> (Arc<AiClient>, Option<models::LocalLlmModel>, Option<String>) {
+        let st = self.input.lock();
+        let client = Arc::clone(&self.ai.read());
+        let model = st
+            .engine
+            .model_paths
+            .local_llm
+            .as_ref()
+            .filter(|model| client.uses_local(&self.offline_guard, Some(model)))
+            .cloned();
+        let tone = app_id
+            .or(st.engine.active_app_id.as_deref())
+            .filter(|app| !st.engine.is_active_privacy_app() && !eng::is_privacy_app(app, &st.engine.config.privacy_apps))
+            .and_then(|app| st.profile.profile.app_styles.get(app.trim()))
+            .map(|style| style.tone.clone());
+        (client, model, tone)
+    }
+
+    pub fn ai_inline_route(&self) -> &'static str {
+        let (client, model, _) = self.ai_inline_context(None);
+        if model.is_some() {
+            "local"
+        } else if !self.is_pure_offline() && client.has_remote_endpoint() {
+            "remote"
+        } else {
+            "none"
+        }
+    }
+
+    pub fn ai_inline_start(
+        &self,
+        mode: AiMode,
+        text: &str,
+        target_lang: &str,
+        app_id: Option<&str>,
+    ) -> Result<ai::InlineStart, VitralError> {
+        let (client, model, tone) = self.ai_inline_context(app_id);
+        self.ai_inline_tasks.start(
+            client,
+            self.offline_guard.clone(),
+            model,
+            &self.privacy_audit,
+            InlineRequest {
+                mode,
+                text,
+                target_lang,
+                app_tone: tone.as_deref(),
+            },
+        )
+    }
+
+    pub fn ai_inline_poll(&self, id: u64) -> Result<ai::InlineUpdate, VitralError> {
+        self.ai_inline_tasks.poll(id)
+    }
+
+    pub fn ai_inline_cancel(&self, id: Option<u64>) -> bool {
+        self.ai_inline_tasks.cancel(id)
+    }
+
+    pub fn privacy_audit(&self) -> serde_json::Value {
+        self.privacy_audit.snapshot(self.is_pure_offline())
+    }
+
+    pub fn privacy_audit_clear(&self) {
+        self.privacy_audit.clear();
     }
 
     pub fn restore_from_koofr(&self, webdav_cfg_json: &str) -> Result<RestoreResult, VitralError> {
@@ -2360,6 +2577,7 @@ impl VitralCore {
             let _tier1_io = self.tier1_io.lock();
             let mut st = self.input.lock();
             if fetched.profile.is_some() || fetched.snapshot.is_some() || !fetched.crdt_deltas.is_empty() {
+                self.prediction.clear_cache();
                 if let Some(dir) = &self.retention_backup_dir {
                     local::backup_retention(dir, &st.retention)
                         .map_err(|error| VitralError::Io(format!("retention backup: {error}")))?;
@@ -2385,6 +2603,7 @@ impl VitralCore {
 
             if let Some(snap) = fetched.snapshot {
                 st.retention = snap.retention;
+                st.retention.purge_clipboard_phrases();
                 let half_life = st.retention.half_life_sec;
                 st.retention.set_half_life_sec(half_life);
                 imported.inject_hotwords(&snap.imported_entries);
@@ -2419,7 +2638,7 @@ impl VitralCore {
                 }
                 sync_st.dav_config = Some(cfg);
             }
-            if self.local_dir.is_some() {
+            if let Some(dir) = &self.local_dir {
                 writes.history = Some(sync_st.clipboard.export_ring());
                 writes.current = Some(sync_st.clipboard.current().clone());
                 drop(sync_st);
@@ -2431,7 +2650,8 @@ impl VitralCore {
                 let app_lang_memory = st.engine.app_lang_memory.clone();
                 drop(imported);
                 drop(st);
-                self.save_local("lexicon-state.json", &snapshot);
+                local::save(dir, "lexicon-state.json", &snapshot)
+                    .map_err(|e| VitralError::Io(format!("lexicon-state.json: {e}")))?;
                 self.save_local("app-languages.json", &app_lang_memory);
                 self.save_clipboard(&mut io, writes);
             }
@@ -2781,6 +3001,34 @@ mod tests {
     }
 
     #[test]
+    fn reset_commit_context_command_ends_backspace_recovery() {
+        for reset in [false, true] {
+            let core = VitralCore::init(r#"{"pure_offline":true,"schema":"rime_ice"}"#).unwrap();
+            for ch in "nihao".chars() {
+                core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
+            }
+            let typed = core.candidate_state().unwrap();
+            let index = typed.candidates.iter().position(|item| item.text == "你好").unwrap();
+            assert_eq!(core.select_candidate(index).unwrap().commit_text.as_deref(), Some("你好"));
+            if reset {
+                for _ in 0..2 {
+                    assert_eq!(commands::execute(&core, "reset-commit-context", &serde_json::json!({})).unwrap(),
+                        serde_json::json!({"ok":true}));
+                }
+            }
+            let backspace = core.process_key(8, 0, SwipeDir::None).unwrap();
+            if reset {
+                assert_eq!(backspace.undo_commit_chars, 0);
+                assert!(backspace.preedit.text.is_empty());
+                assert!(core.input.lock().engine.raw_input.is_empty());
+            } else {
+                assert_eq!(backspace.undo_commit_chars, 2);
+                assert_eq!(core.input.lock().engine.raw_input, "nihao");
+            }
+        }
+    }
+
+    #[test]
     fn quick_paste_ends_backspace_recovery_for_the_previous_candidate() {
         let core = VitralCore::init(r#"{"pure_offline":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
         core.on_ime_open();
@@ -2795,7 +3043,9 @@ mod tests {
         core.on_ime_open();
         core.clipboard_push(serde_json::from_value(serde_json::json!({"content": "快捷粘贴"})).unwrap());
         assert!(core.candidate_state().unwrap().candidates[0].quick_paste_id.is_some());
-        assert_eq!(core.select_candidate(0).unwrap().commit_text.as_deref(), Some("快捷粘贴"));
+        let action = core.select_candidate(0).unwrap();
+        assert_eq!(action.commit_text.as_deref(), Some("快捷粘贴"));
+        assert_eq!(serde_json::to_value(action).unwrap()["clipboard_commit"], true);
         let backspace = core.process_key(8, 0, SwipeDir::None).unwrap();
         assert_eq!(backspace.undo_commit_chars, 0);
         assert!(backspace.preedit.text.is_empty());
@@ -2803,12 +3053,21 @@ mod tests {
 
     #[test]
     fn clipboard_shortcut_preserves_text_with_micro_spacing_enabled() {
-        let core = VitralCore::init(r#"{"pure_offline":true,"auto_micro_space":true,"learn_from_clipboard":false,"assets_dir":"/nonexistent-vitral-assets"}"#).unwrap();
+        let core = VitralCore::init(r#"{"pure_offline":true,"auto_micro_space":true,"assets_dir":"/nonexistent-vitral-assets"}"#).unwrap();
+        core.on_app_focus("editor").unwrap();
         let state = core.clipboard_push(serde_json::from_value(serde_json::json!({"content": "中文\n原文"})).unwrap());
         core.clipboard_pin(&state.ring[0].id, Some("ksb")).unwrap();
 
-        for key in [None, Some(' '), Some('1'), Some(',')] {
-            assert_eq!(core.process_key('7' as u32, 0, SwipeDir::None).unwrap().commit_text.as_deref(), Some("7"));
+        for (key, suffix) in [(None, ""), (Some(' '), ""), (Some('1'), ""), (Some(','), "，"), (Some('('), "()")] {
+            let typed = core.process_key('7' as u32, 0, SwipeDir::None).unwrap();
+            assert_eq!(typed.commit_text.as_deref(), Some("7"));
+            let typed_json = serde_json::to_value(typed).unwrap();
+            assert!(typed_json.get("clipboard_commit").is_none());
+            assert!(
+                !serde_json::from_value::<InputAction>(typed_json)
+                    .unwrap()
+                    .clipboard_commit
+            );
             for ch in "ksb".chars() {
                 core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
             }
@@ -2818,8 +3077,10 @@ mod tests {
             } else {
                 core.select_candidate(0).unwrap()
             };
-            let expected = if key == Some(',') { "中文\n原文，" } else { "中文\n原文" };
-            assert_eq!(action.commit_text.as_deref(), Some(expected));
+            let expected = format!("中文\n原文{suffix}");
+            assert_eq!(action.commit_text.as_deref(), Some(expected.as_str()));
+            assert_eq!(serde_json::to_value(action).unwrap()["clipboard_commit"], true);
+            assert_eq!(core.input.lock().profile.latest("editor"), Some("7"));
         }
     }
 
@@ -5946,7 +6207,8 @@ mod m1c_tests {
             timestamp_ms: 10,
             ..local[0].clone()
         };
-        let cloud_bytes = crate::sync::encode_clipboard_ring_jsonl(&[cloud.clone()]).unwrap();
+        let cloud_bytes = crate::sync::encode_clipboard_ring_jsonl(std::slice::from_ref(&cloud))
+            .unwrap();
         mock.write_file(
             "clipboard/history_ring.jsonl.enc",
             &encrypt_envelope(&cloud_bytes, None).unwrap(),
@@ -6635,6 +6897,151 @@ mod m1c_tests {
         let dir = std::env::temp_dir().join(format!("vitral-package-a-{name}-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         TestStateDir(dir)
+    }
+
+    #[test]
+    fn preference_half_life_persists_and_explicit_init_overrides_snapshot() {
+        let dir = state_dir_for_test("preference-half-life");
+        let cfg = serde_json::json!({
+            "data_dir": dir.0,
+            "assets_dir": dir.0.join("no-assets"),
+            "pure_offline": true,
+            "schema": "rime_ice"
+        });
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        let mut retention = RetentionEngine::with_half_life(2_592_000.0);
+        retention.record_selection_at("学习词条", 123, 2.0);
+        let snapshot = LexiconSnapshotPayload {
+            schema_version: 1,
+            retention,
+            imported_entries: vec![crate::imp::ImportedLexiconEntry {
+                text: "星尘漫步者".into(),
+                pinyin: "xing chen man bu zhe".into(),
+                toned_pinyin: "xīng chén màn bù zhě".into(),
+                xiaohe: "xkifmjbuve".into(),
+                weight: 100,
+            }],
+        };
+        local::save(&dir.0, "lexicon-state.json", &snapshot).unwrap();
+        drop(core);
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        assert_eq!(core.input.lock().retention.half_life_sec, 2_592_000.0);
+        let mut preferences = EngineConfig::parse_json(&cfg.to_string()).unwrap();
+        preferences.frecency_half_life_sec = Some(604_800.0);
+        core.apply_preferences(preferences).unwrap();
+        assert_eq!(core.input.lock().engine.config.frecency_half_life_sec, Some(604_800.0));
+        drop(core);
+        let stored = local::load::<LexiconSnapshotPayload>(&dir.0, "lexicon-state.json")
+            .unwrap().unwrap();
+        assert_eq!(stored.retention.half_life_sec, 604_800.0);
+        assert_eq!(serde_json::to_value(&stored.retention.frecency).unwrap(),
+            serde_json::to_value(&snapshot.retention.frecency).unwrap());
+        assert_eq!(serde_json::to_value(&stored.imported_entries).unwrap(),
+            serde_json::to_value(&snapshot.imported_entries).unwrap());
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        assert_eq!(core.input.lock().retention.half_life_sec, 604_800.0);
+        assert_eq!(core.input.lock().retention.frecency["学习词条"], 2.0);
+        drop(core);
+        let mut explicit_cfg = cfg;
+        explicit_cfg["frecency_half_life_sec"] = serde_json::json!(86_400);
+        let core = VitralCore::init(&explicit_cfg.to_string()).unwrap();
+        assert_eq!(core.input.lock().retention.half_life_sec, 86_400.0);
+    }
+
+    #[test]
+    fn legacy_clipboard_phrases_are_purged_on_startup_and_restore() {
+        let dir = state_dir_for_test("legacy-clipboard-phrases");
+        let mock = InProcessWebDavMock::start();
+        let cfg = serde_json::json!({
+            "data_dir": dir.0,
+            "assets_dir": dir.0.join("no-assets"),
+            "pure_offline": true,
+            "schema": "rime_ice",
+            "koofr_endpoint": mock.koofr_endpoint()
+        });
+        let legacy_word = "霁岚云篆";
+        let typed_word = "霁岚星牒";
+        let snapshot = serde_json::json!({
+            "schema_version": 1,
+            "imported_entries": [],
+            "retention": {
+                "frecency": {(legacy_word): 0.35, (typed_word): 1.0},
+                "frecency_updated_ms": {(legacy_word): 10, (typed_word): 1},
+                "user_english": {"copiedortyped": "CopiedOrTyped"},
+                "habit_updated_ms": {"e:copiedortyped": 10},
+                "pinned_words": [], "erased_words": [],
+                "user_phrases": {
+                    (legacy_word): {
+                        "word": legacy_word, "quanpin": "ji lan yun zhuan", "xiaohe": "jiljyvyv",
+                        "count": 1, "updated_ms": 10, "source": "clipboard"
+                    },
+                    (typed_word): {
+                        "word": typed_word, "quanpin": "ji lan xing die", "xiaohe": "jiljxkdp",
+                        "count": 1, "updated_ms": 1, "source": "typed"
+                    }
+                }
+            }
+        });
+        local::save(&dir.0, "lexicon-state.json", &snapshot).unwrap();
+        let core = VitralCore::init(&cfg.to_string()).unwrap();
+        let assert_clean = || {
+            let stored = local::load::<LexiconSnapshotPayload>(&dir.0, "lexicon-state.json")
+                .unwrap()
+                .unwrap();
+            assert!(!stored.retention.user_phrases.contains_key(legacy_word));
+            assert_eq!(stored.retention.user_phrases[typed_word].source, "typed");
+            let ret = &stored.retention;
+            let delta = ret.export_crdt_delta("clean");
+            assert!(!delta.frecency.contains_key(legacy_word));
+            assert!(!delta.frecency_updated_ms.contains_key(legacy_word));
+            assert!(!delta.user_phrases.contains_key(legacy_word));
+            assert_eq!(delta.frecency[typed_word], 1.0);
+            assert_eq!(delta.user_english["copiedortyped"], "CopiedOrTyped");
+            let mut profile = profile::ProfileEngine::new(None).unwrap();
+            profile.statistical(ret);
+            let speech = ai::speech_context(ret, None, String::new());
+            for words in [&profile.profile.entities, &speech.hotwords] {
+                assert!(!words.iter().any(|word| word == legacy_word));
+                assert!(words.iter().any(|word| word == typed_word));
+            }
+            core.on_app_focus("editor").unwrap();
+            let prediction = core.predict_request(predict::PredictRequest {
+                context_before: "霁岚".into(),
+                ..Default::default()
+            });
+            assert_eq!(prediction.text, "星牒", "{prediction:?}");
+            assert!(!prediction.candidates.iter().any(|text| text == "云篆"));
+            let action = type_ascii(&core, "jilanyunzhuan");
+            assert!(!action
+                .candidates
+                .iter()
+                .any(|item| item.text == legacy_word));
+            core.process_key(0x1b, 0, SwipeDir::None).unwrap();
+            let action = type_ascii(&core, "jilanxingdie");
+            assert!(action.candidates.iter().any(|item| item.text == typed_word));
+            core.process_key(0x1b, 0, SwipeDir::None).unwrap();
+        };
+        assert_clean();
+
+        let snapshot: LexiconSnapshotPayload = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(
+            snapshot.retention.user_phrases[legacy_word].source,
+            "clipboard"
+        );
+        let mut delta = snapshot.retention.export_crdt_delta("legacy-device");
+        let stale = delta.user_phrases.get_mut(typed_word).unwrap();
+        stale.source = "clipboard".into();
+        stale.updated_ms = 100;
+        stale.count = 100;
+        core.set_pure_offline(false);
+        let dav =
+            DavConfig::from_engine_config(&EngineConfig::parse_json(&cfg.to_string()).unwrap())
+                .unwrap();
+        upload_lexicon_snapshot(&core.offline_guard, &dav, &snapshot).unwrap();
+        upload_retention_crdt_delta(&core.offline_guard, &dav, &delta).unwrap();
+        let restored = core.restore_from_koofr("{}").unwrap();
+        assert_eq!(restored.snapshots_applied, 2);
+        assert_clean();
     }
 
     #[test]
@@ -7828,7 +8235,7 @@ mod personalization_tests {
     }
 
     #[test]
-    fn clipboard_preferences_commands_and_persisted_clear() {
+    fn clipboard_copy_routes_do_not_learn_with_legacy_preferences() {
         struct TempData(std::path::PathBuf);
         impl Drop for TempData {
             fn drop(&mut self) {
@@ -7842,42 +8249,58 @@ mod personalization_tests {
         )));
         let cfg = serde_json::json!({"pure_offline":true,"data_dir":data.0,"assets_dir":"/nonexistent-vitral-assets"});
         let core = VitralCore::init(&cfg.to_string()).unwrap();
-        let payload = |text: &str| ClipboardPayload {
-            id: None,
-            content: text.into(),
-            mime_type: "text/plain".into(),
-            source_device: "test".into(),
-            timestamp_ms: 0,
-        };
-        core.clipboard_push_local(payload("你好 OpenAI"));
-        core.clipboard_ingest_remote(payload("中国 Vitral"), false);
-        assert!(core.personalization_stats().phrase_count >= 2);
-        assert_eq!(core.personalization_stats().english_count, 2);
-        let mut preferences = cfg.clone();
-        preferences["learn_from_clipboard"] = serde_json::json!(false);
-        core.apply_preferences(EngineConfig::parse_json(&preferences.to_string()).unwrap())
-            .unwrap();
-        core.clipboard_push_local(payload("学习 RustLang"));
-        assert!(!core
-            .input
-            .lock()
-            .retention
-            .user_phrases
-            .contains_key("学习"));
-        assert!(core
-            .input
-            .lock()
-            .retention
-            .query_user_english("rustlang")
-            .is_none());
+        let mut timestamp_ms = 0;
+        for legacy in [true, false] {
+            let mut preferences = cfg.clone();
+            preferences["learn_from_clipboard"] = serde_json::json!(legacy);
+            let config = EngineConfig::parse_json(&preferences.to_string()).unwrap();
+            assert!(config.adaptive_learning);
+            assert!(serde_json::to_value(&config)
+                .unwrap()
+                .get("learn_from_clipboard")
+                .is_none());
+            core.apply_preferences(config).unwrap();
+
+            let mut payload = |content: &str| {
+                timestamp_ms += 1;
+                ClipboardPayload {
+                    id: None,
+                    content: content.into(),
+                    mime_type: "text/plain".into(),
+                    source_device: "test".into(),
+                    timestamp_ms,
+                }
+            };
+            let seq = core.input.lock().retention.crdt_seq;
+            assert_eq!(
+                core.clipboard_push(payload("你好 OpenAI")).ring[0].content,
+                "你好 OpenAI"
+            );
+            assert_eq!(
+                core.clipboard_push_local(payload("中国 Vitral")).ring[0].content,
+                "中国 Vitral"
+            );
+            assert_eq!(
+                core.clipboard_ingest_remote(payload("学习 RustLang"), false)
+                    .quick_paste
+                    .unwrap()
+                    .content,
+                "学习 RustLang"
+            );
+            let retention = &core.input.lock().retention;
+            assert_eq!(retention.crdt_seq, seq);
+            assert!(retention.user_phrases.is_empty());
+            assert_eq!(retention.stats().english_count, 0);
+        }
         {
             let mut st = core.input.lock();
+            st.retention.record_english_casing("OpenAI");
             st.retention.pin_word("保留");
             st.retention.erase_word("删除");
         }
         let stats =
             commands::execute(&core, "personalization-stats", &serde_json::json!({})).unwrap();
-        assert_eq!(stats["english_count"], 2);
+        assert_eq!(stats["english_count"], 1);
         let cleared =
             commands::execute(&core, "personalization-clear", &serde_json::json!({})).unwrap();
         assert_eq!(cleared["phrase_count"], 0);
@@ -7896,6 +8319,38 @@ mod personalization_tests {
 mod prediction_integration_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn clipboard_does_not_change_prediction_context_or_cache() {
+        let core = VitralCore::init(
+            r#"{"assets_dir":"/nonexistent-vitral-assets","pure_offline":true}"#,
+        )
+        .unwrap();
+        core.input
+            .lock()
+            .retention
+            .context_bigrams
+            .insert("你好".into(), [("世界".into(), 4.0)].into());
+        let request = predict::PredictRequest {
+            app_id: "editor".into(),
+            context_before: "你好".into(),
+            ..Default::default()
+        };
+        let first = core.predict_request(request.clone());
+        assert_eq!(first.text, "世界");
+        assert!(!first.cached);
+
+        core.clipboard_push(ClipboardPayload {
+            id: None,
+            content: "剪贴板上下文 VitralCopy".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 0,
+        });
+        let after_copy = core.predict_request(request);
+        assert!(after_copy.cached);
+        assert_eq!(after_copy.candidates, first.candidates);
+    }
 
     #[test]
     fn context_next_hints_rank_deduplicate_and_serialize() {
@@ -7994,7 +8449,7 @@ mod prediction_integration_tests {
         for ms in [150,380,2000] { assert!(EngineConfig::parse_json(&json!({"prediction_delay_ms":ms}).to_string()).is_ok()); }
         let cfg = EngineConfig { adaptive_learning:false, profile_distill_enabled:false, ..Default::default() };
         core.apply_preferences(cfg).unwrap();
-        core.record_profile_commit("不应学习这句话");
+        core.record_profile_commit(&mut core.input.lock(), "不应学习这句话");
         assert!(core.input.lock().profile.latest("editor").is_none());
         core.input.lock().retention.context_bigrams.entry("你好".into()).or_default().insert("世界".into(), 1.);
         let ready = commands::execute(&core, "predict-request", &request).unwrap();
@@ -8177,6 +8632,53 @@ mod device_regression_tests {
     }
 
     #[test]
+    fn prediction_skips_development_and_sensitive_apps() {
+        let temp = Temp::new("prediction-apps");
+        let core = temp.core();
+        assert_eq!(core.profile_state()["prediction_skip_dev_apps"], true);
+        let status = |app_id: &str| {
+            core.predict_request(predict::PredictRequest {
+                app_id: app_id.into(),
+                context_before: "输入".into(),
+                ..Default::default()
+            })
+            .status
+        };
+        let dev_apps = [
+            r"C:\Program Files\Microsoft VS Code\Code.exe",
+            "org.gnome.Terminal",
+            "com.jetbrains.idea",
+            "com.termux",
+        ];
+        let sensitive_apps = [
+            "1Password.exe",
+            "com.onepassword.passwordmanager",
+            "org.keepassxc.KeePassXC",
+            "com.bitwarden.desktop",
+            "Enpass",
+            "polkit",
+            "gnome-keyring-daemon",
+            "kwalletd6",
+        ];
+        for app in dev_apps.into_iter().chain(sensitive_apps) {
+            assert_eq!(status(app), "skipped", "{app}");
+        }
+        assert_eq!(status("org.mozilla.firefox"), "ready");
+
+        let cfg = EngineConfig::parse_json(r#"{"prediction_skip_dev_apps":false}"#).unwrap();
+        core.apply_preferences(cfg).unwrap();
+        assert_eq!(core.profile_state()["prediction_skip_dev_apps"], false);
+        for app in dev_apps {
+            assert_eq!(status(app), "ready", "{app}");
+        }
+        for app in sensitive_apps {
+            assert_eq!(status(app), "skipped", "{app}");
+        }
+        core.on_app_focus("com.bitwarden.desktop").unwrap();
+        assert_eq!(status(""), "skipped");
+    }
+
+    #[test]
     fn power_save_skips_local_prediction_and_distillation() {
         let temp = Temp::new("power-save");
         let core = temp.core();
@@ -8223,12 +8725,17 @@ mod device_regression_tests {
         assert_eq!(profile["profile"]["source"], "statistical");
         assert_eq!(profile["profile"]["entities"], serde_json::json!(["Vitral", "完成"]));
         assert!(profile["reason"].is_null());
+        assert_eq!(core.privacy_audit()["entries"], serde_json::json!([]));
 
         assert_eq!(set_power_save(false), serde_json::json!({"power_save":false}));
         #[cfg(feature = "native-onnx")]
         {
             core.profile_distill().unwrap();
             assert!(core.profile_state()["reason"].is_string());
+            let audit = core.privacy_audit();
+            assert_eq!(audit["entries"][0]["operation"], "profile_distill");
+            assert_eq!(audit["entries"][0]["route"], "local");
+            assert_eq!(audit["total_outbound_bytes"], 0);
         }
     }
 
@@ -8373,6 +8880,45 @@ mod device_regression_tests {
                 }
                 assert_eq!(type_code(&restarted).candidates[0].text, selected, "{backend} {schema:?}");
             }
+        }
+    }
+
+    #[test]
+    fn configure_preserves_legacy_clipboard_capacity_when_changing_shortcuts() {
+        let temp = Temp::new("configure-capacity");
+        let mut cfg = temp.core().input.lock().engine.config.clone();
+        cfg.clipboard_ring_capacity = 4;
+        let core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        cfg.shortcuts[0].key = "Ctrl+Shift+F1".into();
+        crate::commands::execute(&core, "configure", &serde_json::to_value(&cfg).unwrap())
+            .unwrap();
+        let state = core.input.lock();
+        assert_eq!(state.engine.config.clipboard_ring_capacity, 4);
+        assert_eq!(state.engine.config.shortcuts, cfg.shortcuts);
+    }
+
+    #[test]
+    fn configure_explicitly_clears_blank_koofr_password_like_cold_start() {
+        let temp = Temp::new("configure-password");
+        let mut cfg = temp.core().input.lock().engine.config.clone();
+        cfg.koofr_endpoint = Some("https://example.org/dav/".into());
+        cfg.koofr_username = Some("user".into());
+        cfg.koofr_password = Some("secret".into());
+        for password in [None, Some(String::new())] {
+            cfg.koofr_password = Some("secret".into());
+            let core = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            cfg.koofr_password = password;
+            let mut payload = serde_json::to_value(&cfg).unwrap();
+            crate::commands::execute(&core, "configure", &payload).unwrap();
+            assert_eq!(core.input.lock().engine.config.koofr_password.as_deref(), Some("secret"));
+            assert_eq!(core.sync.lock().dav_config.as_ref().unwrap().password.as_deref(), Some("secret"));
+
+            payload["clear_koofr_password"] = serde_json::json!(true);
+            crate::commands::execute(&core, "configure", &payload).unwrap();
+            assert!(core.input.lock().engine.config.koofr_password.is_none());
+            assert!(core.sync.lock().dav_config.as_ref().unwrap().password.is_none());
+            let restarted = VitralCore::init(&serde_json::to_string(&cfg).unwrap()).unwrap();
+            assert_eq!(core.sync.lock().dav_config, restarted.sync.lock().dav_config);
         }
     }
 
@@ -8934,5 +9480,498 @@ mod input_feature_tests {
         let engine = &f.core.input.lock().engine;
         assert!(engine.raw_input.is_empty());
         assert!(engine.current_candidates.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod p1_privacy_tests {
+    use super::*;
+    use serde_json::{json, Value};
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    fn core(settings: &Value) -> VitralCore {
+        let mut settings = settings.clone();
+        settings["assets_dir"] = json!("/nonexistent-vitral-assets");
+        VitralCore::init(&settings.to_string()).unwrap()
+    }
+
+    #[test]
+    fn ai_inline_route_command_matches_start_context() {
+        for offline in [false, true] {
+            for prefer_local in [false, true] {
+                for model_enabled in [false, true] {
+                    for endpoint in [None, Some("   "), Some("http://127.0.0.1:9/v1")] {
+                        let core = core(&json!({
+                            "pure_offline":offline, "ai_prefer_local":prefer_local,
+                            "ai_endpoint":endpoint, "ai_timeout_ms":100,
+                        }));
+                        // A model descriptor exercises route selection without real model weights.
+                        if model_enabled {
+                            let dir = std::path::PathBuf::from("/nonexistent-vitral-route-model");
+                            core.input.lock().engine.model_paths.local_llm = Some(models::LocalLlmModel {
+                                id: "route-test".into(), model_file: dir.join("model.onnx"),
+                                dir, is_fp16_kv: false,
+                            });
+                        }
+                        let remote = endpoint.is_some_and(|s| !s.trim().is_empty());
+                        let local = cfg!(feature = "native-onnx") && model_enabled
+                            && (offline || prefer_local || !remote);
+                        let expected = if local { "local" } else if !offline && remote { "remote" } else { "none" };
+                        let route = commands::execute(&core, "ai-inline-route", &json!({})).unwrap();
+                        assert_eq!(route, json!({"route":expected,"pure_offline":offline}));
+                        let started = commands::execute(&core, "ai-inline-start",
+                            &json!({"mode":"polish","text":"输入","target_lang":""})).unwrap();
+                        if expected == "none" {
+                            let last = poll_until(&core, started["id"].as_u64().unwrap(), |v| v["status"] != "running");
+                            assert_eq!(last["status"], "error");
+                            assert_eq!(core.privacy_audit()["total_outbound_bytes"], 0);
+                        } else {
+                            assert_eq!(started["route"], expected);
+                            core.ai_inline_cancel(started["id"].as_u64());
+                        }
+                        core.set_pure_offline(true);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preferences_validate_voice_modes_and_expose_privacy_apps() {
+        assert_eq!(
+            EngineConfig::parse_json("{}").unwrap().voice_cleanup_mode,
+            "light"
+        );
+        let core = core(&json!({"pure_offline":true}));
+        for mode in ["off", "light", "polish"] {
+            let value = json!({"voice_cleanup_mode":mode,"privacy_apps":["secret-editor"],"pure_offline":true});
+            core.apply_preferences(EngineConfig::parse_json(&value.to_string()).unwrap())
+                .unwrap();
+            assert_eq!(core.profile_state()["voice_cleanup_mode"], mode);
+            assert_eq!(core.profile_state()["privacy_apps"], value["privacy_apps"]);
+        }
+        for check in [
+            EngineConfig::parse_json(r#"{"voice_cleanup_mode":"heavy"}"#).map(|_| ()),
+            core.apply_preferences(EngineConfig {
+                voice_cleanup_mode: "heavy".into(),
+                ..Default::default()
+            }),
+        ] {
+            assert!(matches!(check, Err(VitralError::InvalidArgument(_))));
+        }
+        assert_eq!(core.profile_state()["voice_cleanup_mode"], "polish");
+    }
+
+    #[test]
+    fn focused_privacy_app_keeps_selection_and_copy_without_learning() {
+        let core = core(&json!({
+            "platform":"android", "schema":"rime_ice", "pure_offline":true,
+            "privacy_apps":[" SECRET-EDITOR "]
+        }));
+        for app in [
+            "org.example.secret-editor",
+            "Tor Browser",
+            "tor-browser.exe",
+            "com.chrome.incognito",
+            "Browser - Private Browsing",
+            "org.keepassxc.KeePassXC",
+        ] {
+            assert!(
+                eng::is_privacy_app(app, &[" SECRET-EDITOR ".into()]),
+                "{app}"
+            );
+        }
+        assert!(!eng::is_privacy_app("incognitoproject", &[" ".into()]));
+        core.on_app_focus("org.example.secret-editor").unwrap();
+        core.input
+            .lock()
+            .retention
+            .context_bigrams
+            .entry("你好".into())
+            .or_default()
+            .insert("世界".into(), 4.0);
+        let request = || predict::PredictRequest {
+            app_id: "editor".into(),
+            context_before: "你好".into(),
+            ..Default::default()
+        };
+        assert_eq!(core.predict_request(request()).status, "skipped");
+        assert!(core.context_next_hints("你好", Some("世界")).is_empty());
+        let type_code = |code: &str| {
+            for char in code.chars() {
+                core.process_key(u32::from(char), 0, SwipeDir::None)
+                    .unwrap();
+            }
+        };
+        let seq = core.input.lock().retention.crdt_seq;
+        type_code("nihao");
+        assert!(core.select_candidate(0).unwrap().commit_text.is_some());
+        type_code("zhongguo");
+        assert!(core
+            .process_key(32, 0, SwipeDir::None)
+            .unwrap()
+            .commit_text
+            .is_some());
+        core.clipboard_push(ClipboardPayload {
+            id: None,
+            content: "项目管理 VitralPrivacy".into(),
+            mime_type: "text/plain".into(),
+            source_device: "test".into(),
+            timestamp_ms: 0,
+        });
+        assert_eq!(
+            core.quick_paste_state().current_copy.unwrap().content,
+            "项目管理 VitralPrivacy"
+        );
+        {
+            let st = core.input.lock();
+            assert_eq!(st.retention.crdt_seq, seq);
+            assert!(st.retention.query_user_english("vitralprivacy").is_none());
+            assert!(st.profile.latest("org.example.secret-editor").is_none());
+        }
+        core.on_app_focus("editor").unwrap();
+        assert_eq!(core.predict_request(request()).text, "世界");
+        assert_eq!(core.context_next_hints("你好", None)[0].ch, "世");
+        type_code("nihao");
+        let committed = core.select_candidate(0).unwrap().commit_text.unwrap();
+        assert_eq!(
+            core.input.lock().profile.latest("editor"),
+            Some(committed.as_str())
+        );
+    }
+
+    #[test]
+    fn host_no_learning_flag_blocks_predictions_hints_and_learning() {
+        let core = core(&json!({"schema":"rime_ice","pure_offline":true}));
+        core.input.lock().retention.context_bigrams.insert(
+            "你好".into(), [("世界".into(), 4.0)].into(),
+        );
+        let execute = |command, args| commands::execute(&core, command, &args).unwrap();
+        let request = json!({"app_id":"editor","context_before":"你好"});
+        execute("on-app-focus", json!({"app_id":"editor"}));
+        assert_eq!(execute("predict-request", request.clone())["text"], "世界");
+        let mut private_request = request.clone();
+        private_request["no_personalized_learning"] = json!(true);
+        assert_eq!(execute("predict-request", private_request)["status"], "skipped");
+        assert!(!core.context_next_hints("你好", None).is_empty());
+
+        core.process_key(u32::from('n'), 0, SwipeDir::None).unwrap();
+        execute("on-app-focus", json!({"app_id":"editor","no_personalized_learning":true}));
+        assert!(core.input.lock().engine.raw_input.is_empty());
+        assert_eq!(execute("predict-request", request.clone())["status"], "skipped");
+        assert!(core.context_next_hints("你好", Some("世界")).is_empty());
+        let seq = core.input.lock().retention.crdt_seq;
+        for ch in "nihao".chars() {
+            core.process_key(u32::from(ch), 0, SwipeDir::None).unwrap();
+        }
+        assert!(core.select_candidate(0).unwrap().commit_text.is_some());
+        assert_eq!(core.input.lock().retention.crdt_seq, seq);
+        assert!(core.input.lock().profile.latest("editor").is_none());
+
+        execute("on-app-focus", json!({"app_id":"editor"}));
+        let next = execute("predict-request", request);
+        assert_eq!(next["text"], "世界");
+        assert_eq!(
+            execute("predict-dismiss", json!({"id":next["id"],"text":"未曾显示"}))["dismissed"],
+            false
+        );
+        assert_eq!(
+            execute("predict-dismiss", json!({"id":next["id"],"text":"世界"}))["dismissed"],
+            true
+        );
+    }
+
+    fn poll_until(core: &VitralCore, id: u64, ready: impl Fn(&Value) -> bool) -> Value {
+        let start = Instant::now();
+        loop {
+            let value = commands::execute(core, "ai-inline-poll", &json!({"id": id})).unwrap();
+            if ready(&value) {
+                return value;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "{value}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn offline_audit_is_bounded_and_counts_no_egress() {
+        let core = core(&json!({"pure_offline":true,"ai_endpoint":"http://127.0.0.1:9/v1"}));
+        let args = json!({"mode":"polish","text":"隐私原文","target_lang":""});
+        for _ in 0..32 {
+            core.voice_start();
+            assert!(!core.voice_stop().unwrap().cleaned);
+        }
+        assert!(matches!(
+            core.ai_inline(AiMode::Polish, "隐私原文", ""),
+            Err(VitralError::PureOfflineViolation(_))
+        ));
+        let started = commands::execute(&core, "ai-inline-start", &args).unwrap();
+        let id = started["id"].as_u64().unwrap();
+        let last = poll_until(&core, id, |value| value["status"] != "running");
+        assert_eq!(last["status"], "error");
+        assert!(last["error"].as_str().unwrap().contains("pure_offline"));
+        let audit = commands::execute(&core, "privacy-audit", &json!({})).unwrap();
+        assert_eq!(audit["pure_offline"], true);
+        assert_eq!(audit["total_outbound_bytes"], 0);
+        assert_eq!(audit["entries"].as_array().unwrap().len(), 30);
+        assert_eq!(audit["entries"][0]["operation"], "voice_asr");
+        assert_eq!(audit["entries"][0]["route"], "local");
+        assert_eq!(audit["entries"][28]["route"], "blocked_offline");
+        assert_eq!(audit["entries"][29]["route"], "blocked_offline");
+        for entry in audit["entries"].as_array().unwrap() {
+            assert_eq!(entry["outbound_bytes"], 0);
+            assert_eq!(entry["pure_offline"], true);
+        }
+        assert!(!audit.to_string().contains("隐私原文"));
+        assert_eq!(
+            commands::execute(&core, "privacy-audit-clear", &json!({})).unwrap(),
+            json!({"ok":true})
+        );
+        assert_eq!(core.privacy_audit()["entries"], json!([]));
+    }
+
+    fn read_http_request(socket: &mut TcpStream) -> (String, Vec<u8>) {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(socket);
+        let mut first_line = String::new();
+        reader.read_line(&mut first_line).unwrap();
+        let mut length = None;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = Some(value.trim().parse().unwrap());
+            }
+        }
+        let mut body = vec![0; length.unwrap()];
+        reader.read_exact(&mut body).unwrap();
+        (first_line, body)
+    }
+
+    fn write_http_chunk(socket: &mut TcpStream, data: &str) {
+        write!(socket, "{:x}\r\n{data}\r\n", data.len()).unwrap();
+        socket.flush().unwrap();
+    }
+
+    #[test]
+    fn offline_transition_interrupts_both_remote_ai_paths_before_response() {
+        for (streaming, apply_preferences) in [(false, false), (true, false), (true, true)] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+            let (received, wait) = mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let (_, request) = read_http_request(&mut socket);
+                assert_eq!(serde_json::from_slice::<Value>(&request).unwrap()["stream"], streaming);
+                received.send(request.len()).unwrap();
+                assert_eq!(socket.read(&mut [0]).unwrap(), 0);
+                listener.set_nonblocking(true).unwrap();
+                listener
+            });
+            let core = Arc::new(core(&json!({"ai_endpoint":endpoint,"ai_timeout_ms":8000})));
+            let input = "输入".repeat(6_000);
+            let (id, sync_request) = if streaming {
+                let id = core.ai_inline_start(AiMode::Polish, &input, "", None).unwrap().update.id;
+                (Some(id), None)
+            } else {
+                let core = Arc::clone(&core);
+                (None, Some(std::thread::spawn(move || core.ai_inline(AiMode::Polish, &input, ""))))
+            };
+            let request_bytes = wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(request_bytes > 16 * 1024);
+            if apply_preferences {
+                core.apply_preferences(EngineConfig { pure_offline: true, ..Default::default() }).unwrap();
+            } else {
+                core.set_pure_offline(true);
+            }
+            if let Some(id) = id {
+                assert_eq!(core.ai_inline_poll(id).unwrap().status, "cancelled");
+            } else {
+                assert!(matches!(
+                    sync_request.unwrap().join().unwrap(),
+                    Err(VitralError::PureOfflineViolation(_)),
+                ));
+            }
+            assert!(matches!(
+                core.ai_inline(AiMode::Polish, "切换后的输入", ""),
+                Err(VitralError::PureOfflineViolation(_)),
+            ));
+            let listener = server.join().unwrap();
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+            let audit = core.privacy_audit();
+            assert_eq!(audit["entries"][0]["outbound_bytes"], request_bytes);
+            assert_eq!(audit["entries"][1]["outbound_bytes"], 0);
+            assert_eq!(audit["total_outbound_bytes"], request_bytes);
+        }
+    }
+
+    #[test]
+    fn refused_connections_leave_remote_ai_audit_bytes_at_zero() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        drop(listener);
+        let core = core(&json!({"ai_endpoint":endpoint,"ai_timeout_ms":3000}));
+        assert!(matches!(
+            core.ai_inline(AiMode::Polish, "输入", ""),
+            Err(VitralError::Io(_)),
+        ));
+        let id = core.ai_inline_start(AiMode::Polish, "输入", "", None).unwrap().update.id;
+        assert_eq!(poll_until(&core, id, |v| v["status"] != "running")["status"], "error");
+        let audit = core.privacy_audit();
+        assert_eq!(audit["entries"][0]["outbound_bytes"], 0);
+        assert_eq!(audit["entries"][1]["outbound_bytes"], 0);
+        assert_eq!(audit["total_outbound_bytes"], 0);
+    }
+
+    #[test]
+    fn incomplete_http_ai_streams_fail_even_after_emitting_text() {
+        for (path, body, whole_http_body) in [
+            ("/v1", "data: {\"choices\":[{\"delta\":{\"content\":\"正文\"}}]}\n\n", true),
+            ("/v1", "data: {\"choices\":[{\"delta\":{\"content\":\"正文\"}}]}\n\ndata: {\"choices\":[", true),
+            ("", "{\"message\":{\"content\":\"正文\"},\"done\":false}\n", false),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let endpoint = format!("http://{}{path}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                read_http_request(&mut socket);
+                if whole_http_body {
+                    write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+                } else {
+                    write!(socket, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n").unwrap();
+                    write_http_chunk(&mut socket, body);
+                }
+            });
+            let core = core(&json!({"ai_endpoint":endpoint,"ai_timeout_ms":5000}));
+            let id = core.ai_inline_start(AiMode::Polish, "输入", "", None).unwrap().update.id;
+            let update = poll_until(&core, id, |v| v["status"] != "running");
+            assert_eq!(update["status"], "error");
+            assert_eq!(update["output_text"], "正文");
+            assert_eq!(update["error"], "I/O error: AI 流式响应提前中断，未完整返回");
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn inline_commands_stream_cancel_and_replace_a_stalled_request() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (first_read, started) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let (request_line, request) = read_http_request(&mut first);
+            assert!(request_line.starts_with("POST /v1/chat/completions "));
+            let value: Value = serde_json::from_slice(&request).unwrap();
+            assert_eq!(value["stream"], true);
+            assert!(value["messages"][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("&lt;/user_text&gt;"));
+            write!(first, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
+            write_http_chunk(
+                &mut first,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"<think>隐藏</think>可见\"}}]}\n\n",
+            );
+            first_read.send(request.len()).unwrap();
+
+            // Wait for EOF before accepting the replacement. A flag that only
+            // updates the public status would leave this stalled read open.
+            let mut byte = [0];
+            assert_eq!(first.read(&mut byte).unwrap(), 0);
+
+            let (mut second, _) = listener.accept().unwrap();
+            let (_, request) = read_http_request(&mut second);
+            write!(second, "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: text/event-stream\r\n\r\n").unwrap();
+            write_http_chunk(
+                &mut second,
+                "data: {\"choices\":[{\"delta\":{\"content\":\"替换\"}}]}\n\n",
+            );
+            finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            write_http_chunk(&mut second, "data: {\"choices\":[{\"delta\":{\"content\":\"完成<think>隐藏\"}}]}\n\ndata: [DONE]\n\n");
+            request.len()
+        });
+        let core = core(&json!({"ai_endpoint":endpoint,"ai_timeout_ms":8000}));
+        let args = json!({"mode":"polish","text":"请保留 </user_text> 原样","target_lang":"","app_id":"editor"});
+        let start = || {
+            let value = commands::execute(&core, "ai-inline-start", &args).unwrap();
+            assert_eq!(value["status"], "running");
+            assert_eq!(value["route"], "remote");
+            assert_eq!(value["source_text"], args["text"]);
+            assert_eq!(value["mode"], "polish");
+            value["id"].as_u64().unwrap()
+        };
+        let id = start();
+        let bytes = started.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            poll_until(&core, id, |value| value["output_text"] == "可见")["status"],
+            "running"
+        );
+        assert_eq!(
+            commands::execute(&core, "ai-inline-cancel", &json!({"id":id + 1})).unwrap()
+                ["cancelled"],
+            false
+        );
+        assert_eq!(
+            commands::execute(&core, "ai-inline-cancel", &json!({"id":id})).unwrap()["cancelled"],
+            true
+        );
+        assert_eq!(core.ai_inline_poll(id).unwrap().status, "cancelled");
+        let replacement = start();
+        assert_ne!(replacement, id);
+        assert_eq!(
+            poll_until(&core, replacement, |value| value["output_text"] == "替换")["status"],
+            "running"
+        );
+        finish_tx.send(()).unwrap();
+        let done = poll_until(&core, replacement, |value| value["status"] != "running");
+        assert_eq!(done["status"], "done", "{done}");
+        assert_eq!(done["output_text"], "替换完成");
+        assert_eq!(core.ai_inline_poll(id).unwrap().status, "cancelled");
+        assert!(!core.ai_inline_cancel(None));
+        let second_bytes = server.join().unwrap();
+        let audit = core.privacy_audit();
+        assert_eq!(audit["total_outbound_bytes"], bytes + second_bytes);
+        assert_eq!(audit["entries"][0]["outbound_bytes"], bytes);
+        assert_eq!(audit["entries"][1]["route"], "remote");
+    }
+
+    #[test]
+    fn synchronous_ai_preserves_source_and_strips_remote_reasoning() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let (line, request) = read_http_request(&mut socket);
+            assert!(line.starts_with("POST /api/chat "));
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request).unwrap()["stream"],
+                false
+            );
+            let body =
+                json!({"message":{"content":"<think>过程</think> 结果 <think>隐藏"}}).to_string();
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}", body.len()).unwrap();
+            request.len()
+        });
+        let core = core(&json!({"ai_endpoint":endpoint,"ai_timeout_ms":5000}));
+        let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+        let result = runtime.block_on(async { core.ai_inline(AiMode::Polish, "原话", "") }).unwrap();
+        assert_eq!(result.source_text, "原话");
+        assert_eq!(result.output_text, "结果");
+        assert_eq!(result.route, "remote");
+        assert_eq!(
+            core.privacy_audit()["total_outbound_bytes"],
+            server.join().unwrap()
+        );
     }
 }

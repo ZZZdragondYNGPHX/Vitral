@@ -255,6 +255,13 @@ impl HandwritingSession {
     /// Record the confirmed handwriting output into shared `RetentionEngine` Frecency
     /// (idempotent per edit so repeated calls do not double-boost Frecency).
     pub fn confirm_result(&mut self, retention: &mut RetentionEngine) -> Option<String> {
+        self.confirm_result_with_learning(Some(retention))
+    }
+
+    pub(crate) fn confirm_result_with_learning(
+        &mut self,
+        retention: Option<&mut RetentionEngine>,
+    ) -> Option<String> {
         let mode = self.active_mode?;
         let committed = match mode {
             HwMode::PhoneticLookup => self.last_mode1.first().map(|c| c.ch.clone()),
@@ -275,11 +282,13 @@ impl HandwritingSession {
             return None;
         }
         if !self.confirmed_since_edit {
-            retention.record_selection(&committed, 0.0, 0.001, 1.0);
-            if mode == HwMode::ContinuousLattice {
-                for slot in &self.last_slots {
-                    if !slot.ch.is_empty() {
-                        retention.record_selection(&slot.ch, 0.0, 0.001, 0.25);
+            if let Some(retention) = retention {
+                retention.record_selection(&committed, 0.0, 0.001, 1.0);
+                if mode == HwMode::ContinuousLattice {
+                    for slot in &self.last_slots {
+                        if !slot.ch.is_empty() {
+                            retention.record_selection(&slot.ch, 0.0, 0.001, 0.25);
+                        }
                     }
                 }
             }

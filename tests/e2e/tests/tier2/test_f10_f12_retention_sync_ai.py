@@ -513,10 +513,11 @@ def test_f11_clipboard_ring_full_pin_eviction_halt_and_no_live_slot(
     # Includes unfiltered secret-like string (no password filtering allowed)
     secret_payload = "sk-live-secret-unfiltered-token-999"
     payloads = [secret_payload, "pin-item-2", "pin-item-3", "pin-item-4"]
+    codes = ("pa", "pb", "pc", "pd")
     for idx, text in enumerate(payloads):
         res = vitral_target.clipboard_push(text)
         eid = _extract_pushed_id(res, text)
-        vitral_target.clipboard_pin(eid, f"p{idx}")
+        vitral_target.clipboard_pin(eid, codes[idx])
         pinned_ids.append(eid)
 
     # Push 5th unpinned item when all 4 slots are pinned -> ZERO pinned items may be dropped

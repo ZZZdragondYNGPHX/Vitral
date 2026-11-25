@@ -86,7 +86,8 @@ mod tests {
 
     #[test]
     fn single_strokes_keep_digit_and_punctuation_choices() {
-        let cases: &[(&[(f32, f32)], &[char])] = &[
+        type StrokeCase<'a> = (&'a [(f32, f32)], &'a [char]);
+        let cases: &[StrokeCase<'_>] = &[
             (&[(0.5, 0.1), (0.5, 0.9)], &['丨', '1']),
             (&[(0.1, 0.5), (0.9, 0.5)], &['一', '-']),
             (&[(0.5, 0.5)], &['丶', '、', '.']),

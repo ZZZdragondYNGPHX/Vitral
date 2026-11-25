@@ -6,10 +6,10 @@ use crate::{
     ret::RetentionEngine,
 };
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Serialize};
 use std::sync::Arc;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashSet, VecDeque},
     path::PathBuf,
 };
 
@@ -86,6 +86,53 @@ pub fn safe_text(text: &str) -> bool {
 fn short(text: &str, limit: usize) -> String {
     text.trim().chars().take(limit).collect()
 }
+
+fn is_topic_word(word: &str) -> bool {
+    let word = word.trim();
+    word.chars().count() >= 2
+        && word.chars().any(char::is_alphabetic)
+        && !matches!(
+            word.to_ascii_lowercase().as_str(),
+            "the" | "and" | "for" | "with" | "from" | "this" | "that" | "these" | "those"
+                | "are" | "was" | "were" | "have" | "has" | "you" | "your" | "our"
+                | "its" | "but" | "not" | "to" | "of" | "in" | "on" | "is" | "it"
+                | "我们" | "你们" | "他们" | "这个" | "那个" | "这些" | "那些" | "以及"
+                | "因为" | "所以" | "但是" | "如果" | "然后" | "可以" | "就是" | "已经"
+        )
+}
+
+fn split_json_object(text: &str) -> Option<(&str, &str)> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in text[start..].char_indices() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => quoted = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + index + 1;
+                    return Some((&text[start..end], &text[end..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn clean_list(items: &mut Vec<String>, count: usize) {
     *items = items
         .iter()
@@ -327,36 +374,16 @@ impl ProfileEngine {
                 .flat_map(|m| m.iter().map(|(w, s)| (w.clone(), *s))),
         );
         let entities = rank(words, 24);
-        let signal = format!(
-            "{} {}",
-            entities.join(" "),
-            self.recent
-                .iter()
-                .map(|(_, t)| t.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-        .to_lowercase();
-        let domains = [
-            "Rust",
-            "Python",
-            "Android",
-            "Linux",
-            "Windows",
-            "Kotlin",
-            "TypeScript",
-            "React",
-            "Qwen",
-            "Vitral",
-            "机器学习",
-            "设计",
-        ]
-        .iter()
-        .filter(|s| signal.contains(&s.to_lowercase()))
-        .map(|s| s.to_string())
-        .collect();
         let mut app_styles = BTreeMap::new();
+        let mut app_words = BTreeMap::<&str, (usize, f64)>::new();
         for (app, scores) in &ret.app_frecency {
+            for (word, &score) in scores {
+                if score.is_finite() && score > 0.0 {
+                    let (apps, total) = app_words.entry(word).or_default();
+                    *apps += 1;
+                    *total += score;
+                }
+            }
             app_styles.insert(
                 app.clone(),
                 AppProfile {
@@ -366,6 +393,25 @@ impl ProfileEngine {
                 },
             );
         }
+        let domain_words = entities
+            .iter()
+            .enumerate()
+            .map(|(i, word)| (word.clone(), 1.0 / (i + 1) as f64))
+            .chain(ret.pinned_words.iter().map(|word| (word.clone(), 100.0)))
+            .chain(
+                app_words
+                    .into_iter()
+                    .filter(|(_, (apps, _))| *apps >= 2)
+                    .map(|(word, (_, total))| (word.to_owned(), total)),
+            )
+            .filter(|(word, _)| is_topic_word(word))
+            .collect();
+        let mut seen = HashSet::new();
+        let domains = rank(domain_words, usize::MAX)
+            .into_iter()
+            .filter(|word| seen.insert(word.to_ascii_lowercase()))
+            .take(12)
+            .collect();
         for (app, text) in &self.recent {
             let entry = app_styles.entry(app.clone()).or_insert_with(|| AppProfile {
                 tone: "沿用日常表达".into(),
@@ -436,20 +482,41 @@ impl ProfileEngine {
         self.persist()
     }
     fn apply_distilled(&mut self, text: &str) -> Result<(), serde_json::Error> {
-        let value: ProfileUpdate = serde_json::from_str(text.trim())?;
-        // Validation precedes replacement; a malformed output cannot corrupt the baseline.
-        let mut next = self.profile.clone();
-        next.summary = value.summary;
-        next.domains = value.domains;
-        next.entities = value.entities;
-        next.style_traits = value.style_traits;
-        next.normalize();
-        if !next.summary.is_empty() {
+        let stripped = crate::ai::strip_thinking_tags(text);
+        let mut text = stripped.as_str();
+        if let Some(fenced) = text.strip_prefix("```") {
+            let fenced = fenced.strip_suffix("```").unwrap_or(fenced);
+            text = fenced.strip_prefix("json").unwrap_or(fenced).trim();
+        }
+        let mut parse_error = serde_json::Error::custom("画像输出缺少完整的 JSON 对象");
+        let mut rejected_summary = false;
+        while let Some((object, rest)) = split_json_object(text) {
+            text = rest;
+            let value: ProfileUpdate = match serde_json::from_str(object) {
+                Ok(value) => value,
+                Err(error) => {
+                    parse_error = error;
+                    continue;
+                }
+            };
+            let mut next = self.profile.clone();
+            next.summary = value.summary;
+            next.domains = value.domains;
+            next.entities = value.entities;
+            next.style_traits = value.style_traits;
+            next.normalize();
+            if next.summary.is_empty() {
+                rejected_summary = true;
+                continue;
+            }
             next.source = "local_qwen".into();
             self.profile = next;
-        } else {
-            self.last_reason = Some("本地模型未返回安全的画像摘要".into());
+            return Ok(());
         }
+        if !rejected_summary {
+            return Err(parse_error);
+        }
+        self.last_reason = Some("本地模型未返回安全的画像摘要".into());
         Ok(())
     }
 }
@@ -522,6 +589,107 @@ mod tests {
         assert!(p.profile.summary.is_empty());
         assert_eq!(p.profile.accepted_count, 0);
     }
+
+    #[test]
+    fn distilled_profile_accepts_reasoning_and_fences() {
+        let mut p = ProfileEngine::new(None).unwrap();
+        let raw = r#"<think>{"summary":"思考中的示例"}</think>
+```json
+{"summary":"保留引号 \" 与花括号 }","domains":["医学"],"entities":[],"style_traits":[]}
+```
+{"summary":"忽略后续附加内容"}"#;
+        p.apply_distilled(raw).unwrap();
+        assert_eq!(p.profile.summary, "保留引号 \" 与花括号 }");
+        assert_eq!(p.profile.domains, ["医学"]);
+        assert_eq!(p.profile.source, "local_qwen");
+
+        p.apply_distilled(
+            "```\n{\"summary\":\"简短\",\"domains\":[],\"entities\":[],\"style_traits\":[]}\n```",
+        )
+        .unwrap();
+        assert_eq!(
+            split_json_object(r#"前言 {"outer":{"key":"}"}} 后记"#),
+            Some((r#"{"outer":{"key":"}"}}"#, " 后记"))
+        );
+        for invalid in ["<think>{\"summary\":\"不可用\"}</think>", "{\"summary\":"] {
+            assert!(p.apply_distilled(invalid).is_err());
+            assert_eq!(p.profile.summary, "简短");
+        }
+    }
+
+    #[test]
+    fn distilled_profile_skips_objects_that_do_not_match_the_schema() {
+        let mut p = ProfileEngine::new(None).unwrap();
+        let raw = r#"字段示例 {summary}
+{"summary":"仍缺少字段"}
+{"summary":"有效画像","domains":[],"entities":[],"style_traits":[]}
+{"summary":"后续画像","domains":[],"entities":[],"style_traits":[]}"#;
+        p.apply_distilled(raw).unwrap();
+        assert_eq!(p.profile.summary, "有效画像");
+        assert_eq!(p.profile.source, "local_qwen");
+        assert!(p
+            .apply_distilled(r#"字段示例 {summary} {"summary":"仍缺少字段"}"#)
+            .is_err());
+        assert_eq!(p.profile.summary, "有效画像");
+    }
+
+    #[test]
+    fn distilled_profile_skips_objects_without_a_safe_summary() {
+        let mut p = ProfileEngine::new(None).unwrap();
+        let invalid = r#"{"summary":"","domains":[],"entities":[],"style_traits":[]}
+{"summary":"token=foo","domains":[],"entities":[],"style_traits":[]}"#;
+        let valid = r#"{"summary":"有效画像","domains":["医学"],"entities":[],"style_traits":[]}"#;
+        p.apply_distilled(&format!("{invalid}\n{valid}")).unwrap();
+        assert_eq!(p.profile.summary, "有效画像");
+        assert_eq!(p.profile.source, "local_qwen");
+        assert!(p.last_reason.is_none());
+
+        p.apply_distilled(&format!("{invalid}\n{{summary}}")).unwrap();
+        assert_eq!(p.profile.summary, "有效画像");
+        assert_eq!(p.profile.domains, ["医学"]);
+        assert_eq!(
+            p.last_reason.as_deref(),
+            Some("本地模型未返回安全的画像摘要")
+        );
+    }
+
+    #[test]
+    fn statistical_domains_use_personal_pinned_and_cross_app_topics() {
+        let mut p = ProfileEngine::new(None).unwrap();
+        let mut r = RetentionEngine::default();
+        r.pinned_words.insert("肿瘤内科".into());
+        for (word, score) in [
+            ("久期对冲", 80.0),
+            ("kerning", 70.0),
+            ("我们", 200.0),
+            ("THE", 200.0),
+            ("……", 200.0),
+            ("病", 200.0),
+        ] {
+            r.frecency.insert(word.into(), score);
+        }
+        for app in ["notes", "studio"] {
+            r.app_frecency.entry(app.into()).or_default().extend([
+                ("Kerning".into(), 8.0),
+                ("视觉层级".into(), 5.0),
+                ("遗忘主题".into(), 5.0),
+            ]);
+        }
+        r.erased_words.insert("遗忘主题".into());
+        for i in 0..20 {
+            r.frecency.insert(format!("术语{i}"), 1.0);
+        }
+        p.statistical(&r);
+        let domains = &p.profile.domains;
+        assert_eq!(domains.len(), 12);
+        for word in ["肿瘤内科", "久期对冲", "Kerning", "视觉层级"] {
+            assert!(domains.iter().any(|entry| entry == word), "{word}");
+        }
+        for word in ["kerning", "我们", "THE", "……", "病", "遗忘主题"] {
+            assert!(!domains.iter().any(|entry| entry == word), "{word}");
+        }
+    }
+
     #[cfg(feature = "native-onnx")]
     #[test]
     fn failed_local_distillation_keeps_baseline_and_reason() {

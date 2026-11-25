@@ -25,6 +25,15 @@ def discovered_targets() -> DiscoveredTargets:
     return discover_targets()
 
 
+@pytest.fixture(autouse=True)
+def _cleanup_live_vitral_targets() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        for target in list(VitralTarget._live_instances):
+            target.close()
+
+
 @pytest.fixture(scope="function")
 def vitral_target(tmp_path: Path, discovered_targets: DiscoveredTargets) -> Iterator[VitralTarget]:
     target = VitralTarget(targets=discovered_targets, state_dir=tmp_path / "vitral_state")

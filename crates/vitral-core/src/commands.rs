@@ -62,13 +62,17 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "predict-poll" => to_value(core.predict_poll(v.get("id").map(|_| arg(v, "id")).transpose()?))?,
         "predict-cancel" => to_value(core.predict_cancel())?,
         "predict-accept" => json!({"accepted":core.predict_accept(arg(v, "id")?, string(v, "text")?)?}),
-        "predict-dismiss" => json!({"dismissed":core.predict_dismiss(arg(v, "id")?)?}),
+        "predict-dismiss" => json!({"dismissed":core.predict_dismiss_with_text(
+            arg(v, "id")?,
+            v.get("text").filter(|value| !value.is_null()).map(|_| string(v, "text")).transpose()?,
+        )?}),
         "profile-state" => core.profile_state(),
         "profile-distill" => { core.profile_distill()?; core.profile_state() },
         "profile-update" => { core.profile_update(serde_json::from_value(v.clone())?)?; core.profile_state() },
         "profile-clear" => { core.profile_clear()?; core.profile_state() },
         "configure" => {
-            core.apply_preferences(serde_json::from_value(v.clone())?)?;
+            let clear_pw = v.get("clear_koofr_password").and_then(Value::as_bool).unwrap_or(false);
+            core.apply_preferences_clearing_secrets(serde_json::from_value(v.clone())?, clear_pw)?;
             json!({"ok":true,"shortcuts":core.input.lock().engine.config.shortcuts})
         }
         "personalization-stats" => to_value(core.personalization_stats())?,
@@ -98,7 +102,11 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "models-delete" => to_value(core.models_delete(string(v, "id")?)?)?,
         "models-refresh-catalog" => to_value(core.models_refresh_catalog(v.get("url").filter(|v| !v.is_null()).map(|_| string(v, "url")).transpose()?)?)?,
         "reload-assets" => to_value(core.reload_assets()?)?,
-        "on-app-focus" => to_value(core.on_app_focus(string(v, "app_id")?)?)?,
+        "on-app-focus" => to_value(core.on_app_focus_with_learning_flag(
+            string(v, "app_id")?,
+            v.get("no_personalized_learning").map(|_| arg(v, "no_personalized_learning")).transpose()?.unwrap_or(false),
+        )?)?,
+        "reset-commit-context" => { core.reset_commit_context(); json!({"ok":true}) },
         "notify-deleted-chars" => { core.notify_deleted_chars(arg(v, "count")?); json!({"ok":true}) },
         "process-key" => {
             let mut flags = 0;
@@ -167,7 +175,10 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "clipboard-push" | "clipboard-ingest-remote" => {
             let payload: ClipboardPayload = if v["payload"].is_string() {
                 serde_json::from_value(
-                    json!({"content":v["payload"],"source_device":v["source_device"].as_str().unwrap_or("")}),
+                    json!({
+                        "content": v["payload"],
+                        "source_device": v["source_device"].as_str().unwrap_or(""),
+                    }),
                 )?
             } else {
                 arg(v, "payload")?
@@ -226,17 +237,37 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
             core.voice_push_pcm(&samples)?;
             json!({"sample_count":samples.len()})
         }
-        "voice-preview" => to_value(core.voice_preview()?)?,
+        "voice-preview" => {
+            let preview = core.voice_preview()?;
+            json!({
+                "transcript": preview.transcript,
+                "language": preview.language,
+                "duration_ms": preview.duration_ms,
+                "sample_count": preview.sample_count,
+            })
+        }
         "voice-stop" => to_value(core.voice_stop()?)?,
         "llm-unload" => {
             core.unload_idle_models();
             json!({"ok":true})
         }
-        "ai-inline" => to_value(core.ai_inline(
+        "ai-inline" => to_value(core.ai_inline_in_app(
             arg(v, "mode")?,
             string(v, "text")?,
             string(v, "target_lang")?,
+            v.get("app_id").filter(|value| !value.is_null()).map(|_| string(v, "app_id")).transpose()?,
         )?)?,
+        "ai-inline-route" => json!({"route":core.ai_inline_route(), "pure_offline":core.is_pure_offline()}),
+        "ai-inline-start" => to_value(core.ai_inline_start(
+            arg(v, "mode")?,
+            string(v, "text")?,
+            string(v, "target_lang")?,
+            v.get("app_id").filter(|value| !value.is_null()).map(|_| string(v, "app_id")).transpose()?,
+        )?)?,
+        "ai-inline-poll" => to_value(core.ai_inline_poll(arg(v, "id")?)?)?,
+        "ai-inline-cancel" => json!({"cancelled":core.ai_inline_cancel(v.get("id").map(|_| arg(v, "id")).transpose()?.flatten())}),
+        "privacy-audit" => core.privacy_audit(),
+        "privacy-audit-clear" => { core.privacy_audit_clear(); json!({"ok":true}) },
         "restore-from-koofr" => {
             let mut result = to_value(core.restore_from_koofr(&v["config"].to_string())?)?;
             let st = core.input.lock();

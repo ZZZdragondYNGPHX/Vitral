@@ -1,6 +1,6 @@
 use super::SpeechModelCache;
 use crate::eng::gram::RimeGramDb;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use crate::{error::VitralError, onnx_env::get_ort_env};
 use kaldi_fbank::{compute_fbank, FbankOptions, WindowType};
 use ort::{session::Session, value::TensorRef};
@@ -193,49 +193,62 @@ fn hanzi(token:&str)->bool {
 }
 
 type ModelLocation = (PathBuf, Option<PathBuf>);
-static MODEL: SpeechModelCache<ModelLocation, Model> = SpeechModelCache::new();
+static MODEL: OnceLock<SpeechModelCache<ModelLocation, Model>> = OnceLock::new();
 
 pub(super) fn transcribe(
     samples: &[i16],
     dir: Option<&Path>,
     grammar: Option<&Path>,
 ) -> Result<(String, String), VitralError> {
-    let dir=dir.ok_or_else(|| model_error("尚未下载或已禁用离线语音识别模型，请在模型中心下载并启用"))?;
-    let handle = MODEL.model((dir.to_path_buf(), grammar.map(Path::to_path_buf)));
-    let mut model = handle.lock();
-    if model.is_none() {
-        *model = Some(Model::load(dir, grammar)?);
-    }
-    let model = model.as_mut().unwrap();
-    let mut best=model.decode(samples)?;
-    // Low-confidence utterances benefit from a second acoustic view. Speed
-    // perturbation changes speaker/formant scale. Compare normalized token
-    // posteriors so differing frame counts do not bias the selection.
-    if !best.0.is_empty() && best.2 < 0.65 {
-        for ratio in [0.9, 1.1] {
-            let size=(samples.len() as f64 / ratio) as usize;
-            let mut adjusted=Vec::with_capacity(size);
-            for i in 0..size {
-                let at=i as f64*ratio;
-                let j=at as usize;
-                let first=f64::from(samples[j]);
-                let second=f64::from(samples[(j+1).min(samples.len()-1)]);
-                adjusted.push((first+(second-first)*at.fract()).round() as i16);
+    let dir = dir.ok_or_else(|| model_error("尚未下载或已禁用离线语音识别模型，请在模型中心下载并启用"))?;
+    let key = (dir.to_path_buf(), grammar.map(Path::to_path_buf));
+    MODEL.get_or_init(SpeechModelCache::new).with_model(key, |model| {
+        if model.is_none() {
+            #[cfg(feature = "native-onnx")]
+            if super::current_heavy_memory_policy().evict_sensevoice {
+                super::local_engine().try_unload_if_idle();
             }
-            let candidate=model.decode(&adjusted)?;
-            if !candidate.0.is_empty() && candidate.1==best.1 && candidate.2>best.2 {
-                best=candidate;
+            *model = Some(Model::load(dir, grammar)?);
+        }
+        let model = model.as_mut().unwrap();
+        let mut best = model.decode(samples)?;
+        // Low-confidence utterances benefit from a second acoustic view. Speed
+        // perturbation changes speaker/formant scale. Compare normalized token
+        // posteriors so differing frame counts do not bias the selection.
+        if !best.0.is_empty() && best.2 < 0.65 {
+            for ratio in [0.9, 1.1] {
+                let size = (samples.len() as f64 / ratio) as usize;
+                let mut adjusted = Vec::with_capacity(size);
+                for i in 0..size {
+                    let at = i as f64 * ratio;
+                    let j = at as usize;
+                    let first = f64::from(samples[j]);
+                    let second = f64::from(samples[(j + 1).min(samples.len() - 1)]);
+                    adjusted.push((first + (second - first) * at.fract()).round() as i16);
+                }
+                let candidate = model.decode(&adjusted)?;
+                if !candidate.0.is_empty() && candidate.1 == best.1 && candidate.2 > best.2 {
+                    best = candidate;
+                }
             }
         }
+        Ok((best.0, best.1))
+    })
+}
+
+pub(super) fn evict_if_idle() {
+    if let Some(cache) = MODEL.get() {
+        cache.try_unload_if_idle();
     }
-    Ok((best.0,best.1))
 }
 
 pub(super) fn clear_cache() {
-    MODEL.clear();
+    if let Some(cache) = MODEL.get() {
+        cache.clear();
+    }
 }
 
 #[cfg(all(test, target_os = "linux", feature = "native-onnx"))]
 pub(super) fn cache_is_empty() -> bool {
-    MODEL.is_empty()
+    MODEL.get().is_none_or(SpeechModelCache::is_empty)
 }

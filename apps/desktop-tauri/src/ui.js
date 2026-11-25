@@ -19,7 +19,18 @@ const read = input =>
 
 let saved = {};
 let busy = false;
+let saving = false;
+let savePending = false;
+let saveSuccessSeq = 0;
+let mutationEpoch = 0;
+let pollSeq = 0;
+let saveInFlight = null;
+let engineConnected = false;
+let livePureOffline = null;
+let editSeq = 0;
 let dirty = false;
+const dirtyFields = new Set();
+const fieldEditSeq = new Map();
 let firstSettings = true;
 let recordingShortcut = null;
 let clipboardEntries = [];
@@ -41,9 +52,123 @@ function setNotice(text, tone = "idle") {
   $("#save-bar").dataset.tone = text ? tone : "idle";
 }
 
-function markDirty() {
-  dirty = true;
-  setNotice("有未保存的更改", "dirty");
+function readFieldCurrent(field) {
+  if (field === "fuzzy_pinyin_pairs") {
+    return JSON.stringify(
+      all("[data-fuzzy-pair]")
+        .filter(box => box.checked)
+        .map(box => box.dataset.fuzzyPair)
+        .sort()
+    );
+  }
+  if (field === "privacy_apps") {
+    return JSON.stringify(splitTags($("#privacy-apps-input")?.value || ""));
+  }
+  if (field === "shortcuts") {
+    return JSON.stringify(readShortcuts());
+  }
+  const el = $(`main [name="${field}"]`);
+  if (!el) return undefined;
+  if (el.type === "password") return el.value || "";
+  return JSON.stringify(read(el));
+}
+
+function readSavedComparable(settings, field) {
+  if (!settings || typeof settings !== "object") return undefined;
+  if (field === "fuzzy_pinyin_pairs") {
+    return JSON.stringify(
+      (Array.isArray(settings.fuzzy_pinyin_pairs) ? [...settings.fuzzy_pinyin_pairs] : []).sort()
+    );
+  }
+  if (field === "privacy_apps") {
+    return JSON.stringify(Array.isArray(settings.privacy_apps) ? settings.privacy_apps : []);
+  }
+  if (field === "shortcuts") {
+    const list = Array.isArray(settings.shortcuts) ? settings.shortcuts : [];
+    const rows = all("[data-shortcut]");
+    if (rows.length) {
+      return JSON.stringify(
+        rows.map(row => {
+          const found = list.find(r => r.action === row.dataset.shortcut);
+          return {
+            action: row.dataset.shortcut,
+            key: found?.key || "",
+            text: String(found?.text || "").trim().toLowerCase(),
+          };
+        })
+      );
+    }
+    return JSON.stringify(
+      list.map(row => ({
+        action: row.action,
+        key: row.key || "",
+        text: String(row.text || "").trim().toLowerCase(),
+      }))
+    );
+  }
+  const el = $(`main [name="${field}"]`);
+  if (!el) return undefined;
+  if (el.type === "password") return "";
+  if (el.type === "checkbox") {
+    return JSON.stringify(
+      settings[field] != null ? Boolean(settings[field]) : Boolean(el.defaultChecked)
+    );
+  }
+  if (el.type === "range" || field === "frecency_half_life_sec") {
+    const fallback =
+      el.tagName === "SELECT"
+        ? Array.from(el.options || []).find(o => o.defaultSelected)?.value ??
+          el.options?.[0]?.value ??
+          604800
+        : el.defaultValue || 0;
+    return JSON.stringify(
+      settings[field] != null ? Number(settings[field]) : Number(fallback)
+    );
+  }
+  if (el.tagName === "SELECT") {
+    const fallback =
+      Array.from(el.options || []).find(o => o.defaultSelected)?.value ??
+      el.options?.[0]?.value ??
+      "";
+    return JSON.stringify(
+      settings[field] != null ? String(settings[field]) : String(fallback)
+    );
+  }
+  return JSON.stringify(
+    settings[field] != null ? String(settings[field]) : String(el.defaultValue || "")
+  );
+}
+
+function pruneRevertedDirtyFields(settings) {
+  for (const field of [...dirtyFields]) {
+    const cur = readFieldCurrent(field);
+    const persisted = readSavedComparable(settings, field);
+    if (cur !== undefined && persisted !== undefined && cur === persisted) {
+      dirtyFields.delete(field);
+    }
+  }
+  dirty = dirtyFields.size > 0;
+}
+
+function markDirty(...fields) {
+  for (const field of fields) {
+    if (typeof field !== "string" || !field) continue;
+    fieldEditSeq.set(field, (fieldEditSeq.get(field) || 0) + 1);
+    const cur = readFieldCurrent(field);
+    const persisted = readSavedComparable(saved, field);
+    if (!saving && cur !== undefined && persisted !== undefined && cur === persisted) {
+      dirtyFields.delete(field);
+    } else {
+      dirtyFields.add(field);
+    }
+  }
+  dirty = dirtyFields.size > 0;
+  editSeq += 1;
+  if (dirty) {
+    setNotice("有未保存的更改", "dirty");
+  } else if (!saving && !busy) {
+    setNotice("", "idle");
+  }
 }
 
 function formatBytes(bytes) {
@@ -95,6 +220,46 @@ function syncSegmented(name, value) {
   }
 }
 
+function effectiveEngineOffline() {
+  const savedOffline = Boolean(saved.pure_offline);
+  if (!engineConnected) return false;
+  return typeof livePureOffline === "boolean" ? livePureOffline : savedOffline;
+}
+
+function isOnlineBlocked() {
+  const offline = Boolean($("[name=pure_offline]")?.checked);
+  const savedOffline = Boolean(saved.pure_offline);
+  return busy || offline || effectiveEngineOffline() || (savedOffline && !engineConnected);
+}
+
+function syncOfflineUi() {
+  const toggle = $("[name=pure_offline]");
+  if (!toggle) return;
+  const offline = toggle.checked;
+  const savedOffline = Boolean(saved.pure_offline);
+  const effectiveOffline = effectiveEngineOffline();
+  document.body.classList.toggle("is-offline", effectiveOffline);
+  $("#mode-pill").hidden = !effectiveOffline;
+  $("#offline-card").classList.toggle("is-offline", offline);
+  const modelsOffline = $("#models-offline-hint");
+  if (modelsOffline) modelsOffline.hidden = !effectiveOffline;
+  const badge = $("#offline-badge");
+  if (offline !== savedOffline) {
+    badge.textContent = offline ? "待保存 · 将阻断网络" : "待保存 · 将恢复协同";
+    badge.className = "badge is-warn";
+  } else if (savedOffline && !engineConnected) {
+    badge.textContent = "已保存 · 待服务启动生效";
+    badge.className = "badge is-warn";
+  } else {
+    badge.textContent = effectiveOffline ? "网络已阻断" : "协同就绪";
+    badge.className = `badge ${effectiveOffline ? "is-warn" : "is-ok"}`;
+  }
+  const blocked = isOnlineBlocked();
+  all(".online").forEach(el => {
+    el.disabled = blocked;
+  });
+}
+
 function preview() {
   const mode = $("[name=theme]").value;
   const resolved =
@@ -124,43 +289,33 @@ function preview() {
       '<span class="caret"></span>';
   }
 
-  const offline = $("[name=pure_offline]").checked;
-  document.body.classList.toggle("is-offline", offline);
-  $("#mode-pill").hidden = !offline;
-  $("#offline-card").classList.toggle("is-offline", offline);
-  const modelsOffline = $("#models-offline-hint");
-  if (modelsOffline) modelsOffline.hidden = !offline;
-  const badge = $("#offline-badge");
-  badge.textContent = offline ? "网络已阻断" : "协同就绪";
-  badge.className = `badge ${offline ? "is-warn" : "is-ok"}`;
-
-  all(".online").forEach(el => {
-    el.disabled = busy || offline;
-  });
+  syncOfflineUi();
   if (modelsLoaded) renderModels();
 }
 
 function updateEngineStatus(connected) {
+  engineConnected = Boolean(connected);
+  if (!engineConnected) livePureOffline = null;
   const box = $("#engine-status");
   const text = box.querySelector(".status-text");
-  const offline = $("[name=pure_offline]").checked;
+  const effectiveOffline = effectiveEngineOffline();
   if (!invoke) {
     box.dataset.state = "disconnected";
     text.textContent = "界面预览模式";
     return;
   }
-  if (connected) {
-    box.dataset.state = offline ? "offline" : "connected";
-    text.textContent = offline ? "输入服务运行中 · 纯离线" : "输入服务已连接";
+  if (engineConnected) {
+    box.dataset.state = effectiveOffline ? "offline" : "connected";
+    text.textContent = effectiveOffline ? "输入服务运行中 · 纯离线" : "输入服务已连接";
   } else {
     box.dataset.state = "disconnected";
     text.textContent = "尚未检测到活动输入服务";
   }
+  syncOfflineUi();
 }
 
-function apply(settings) {
+function applyFields(settings, skipFields = null) {
   saved = settings;
-  dirty = false;
   clipboardCapacity = Number(settings.clipboard_ring_capacity || 50);
 
   const linuxEnglish = $("[name=linux_english_mode]");
@@ -168,11 +323,21 @@ function apply(settings) {
   $("#linux-language").hidden = linuxEnglish.disabled;
 
   for (const el of all("main [name]")) {
+    if (skipFields?.has(el.name)) continue;
     if (el.type === "password") {
       el.value = "";
     } else if (settings[el.name] != null) {
       if (el.type === "checkbox") el.checked = Boolean(settings[el.name]);
       else el.value = String(settings[el.name]);
+    } else if (el.type === "checkbox") {
+      el.checked = Boolean(el.defaultChecked);
+    } else if (el.tagName === "SELECT") {
+      el.value =
+        Array.from(el.options || []).find(o => o.defaultSelected)?.value ??
+        el.options?.[0]?.value ??
+        "";
+    } else {
+      el.value = String(el.defaultValue || "");
     }
   }
 
@@ -180,23 +345,48 @@ function apply(settings) {
     const present = Boolean(settings[pill.dataset.secret]);
     pill.hidden = !present;
     const input = pill.closest(".row")?.querySelector("input");
-    if (input && present) {
-      input.placeholder = "已保存（留空保持不变）";
+    if (input) {
+      if (input.dataset.defaultPlaceholder === undefined) {
+        input.dataset.defaultPlaceholder = input.placeholder || "";
+      }
+      input.placeholder = present
+        ? "已保存（留空保持不变）"
+        : input.dataset.defaultPlaceholder;
     }
   }
 
   const fuzzyGroup = $("#fuzzy-pairs-group");
   if (fuzzyGroup) {
-    const enabled = Boolean(settings.fuzzy_pinyin);
+    const enabled = skipFields?.has("fuzzy_pinyin")
+      ? Boolean($("#fuzzy-pinyin-toggle")?.checked)
+      : Boolean(settings.fuzzy_pinyin);
     fuzzyGroup.hidden = !enabled;
-    const selected = new Set(Array.isArray(settings.fuzzy_pinyin_pairs) ? settings.fuzzy_pinyin_pairs : []);
-    for (const box of all("[data-fuzzy-pair]")) {
-      box.checked = selected.has(box.dataset.fuzzyPair);
+    if (!skipFields?.has("fuzzy_pinyin_pairs")) {
+      const selected = new Set(Array.isArray(settings.fuzzy_pinyin_pairs) ? settings.fuzzy_pinyin_pairs : []);
+      for (const box of all("[data-fuzzy-pair]")) {
+        box.checked = selected.has(box.dataset.fuzzyPair);
+      }
     }
   }
 
-  renderShortcuts(settings);
+  const privacyAppsInput = $("#privacy-apps-input");
+  if (privacyAppsInput && !skipFields?.has("privacy_apps")) {
+    privacyAppsInput.value = Array.isArray(settings.privacy_apps)
+      ? settings.privacy_apps.join(", ")
+      : "";
+  }
+
+  if (!skipFields?.has("shortcuts") && !recordingShortcut) {
+    renderShortcuts(settings);
+  }
   preview();
+}
+
+function apply(settings) {
+  dirtyFields.clear();
+  fieldEditSeq.clear();
+  dirty = false;
+  applyFields(settings, null);
 
   if (firstSettings) {
     firstSettings = false;
@@ -206,7 +396,25 @@ function apply(settings) {
   }
 }
 
-const api = (command, payload = {}) => invoke("engine", { command, payload });
+function applyCleanFields(settings) {
+  pruneRevertedDirtyFields(settings);
+  applyFields(settings, dirtyFields);
+  dirty = dirtyFields.size > 0;
+}
+
+async function api(command, payload = {}) {
+  try {
+    const res = await invoke("engine", { command, payload });
+    if (command === "is-pure-offline" && typeof res?.pure_offline === "boolean") {
+      livePureOffline = res.pure_offline;
+    }
+    if (!engineConnected) updateEngineStatus(true);
+    return res;
+  } catch (err) {
+    await pollEngineHealth(true);
+    throw err;
+  }
+}
 
 async function run(fn, { silent = false } = {}) {
   if (busy) return;
@@ -215,7 +423,7 @@ async function run(fn, { silent = false } = {}) {
     return;
   }
   busy = true;
-  const buttons = all("main button");
+  const buttons = all("main button").filter(b => b.id !== "save");
   buttons.forEach(b => (b.disabled = true));
   if (!silent) setNotice("处理中…", "busy");
   try {
@@ -250,6 +458,9 @@ function switchTab(tabId) {
   if (tabId === "models") {
     loadModels(true);
   }
+  if (tabId === "tools" && invoke) {
+    loadPrivacyAudit(true);
+  }
 }
 
 all("nav button").forEach(b => (b.onclick = () => switchTab(b.dataset.tab)));
@@ -270,7 +481,7 @@ all(".segmented").forEach(group => {
       if (!select) return;
       select.value = btn.dataset.val;
       preview();
-      markDirty();
+      markDirty(name);
     };
   });
 });
@@ -281,25 +492,25 @@ all("[data-font-preset]").forEach(btn => {
     const range = $("[name=candidate_font_px]");
     range.value = btn.dataset.fontPreset;
     preview();
-    markDirty();
+    markDirty("candidate_font_px");
   };
 });
 
 all("main [name]").forEach(el => {
   el.oninput = () => {
     preview();
-    markDirty();
+    markDirty(el.name);
   };
   el.onchange = () => {
     preview();
-    markDirty();
+    markDirty(el.name);
   };
 });
 
 matchMedia("(prefers-color-scheme: dark)").addEventListener("change", preview);
 
 all("[data-fuzzy-pair]").forEach(box => {
-  box.onchange = () => markDirty();
+  box.onchange = () => markDirty("fuzzy_pinyin_pairs");
 });
 const fuzzyMaster = $("#fuzzy-pinyin-toggle");
 if (fuzzyMaster) {
@@ -316,25 +527,100 @@ async function saveAll() {
     setNotice(conflicts[0], "error");
     return;
   }
-  await run(async () => {
-    const patch = {};
-    for (const el of all("main [name]")) {
-      if (!el.disabled && (el.type !== "password" || el.value)) {
-        patch[el.name] = read(el);
-      }
+  if (!invoke) {
+    setNotice("请在 Vitral 桌面应用中执行此操作", "error");
+    return;
+  }
+  if (saving) {
+    savePending = true;
+    return saveInFlight;
+  }
+  pruneRevertedDirtyFields(saved);
+  if (dirtyFields.size === 0) {
+    if (!busy) setNotice("当前没有未保存的更改", "idle");
+    return;
+  }
+  saving = true;
+  mutationEpoch += 1;
+  const saveBtn = $("#save");
+  const saveLabel = saveBtn ? saveBtn.textContent : "";
+  if (saveBtn) saveBtn.textContent = "保存中…";
+  setNotice("保存中…", "busy");
+  saveInFlight = (async () => {
+    try {
+      do {
+        savePending = false;
+        pruneRevertedDirtyFields(saved);
+        const fieldsToSave = new Set(dirtyFields);
+        if (fieldsToSave.size === 0) {
+          if (!busy) setNotice("设置已保存", "ok");
+          break;
+        }
+        const seqSnapshot = new Map();
+        for (const f of fieldsToSave) {
+          seqSnapshot.set(f, fieldEditSeq.get(f) || 0);
+        }
+        try {
+          const patch = {};
+          for (const el of all("main [name]")) {
+            if (fieldsToSave.has(el.name) && !el.disabled && (el.type !== "password" || el.value)) {
+              patch[el.name] = read(el);
+            }
+          }
+          if (fieldsToSave.has("fuzzy_pinyin_pairs")) {
+            patch.fuzzy_pinyin_pairs = all("[data-fuzzy-pair]")
+              .filter(box => box.checked)
+              .map(box => box.dataset.fuzzyPair);
+          }
+          const privacyAppsInput = $("#privacy-apps-input");
+          if (fieldsToSave.has("privacy_apps") && privacyAppsInput) {
+            patch.privacy_apps = splitTags(privacyAppsInput.value);
+          }
+          if (fieldsToSave.has("shortcuts")) {
+            patch.shortcuts = readShortcuts();
+          }
+          const reply = await invoke("save_settings", { patch });
+          mutationEpoch += 1;
+          saveSuccessSeq += 1;
+          for (const [f, seq] of seqSnapshot) {
+            if ((fieldEditSeq.get(f) || 0) === seq) {
+              dirtyFields.delete(f);
+            }
+          }
+          pruneRevertedDirtyFields(reply.settings);
+          dirty = dirtyFields.size > 0;
+          saved = reply.settings;
+          livePureOffline = reply.active ? Boolean(reply.settings.pure_offline) : null;
+          updateEngineStatus(Boolean(reply.active));
+          if (!savePending) {
+            if (dirty) {
+              applyCleanFields(reply.settings);
+              updateEngineStatus(Boolean(reply.active));
+              setNotice("上次保存已完成，检测到新改动尚未保存", "dirty");
+            } else {
+              apply(reply.settings);
+              updateEngineStatus(Boolean(reply.active));
+              setNotice(
+                reply.active ? "设置已保存并实时应用" : "设置已保存，下次启用 Vitral 时生效",
+                "ok"
+              );
+            }
+          }
+        } catch (e) {
+          mutationEpoch += 1;
+          pruneRevertedDirtyFields(saved);
+          if (!savePending) setNotice(String(e), "error");
+        }
+      } while (savePending);
+    } finally {
+      saving = false;
+      saveInFlight = null;
+      pruneRevertedDirtyFields(saved);
+      if (saveBtn) saveBtn.textContent = saveLabel || "保存设置";
+      preview();
     }
-    patch.fuzzy_pinyin_pairs = all("[data-fuzzy-pair]")
-      .filter(box => box.checked)
-      .map(box => box.dataset.fuzzyPair);
-    patch.shortcuts = readShortcuts();
-    const reply = await invoke("save_settings", { patch });
-    apply(reply.settings);
-    updateEngineStatus(Boolean(reply.active));
-    setNotice(
-      reply.active ? "设置已保存并实时应用" : "设置已保存，下次启用 Vitral 时生效",
-      "ok"
-    );
-  });
+  })();
+  return saveInFlight;
 }
 
 $("#save").onclick = saveAll;
@@ -723,10 +1009,40 @@ all("[data-action]").forEach(b => {
     }
 
     run(async () => {
+      const seqBeforeRestore = editSeq;
+      const wasDirtyBeforeRestore = dirty;
+      const tokenBeforeRestore =
+        cmd === "restore-from-koofr"
+          ? (await invoke("get_settings"))._settings_token
+          : undefined;
       const data = await api(cmd, cmd === "restore-from-koofr" ? { config: {} } : {});
+      let keptUnsavedChanges = false;
+      let skippedPreferences = false;
       if (cmd === "restore-from-koofr" && data.preferences) {
-        const reply = await invoke("save_settings", { patch: data.preferences });
-        apply(reply.settings);
+        if (saveInFlight) await saveInFlight;
+        mutationEpoch += 1;
+        const reply = await invoke("save_settings", {
+          patch: data.preferences,
+          expectedToken: tokenBeforeRestore,
+        });
+        mutationEpoch += 1;
+        saved = reply.settings;
+        livePureOffline = reply.active ? Boolean(reply.settings.pure_offline) : null;
+        updateEngineStatus(Boolean(reply.active));
+        if (reply.stale) {
+          skippedPreferences = true;
+          applyCleanFields(reply.settings);
+          updateEngineStatus(Boolean(reply.active));
+          keptUnsavedChanges = dirty;
+        } else if (dirty || editSeq !== seqBeforeRestore || wasDirtyBeforeRestore) {
+          applyCleanFields(reply.settings);
+          updateEngineStatus(Boolean(reply.active));
+          dirty = dirtyFields.size > 0;
+          keptUnsavedChanges = dirty;
+        } else {
+          apply(reply.settings);
+          updateEngineStatus(Boolean(reply.active));
+        }
       }
       if (data.ring) {
         clipboardLoaded = true;
@@ -789,7 +1105,21 @@ all("[data-action]").forEach(b => {
         } catch {}
         setNotice("已完成与 Koofr 云端同步", "ok");
       } else if (cmd === "restore-from-koofr") {
-        setNotice(`已从云端恢复 ${data.snapshots_applied} 项数据`, "ok");
+        if (skippedPreferences && keptUnsavedChanges) {
+          setNotice(
+            `已恢复 ${data.snapshots_applied} 项数据；因恢复期间保存过新设置，云端偏好设置已跳过，且表单仍有未保存更改`,
+            "dirty"
+          );
+        } else if (skippedPreferences) {
+          setNotice(
+            `已恢复 ${data.snapshots_applied} 项数据；因恢复期间保存过新设置，云端偏好设置已跳过`,
+            "dirty"
+          );
+        } else if (keptUnsavedChanges) {
+          setNotice(`已从云端恢复 ${data.snapshots_applied} 项数据，当前表单仍有未保存的更改`, "dirty");
+        } else {
+          setNotice(`已从云端恢复 ${data.snapshots_applied} 项数据`, "ok");
+        }
       } else if (cmd === "clipboard-clear-unpinned") {
         setNotice("已清空未置顶剪贴板记录", "ok");
       } else if (cmd === "relay-discover") {
@@ -874,11 +1204,214 @@ window.__TAURI__?.event.listen("tauri://drag-drop", e => {
 
 // ================= VOICE & AI WORKBENCH =================
 const sourceInput = $("#source");
+const restoreRawSourceBtn = $("#restore-raw-source");
+const undoApplySourceBtn = $("#undo-apply-source");
+const cancelAiStreamBtn = $("#cancel-ai-stream");
+const toggleDiffBtn = $("#toggle-diff-result");
+const resultRouteBadge = $("#result-route-badge");
+const resultDiffBox = $("#result-diff");
+let lastVoiceCleaned = "";
+let lastVoiceRaw = "";
+let showingVoiceRaw = false;
+let lastAppliedPrevSource = "";
+let lastAiSourceText = "";
+let lastAiOutputText = "";
+let diffVisible = false;
+let activeWorkbenchAiId = 0;
+
 const updateCount = () => {
   $("#source-count").textContent = `${sourceInput.value.length} 字`;
 };
-sourceInput.addEventListener("input", updateCount);
+function syncWorkbenchActions() {
+  const canToggleRaw = Boolean(lastVoiceRaw && lastVoiceCleaned && lastVoiceRaw !== lastVoiceCleaned);
+  if (restoreRawSourceBtn) {
+    restoreRawSourceBtn.hidden = !canToggleRaw;
+    restoreRawSourceBtn.textContent = showingVoiceRaw ? "切回规整" : "还原原话";
+  }
+  if (undoApplySourceBtn) {
+    undoApplySourceBtn.hidden = !lastAppliedPrevSource;
+  }
+}
+sourceInput.addEventListener("input", () => {
+  if (sourceInput.value !== lastVoiceCleaned && sourceInput.value !== lastVoiceRaw) {
+    lastVoiceCleaned = "";
+    lastVoiceRaw = "";
+    showingVoiceRaw = false;
+  }
+  updateCount();
+  syncWorkbenchActions();
+});
 updateCount();
+syncWorkbenchActions();
+
+$("#privacy-apps-input")?.addEventListener("input", () => markDirty("privacy_apps"));
+
+function tokenizeForDiff(text) {
+  return String(text || "").match(/[A-Za-z0-9_]+|\s+|[\u3400-\u9fff]|./gu) || [];
+}
+
+function renderDiffView(before, after) {
+  if (!resultDiffBox) return;
+  resultDiffBox.replaceChildren();
+  const a = tokenizeForDiff(before);
+  const b = tokenizeForDiff(after);
+  if (a.length > 260 || b.length > 260) {
+    const del = document.createElement("span");
+    del.className = "diff-del";
+    del.textContent = before;
+    const sep = document.createTextNode("\n→\n");
+    const ins = document.createElement("span");
+    ins.className = "diff-ins";
+    ins.textContent = after;
+    resultDiffBox.append(del, sep, ins);
+    return;
+  }
+  const m = a.length;
+  const n = b.length;
+  const dp = Array.from({ length: m + 1 }, () => new Uint16Array(n + 1));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const ops = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) {
+      ops.push(["eq", a[i++]]);
+      j++;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      ops.push(["del", a[i++]]);
+    } else {
+      ops.push(["ins", b[j++]]);
+    }
+  }
+  while (i < m) ops.push(["del", a[i++]]);
+  while (j < n) ops.push(["ins", b[j++]]);
+  for (const [kind, chunk] of ops) {
+    const last = resultDiffBox.lastChild;
+    if (kind === "eq") {
+      if (last && last.nodeType === Node.TEXT_NODE) last.textContent += chunk;
+      else resultDiffBox.append(document.createTextNode(chunk));
+    } else {
+      const cls = kind === "del" ? "diff-del" : "diff-ins";
+      if (last && last.nodeType === Node.ELEMENT_NODE && last.className === cls) {
+        last.textContent += chunk;
+      } else {
+        const span = document.createElement("span");
+        span.className = cls;
+        span.textContent = chunk;
+        resultDiffBox.append(span);
+      }
+    }
+  }
+}
+
+function updateRouteBadge(route) {
+  if (!resultRouteBadge) return;
+  if (!route) {
+    resultRouteBadge.hidden = true;
+    return;
+  }
+  resultRouteBadge.hidden = false;
+  if (route === "local") {
+    resultRouteBadge.textContent = "本机离线";
+    resultRouteBadge.className = "badge is-ok";
+  } else {
+    resultRouteBadge.textContent = "远端 API";
+    resultRouteBadge.className = "badge is-warn";
+  }
+}
+
+const AUDIT_OP_LABELS = {
+  voice_asr: "离线语音转写",
+  ai_translate: "AI 翻译",
+  ai_polish: "AI 润色",
+  ai_summary: "AI 摘要",
+  predict_llm: "本地预测推理",
+  profile_distill: "画像蒸馏",
+};
+
+function renderPrivacyAudit(data) {
+  const badge = $("#privacy-audit-badge");
+  const list = $("#privacy-audit-list");
+  const empty = $("#privacy-audit-empty");
+  if (!badge || !list || !empty || !data) return;
+  const outbound = Number(data.total_outbound_bytes) || 0;
+  badge.textContent = data.pure_offline
+    ? `纯离线 · 外发 ${formatBytes(outbound)}`
+    : `累计外发 ${formatBytes(outbound)}`;
+  badge.className = `badge ${outbound === 0 ? "is-ok" : "is-warn"}`;
+
+  const entries = Array.isArray(data.entries) ? data.entries : [];
+  list.replaceChildren();
+  empty.hidden = entries.length > 0;
+  for (const item of [...entries].reverse()) {
+    const li = document.createElement("li");
+    const left = document.createElement("span");
+    const op = AUDIT_OP_LABELS[item.operation] || item.operation;
+    const routeText =
+      item.route === "local"
+        ? "本机离线"
+        : item.route === "blocked_offline"
+          ? "纯离线拦截"
+          : "远端 API";
+    left.textContent = `${formatTime(item.timestamp_ms)} · ${op} · ${routeText}`;
+    const right = document.createElement("strong");
+    right.textContent = `外发 ${formatBytes(item.outbound_bytes)}`;
+    if ((Number(item.outbound_bytes) || 0) > 0) {
+      right.style.color = "var(--warning)";
+    }
+    li.append(left, right);
+    list.append(li);
+  }
+}
+
+async function loadPrivacyAudit(silent = true) {
+  if (!invoke) return;
+  try {
+    const data = await api("privacy-audit");
+    renderPrivacyAudit(data);
+    if (!silent) setNotice("已刷新本地隐私活动审计", "ok");
+  } catch (e) {
+    if (!silent) setNotice(String(e), "error");
+  }
+}
+
+$("#btn-audit-refresh")?.addEventListener("click", () => loadPrivacyAudit(false));
+$("#btn-audit-clear")?.addEventListener("click", () =>
+  run(async () => {
+    await api("privacy-audit-clear");
+    await loadPrivacyAudit(true);
+    setNotice("已清空本地隐私审计记录", "ok");
+  })
+);
+
+cancelAiStreamBtn?.addEventListener("click", () => {
+  const id = activeWorkbenchAiId;
+  if (!id || !invoke) return;
+  cancelAiStreamBtn.disabled = true;
+  api("ai-inline-cancel", { id })
+    .then(res => {
+      if (!res?.cancelled && activeWorkbenchAiId === id) {
+        cancelAiStreamBtn.disabled = false;
+      }
+    })
+    .catch(err => {
+      if (activeWorkbenchAiId === id) cancelAiStreamBtn.disabled = false;
+      setNotice(`停止生成失败：${err}`, "error");
+    });
+});
+
+toggleDiffBtn?.addEventListener("click", () => {
+  diffVisible = !diffVisible;
+  if (diffVisible) {
+    renderDiffView(lastAiSourceText, lastAiOutputText);
+  }
+  resultDiffBox.hidden = !diffVisible;
+  toggleDiffBtn.textContent = diffVisible ? "隐藏对比" : "对比改动";
+});
 
 const AI_LABELS = { translate: "翻译结果", polish: "润色结果", summary: "提炼摘要" };
 all("[data-ai]").forEach(b => {
@@ -891,15 +1424,68 @@ all("[data-ai]").forEach(b => {
     }
     run(async () => {
       const mode = b.dataset.ai;
-      const r = await api("ai-inline", {
+      diffVisible = false;
+      lastAiSourceText = text;
+      lastAiOutputText = "";
+      let receivedStreamText = false;
+      if (resultDiffBox) resultDiffBox.hidden = true;
+      if (toggleDiffBtn) {
+        toggleDiffBtn.hidden = true;
+        toggleDiffBtn.textContent = "对比改动";
+      }
+      $("#result-title").textContent = AI_LABELS[mode] || "处理结果";
+      $("#result").textContent = "";
+      $("#result-card").hidden = true;
+      const started = await api("ai-inline-start", {
         mode,
         text,
         target_lang: $("#target-lang").value,
       });
-      $("#result-title").textContent = AI_LABELS[mode] || "处理结果";
-      $("#result").textContent = r.output_text;
-      $("#result-card").hidden = false;
-      setNotice("处理完成", "ok");
+      activeWorkbenchAiId = Number(started.id) || 0;
+      updateRouteBadge(started.route);
+      if (cancelAiStreamBtn && activeWorkbenchAiId > 0) {
+        cancelAiStreamBtn.hidden = false;
+        cancelAiStreamBtn.disabled = false;
+      }
+      let current = started;
+      try {
+        while (current.status === "running" && activeWorkbenchAiId > 0) {
+          if (current.output_text) {
+            receivedStreamText = true;
+            $("#result-card").hidden = false;
+            $("#result").textContent = current.output_text;
+          }
+          await new Promise(resolve => setTimeout(resolve, 80));
+          current = await api("ai-inline-poll", { id: activeWorkbenchAiId });
+          if (current.route) updateRouteBadge(current.route);
+        }
+      } finally {
+        activeWorkbenchAiId = 0;
+        if (cancelAiStreamBtn) cancelAiStreamBtn.hidden = true;
+      }
+      loadPrivacyAudit(true);
+      if (current.status === "cancelled") {
+        if (!receivedStreamText) {
+          $("#result").textContent = "";
+          $("#result-card").hidden = true;
+        }
+        setNotice("已停止生成", "idle");
+        return;
+      }
+      if (current.status === "error") {
+        if (!receivedStreamText) {
+          $("#result").textContent = "";
+          $("#result-card").hidden = true;
+        }
+        throw new Error(current.error || "AI 处理失败");
+      }
+      lastAiOutputText = current.output_text || "";
+      $("#result").textContent = lastAiOutputText;
+      $("#result-card").hidden = !lastAiOutputText;
+      if (toggleDiffBtn && lastAiOutputText && lastAiOutputText !== lastAiSourceText) {
+        toggleDiffBtn.hidden = false;
+      }
+      setNotice(current.route === "local" ? "本机离线处理完成" : "远端 AI 处理完成", "ok");
     });
   };
 });
@@ -917,10 +1503,28 @@ $("#copy-result").onclick = async () => {
 $("#apply-result").onclick = () => {
   const txt = $("#result").textContent;
   if (!txt) return;
+  lastAppliedPrevSource = sourceInput.value;
   sourceInput.value = txt;
   updateCount();
-  setNotice("已替换至原文输入框", "ok");
+  syncWorkbenchActions();
+  setNotice("已替换至原文输入框（可点击「撤销替换」还原）", "ok");
 };
+undoApplySourceBtn?.addEventListener("click", () => {
+  if (!lastAppliedPrevSource) return;
+  sourceInput.value = lastAppliedPrevSource;
+  lastAppliedPrevSource = "";
+  updateCount();
+  syncWorkbenchActions();
+  setNotice("已撤销替换并恢复原文", "ok");
+});
+restoreRawSourceBtn?.addEventListener("click", () => {
+  if (!lastVoiceRaw || !lastVoiceCleaned) return;
+  showingVoiceRaw = !showingVoiceRaw;
+  sourceInput.value = showingVoiceRaw ? lastVoiceRaw : lastVoiceCleaned;
+  updateCount();
+  syncWorkbenchActions();
+  setNotice(showingVoiceRaw ? "已切回原始听写文本" : "已恢复轻度规整文本", "ok");
+});
 
 function startTimer() {
   recordStartedAt = Date.now();
@@ -946,10 +1550,27 @@ $("#record").onclick = () =>
       stopTimer();
       $("#record").textContent = "开始录音";
       const r = await invoke("stop_recording");
-      sourceInput.value = r.transcript || "";
+      const text = r.transcript || "";
+      lastVoiceCleaned = text;
+      lastVoiceRaw = r.cleaned ? (r.raw_transcript || "") : "";
+      showingVoiceRaw = false;
+      sourceInput.value = text;
       updateCount();
-      setNotice(r.transcript ? "本机 SenseVoice 转写完成" : "未识别到有效语音", "ok");
+      syncWorkbenchActions();
+      loadPrivacyAudit(true);
+      const activeVoice = (modelsState?.models || []).find(m => m.capability === "voice" && m.active);
+      const voiceName = activeVoice?.name || "本机离线语音";
+      setNotice(
+        text
+          ? (r.cleaned ? `${voiceName} 转写并完成轻度规整（可一键还原原话）` : `${voiceName} 转写完成`)
+          : "未识别到有效语音",
+        "ok"
+      );
     } else {
+      lastVoiceCleaned = "";
+      lastVoiceRaw = "";
+      showingVoiceRaw = false;
+      syncWorkbenchActions();
       await invoke("start_recording");
       recorderActive = true;
       startTimer();
@@ -1056,7 +1677,7 @@ function renderShortcuts(settings) {
     clearBtn.onclick = () => {
       key.value = "";
       checkShortcutConflicts();
-      markDirty();
+      markDirty("shortcuts");
     };
 
     group.append(key, recordBtn, clearBtn);
@@ -1078,7 +1699,7 @@ function renderShortcuts(settings) {
     text.setAttribute("aria-label", `${action.label}输入码`);
     text.oninput = () => {
       checkShortcutConflicts();
-      markDirty();
+      markDirty("shortcuts");
     };
     textField.append(textTitle, text);
 
@@ -1098,7 +1719,7 @@ $("#reset-shortcuts").onclick = () => {
     { action: "handwriting", key: "", text: "" },
   ];
   renderShortcuts({ ...saved, shortcuts: defaults });
-  markDirty();
+  markDirty("shortcuts");
 };
 
 function readShortcuts() {
@@ -1118,7 +1739,7 @@ function finishShortcut(key) {
   if (key !== null) {
     capture.key.value = key;
     checkShortcutConflicts();
-    markDirty();
+    markDirty("shortcuts");
   } else {
     setNotice(dirty ? "有未保存的更改" : "已取消录制", dirty ? "dirty" : "idle");
   }
@@ -1278,7 +1899,7 @@ function renderModels() {
     storeSub.textContent = `存储目录：${modelsState.store_root} · 下载完成或切换开关后自动热加载生效`;
   }
 
-  const offline = $("[name=pure_offline]").checked;
+  const onlineBlocked = isOnlineBlocked();
   const models = modelsState.models || [];
   list.replaceChildren();
   empty.hidden = models.length > 0;
@@ -1603,7 +2224,7 @@ function renderModels() {
       const dlBtn = document.createElement("button");
       dlBtn.type = "button";
       dlBtn.className = "online btn-accent-soft";
-      dlBtn.disabled = busy || offline;
+      dlBtn.disabled = onlineBlocked;
       dlBtn.textContent =
         dl?.status === "failed"
           ? "重试下载"
@@ -1784,17 +2405,70 @@ $("#btn-profile-clear")?.addEventListener("click", () =>
 );
 
 // ================= BOOT =================
+function settingsComparable(s) {
+  if (!s || typeof s !== "object") return "";
+  const copy = { ...s };
+  delete copy._settings_token;
+  delete copy._settings_version;
+  delete copy.launch_page;
+  return JSON.stringify(copy);
+}
+
+function settingsRev(s) {
+  if (!s || typeof s._settings_token !== "string") return -1;
+  const rev = Number(s._settings_token.split(":")[0]);
+  return Number.isFinite(rev) ? rev : -1;
+}
+
+async function pollEngineHealth(force = false) {
+  if (!invoke || (!force && document.hidden)) return;
+  const epochAtStart = mutationEpoch;
+  const myPollSeq = ++pollSeq;
+  try {
+    const status = await invoke("probe_engine");
+    if (myPollSeq !== pollSeq || epochAtStart !== mutationEpoch || saving) return;
+    livePureOffline =
+      typeof status.live_pure_offline === "boolean" ? status.live_pure_offline : null;
+    if (!busy && status.settings) {
+      const incomingRev = settingsRev(status.settings);
+      const currentRev = settingsRev(saved);
+      if (incomingRev < 0 || currentRev < 0 || incomingRev >= currentRev) {
+        const changed = settingsComparable(saved) !== settingsComparable(status.settings);
+        if (!dirty && changed) {
+          apply(status.settings);
+        } else if (changed) {
+          applyCleanFields(status.settings);
+        } else {
+          saved = status.settings;
+        }
+      }
+    }
+    updateEngineStatus(Boolean(status.connected));
+  } catch {
+    if (myPollSeq !== pollSeq || epochAtStart !== mutationEpoch || saving) return;
+    livePureOffline = null;
+    updateEngineStatus(false);
+  }
+}
+
 if (invoke) {
+  setInterval(() => pollEngineHealth(false), 3000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) pollEngineHealth(false);
+  });
+  window.addEventListener("focus", () => pollEngineHealth(false));
   invoke("get_settings")
     .then(settings => {
       apply(settings);
-      api("personalization-stats")
-        .then(stats => {
-          updateEngineStatus(true);
-          renderHabitStats(stats);
-          api("profile-state").then(renderProfile).catch(() => {});
-        })
-        .catch(() => updateEngineStatus(false));
+      pollEngineHealth(true).then(() => {
+        if (!engineConnected) return;
+        api("personalization-stats")
+          .then(stats => {
+            renderHabitStats(stats);
+            api("profile-state").then(renderProfile).catch(() => {});
+          })
+          .catch(() => {});
+      });
     })
     .catch(e => {
       setNotice(String(e), "error");

@@ -365,7 +365,7 @@ impl PipeConnection {
     }
 }
 
-fn connect_to_host(host: &Path, deadline: Instant) -> Result<PipeConnection> {
+fn connect_to_host(host: Option<&Path>, deadline: Instant) -> Result<PipeConnection> {
     let mut launched = false;
     let mut connect_deadline = deadline.min(Instant::now() + Duration::from_millis(1500));
     loop {
@@ -375,11 +375,11 @@ fn connect_to_host(host: &Path, deadline: Instant) -> Result<PipeConnection> {
         match connect() {
             Ok(file) => return Ok(PipeConnection::new(file)?),
             Err(e)
-                if e.kind() == io::ErrorKind::NotFound
+                if (host.is_some() && e.kind() == io::ErrorKind::NotFound)
                     || e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
             {
                 if !launched && e.kind() == io::ErrorKind::NotFound {
-                    std::process::Command::new(host).arg("--engine").spawn()?;
+                    std::process::Command::new(host.unwrap()).arg("--engine").spawn()?;
                     launched = true;
                     connect_deadline = deadline.min(Instant::now() + Duration::from_secs(5));
                 }
@@ -443,6 +443,19 @@ impl PipeClient {
         args: &Value,
         timeout: Duration,
     ) -> Result<Value> {
+        self.request_with_connector(editor, cmd, args, timeout, |deadline| {
+            connect_to_host(Some(host), deadline)
+        })
+    }
+
+    fn request_with_connector(
+        &mut self,
+        editor: &str,
+        cmd: &str,
+        args: &Value,
+        timeout: Duration,
+        mut connect: impl FnMut(Instant) -> Result<PipeConnection>,
+    ) -> Result<Value> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid pipe timeout"))?;
@@ -456,7 +469,7 @@ impl PipeClient {
             return Err("message exceeds 32 MiB".into());
         }
         frame[..4].copy_from_slice(&(len as u32).to_le_bytes());
-        self.exchange(&mut frame, deadline, || connect_to_host(host, deadline))
+        self.exchange(&mut frame, deadline, || connect(deadline))
     }
 
     fn exchange(
@@ -517,6 +530,22 @@ pub fn request_with_timeout(
     })
 }
 
+/// Query an existing engine without starting one when its pipe is absent.
+pub fn probe(cmd: &str, args: &Value) -> Result<Value> {
+    probe_with_timeout("", cmd, args, Duration::from_millis(1500))
+}
+
+pub fn probe_with_timeout(
+    editor: &str,
+    cmd: &str,
+    args: &Value,
+    timeout: Duration,
+) -> Result<Value> {
+    PipeClient::default().request_with_connector(editor, cmd, args, timeout, |deadline| {
+        connect_to_host(None, deadline)
+    })
+}
+
 pub fn serve() -> Result<()> {
     let mut pipe = instance(true)?;
     let path = settings_path()?;
@@ -525,6 +554,19 @@ pub fn serve() -> Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => json!({}),
         Err(e) => return Err(e.into()),
     };
+    if !config.is_object() {
+        return Err("settings must be a JSON object".into());
+    }
+    if let Some(fields) = config.as_object_mut() {
+        fields.retain(|_, v| !v.is_null());
+        if let Some(devices) = fields.get_mut("known_devices").and_then(Value::as_array_mut) {
+            for device in devices {
+                if let Some(dev_fields) = device.as_object_mut() {
+                    dev_fields.retain(|_, v| !v.is_null());
+                }
+            }
+        }
+    }
     let data =
         PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or("LOCALAPPDATA")?).join("Vitral");
     fs::create_dir_all(&data)?;
@@ -550,6 +592,9 @@ pub fn serve() -> Result<()> {
         .join("assets"));
     config["background_sync"] = json!(true);
     config["platform"] = json!("windows");
+    if config.get("frecency_half_life_sec").is_none_or(Value::is_null) {
+        config["frecency_half_life_sec"] = json!(crate::DEFAULT_FRECENCY_HALF_LIFE_SEC);
+    }
     let core = Arc::new(VitralCore::init(&config.to_string())?);
     crate::windows_clipboard::start(core.clone());
     let poll = core.clone();
@@ -616,18 +661,22 @@ mod tests {
 
     #[test]
     fn expired_deadline_does_not_connect_or_launch_the_engine() {
-        let error = request_with_timeout(
-            Path::new("unused"),
-            "",
-            "profile-state",
-            &json!({}),
-            Duration::ZERO,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<io::Error>().unwrap().kind(),
-            io::ErrorKind::TimedOut
-        );
+        for error in [
+            request_with_timeout(
+                Path::new("unused"),
+                "",
+                "profile-state",
+                &json!({}),
+                Duration::ZERO,
+            )
+            .unwrap_err(),
+            probe_with_timeout("", "profile-state", &json!({}), Duration::ZERO).unwrap_err(),
+        ] {
+            assert_eq!(
+                error.downcast_ref::<io::Error>().unwrap().kind(),
+                io::ErrorKind::TimedOut
+            );
+        }
     }
 
     fn test_pipe(label: &str) -> (File, PipeConnection) {

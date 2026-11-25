@@ -9,7 +9,6 @@ use vitral_core::eng::{
 };
 use vitral_core::imp::{ImportedLexiconIndex, LexiconFormat, compile_and_index};
 use vitral_core::ret::{RetentionEngine, UserPhrase};
-use vitral_core::sync::LexiconSnapshotPayload;
 
 use SchemaKind::{DoublePinyinFlypy, RimeIce};
 
@@ -385,58 +384,6 @@ const POLLUTION: &[(&str, &str, &str)] = &[
     ("womashangjiudao", "womauhjqdc", "我马上就到"),
 ];
 
-struct ClipboardCase {
-    copied: &'static str,
-    word: &'static str,
-    reading: &'static str,
-    codes: [&'static str; 2],
-}
-
-const CLIPBOARD: &[ClipboardCase] = &[
-    ClipboardCase {
-        copied: "今天讨论了云璃输入法架构",
-        word: "云璃",
-        reading: "yun li",
-        codes: ["yunli", "yyli"],
-    },
-    ClipboardCase {
-        copied: "今天开会讨论澜枢系统架构",
-        word: "澜枢",
-        reading: "lan shu",
-        codes: ["lanshu", "ljuu"],
-    },
-    ClipboardCase {
-        copied: "栖岚技术方案需要讨论系统架构",
-        word: "栖岚",
-        reading: "qi lan",
-        codes: ["qilan", "qilj"],
-    },
-    ClipboardCase {
-        copied: "系统架构开会讨论星槿",
-        word: "星槿",
-        reading: "xing jin",
-        codes: ["xingjin", "xkjb"],
-    },
-    ClipboardCase {
-        copied: "今天开会讨论曜柠项目管理",
-        word: "曜柠",
-        reading: "yao ning",
-        codes: ["yaoning", "ycnk"],
-    },
-    ClipboardCase {
-        copied: "今天开会讨论椿珂技术设计",
-        word: "椿珂",
-        reading: "chun ke",
-        codes: ["chunke", "iyke"],
-    },
-    ClipboardCase {
-        copied: "今天开会讨论安璃输入法架构",
-        word: "安璃",
-        reading: "an li",
-        codes: ["an'li", "anli"],
-    },
-];
-
 fn paired_queries(keyboard: &mut Keyboard, cases: &[(&str, &str, &str)]) -> Hits {
     let mut hits = Hits::default();
     for &(quanpin, xiaohe, word) in cases {
@@ -531,60 +478,6 @@ fn pollution(keyboard: &mut Keyboard, scratch: &Path) -> Hits {
     hits
 }
 
-fn clipboard_core(assets: &Path, scratch: &Path) -> VitralCore {
-    let config = EngineConfig {
-        assets_dir: assets.display().to_string(),
-        data_dir: scratch.display().to_string(),
-        pure_offline: true,
-        prediction_enabled: false,
-        profile_distill_enabled: false,
-        // Full-pinyin segmentation and Xiaohe's fuzzy-input switch select the portable path.
-        syllable_split: true,
-        fuzzy_pinyin: true,
-        ..EngineConfig::default()
-    };
-    VitralCore::init(&serde_json::to_string(&config).unwrap()).unwrap()
-}
-
-fn copy_text(core: &VitralCore, text: &str) {
-    core.clipboard_push(ClipboardPayload {
-        id: None,
-        content: text.into(),
-        mime_type: "text/plain".into(),
-        source_device: "quality-test".into(),
-        timestamp_ms: 0,
-    });
-}
-
-fn clipboard(assets: &Path, scratch: &Path) -> Hits {
-    let core = clipboard_core(assets, scratch);
-    let mut hits = Hits::default();
-    for (index, case) in CLIPBOARD.iter().enumerate() {
-        copy_text(&core, case.copied);
-        assert_eq!(
-            core.personalization_stats().phrase_count,
-            index + 1,
-            "{}",
-            case.copied
-        );
-        let bytes = fs::read(scratch.join("lexicon-state.json")).unwrap();
-        let snapshot: LexiconSnapshotPayload = serde_json::from_slice(&bytes).unwrap();
-        let phrase = &snapshot.retention.user_phrases[case.word];
-        assert_eq!(phrase.source, "clipboard");
-        assert_eq!(phrase.quanpin, case.reading);
-        assert_eq!(phrase.xiaohe, case.codes[1]);
-        for (schema, code) in SCHEMAS.into_iter().zip(case.codes) {
-            core.process_key(27, 0, SwipeDir::None).unwrap();
-            core.set_schema(schema);
-            let candidates = type_code(code, |key| {
-                core.process_key(key, 0, SwipeDir::None).unwrap()
-            });
-            record(&mut hits, schema, code, case.word, None, &candidates);
-        }
-    }
-    hits
-}
-
 fn required_assets() -> PathBuf {
     let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets");
     for file in [
@@ -609,59 +502,44 @@ fn required_assets() -> PathBuf {
 }
 
 #[test]
-fn clipboard_learns_the_ninth_oov_when_the_first_eight_are_already_learned() {
+fn copying_text_keeps_typing_candidates_unchanged() {
     let assets = required_assets();
     let scratch = Scratch::new();
-    let core = clipboard_core(&assets, &scratch.0);
-    let known: Vec<_> = CLIPBOARD
-        .iter()
-        .map(|case| (case.copied, case.word))
-        .chain([("今天开会讨论槿璃系统架构", "槿璃")])
-        .collect();
-    for &(sentence, _) in &known {
-        copy_text(&core, sentence);
-    }
-    let snapshot_path = scratch.0.join("lexicon-state.json");
-    let before: LexiconSnapshotPayload =
-        serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
-    assert_eq!(before.retention.user_phrases.len(), 8);
-    for &(_, word) in &known {
-        assert!(
-            before.retention.user_phrases.contains_key(word),
-            "missing {word}"
-        );
-    }
+    let config = EngineConfig {
+        assets_dir: assets.display().to_string(),
+        data_dir: scratch.0.display().to_string(),
+        pure_offline: true,
+        // Select the portable decoder for both schemas.
+        syllable_split: true,
+        fuzzy_pinyin: true,
+        ..EngineConfig::default()
+    };
+    let core = VitralCore::init(&serde_json::to_string(&config).unwrap()).unwrap();
+    let candidates = |schema, code| {
+        core.process_key(27, 0, SwipeDir::None).unwrap();
+        core.set_schema(schema);
+        type_code(code, |key| core.process_key(key, 0, SwipeDir::None).unwrap())
+            .into_iter()
+            .map(|item| (item.text, item.comment))
+            .collect::<Vec<_>>()
+    };
+    let baseline = [candidates(RimeIce, "yunli"), candidates(DoublePinyinFlypy, "yyli")];
 
-    let text = known
-        .iter()
-        .map(|&(sentence, _)| sentence)
-        .chain(["今天开会讨论曜枢系统架构"])
-        .collect::<Vec<_>>()
-        .join("。");
-    copy_text(&core, &text);
-    let after: LexiconSnapshotPayload =
-        serde_json::from_slice(&fs::read(snapshot_path).unwrap()).unwrap();
-    assert_eq!(after.retention.user_phrases.len(), 9);
-    let phrase = &after.retention.user_phrases["曜枢"];
-    assert_eq!(phrase.source, "clipboard");
-    assert_eq!(phrase.quanpin, "yao shu");
-}
-
-#[test]
-fn clipboard_treats_imported_hotwords_as_known_in_long_text() {
-    let assets = required_assets();
-    let scratch = Scratch::new();
-    let core = clipboard_core(&assets, &scratch.0);
-    let hotwords = scratch.0.join("clipboard-hotwords.tsv");
-    fs::write(&hotwords, "澜枢\tlan shu\t1000\n").unwrap();
-    let report = core.import_lexicon(&hotwords, LexiconFormat::Tsv).unwrap();
-    assert_eq!(report.imported_count, 1);
-
-    copy_text(&core, "今天开会讨论澜枢系统架构。今天讨论了云璃输入法架构");
-    let bytes = fs::read(scratch.0.join("lexicon-state.json")).unwrap();
-    let snapshot: LexiconSnapshotPayload = serde_json::from_slice(&bytes).unwrap();
-    assert!(!snapshot.retention.user_phrases.contains_key("澜枢"));
-    assert_eq!(snapshot.retention.user_phrases["云璃"].source, "clipboard");
+    let content = "今天讨论了云璃输入法架构。OpenAI";
+    let state = core.clipboard_push(ClipboardPayload {
+        id: None,
+        content: content.into(),
+        mime_type: "text/plain".into(),
+        source_device: "quality-test".into(),
+        timestamp_ms: 0,
+    });
+    assert_eq!(state.ring[0].content, content);
+    assert_eq!(core.personalization_stats().phrase_count, 0);
+    assert_eq!(core.personalization_stats().english_count, 0);
+    assert_eq!(
+        [candidates(RimeIce, "yunli"), candidates(DoublePinyinFlypy, "yyli")],
+        baseline
+    );
 }
 
 #[test]
@@ -709,7 +587,6 @@ fn offline_candidate_quality() {
         }
     }
     let pollution = pollution(&mut keyboard, &scratch.0);
-    let clipboard = clipboard(&assets, &scratch.0);
     let mut total = Hits::default();
     for (name, hits, top1, top5) in [
         ("long sentences and chat", chat, 90, 98),
@@ -728,7 +605,6 @@ fn offline_candidate_quality() {
             100,
             100,
         ),
-        ("clipboard OOV", clipboard, 100, 100),
     ] {
         hits.check(
             name,

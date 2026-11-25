@@ -359,8 +359,8 @@ def test_f15_android_schema_4row_flypy_vs_5row_quanpin(
     kt_text = _android_tokens_kt_path(discovered_targets).read_text(encoding="utf-8")
     assert "flypyRows: Int = 4" in kt_text
     assert 'flypyBottomRightSublabel: String = "xiaohe-final"' in kt_text
-    assert "quanpinRows: Int = 5" in kt_text
-    assert "quanpinDedicatedTopNumberRow: Boolean = true" in kt_text
+    assert "quanpinRows: Int = 4" in kt_text
+    assert "quanpinDedicatedTopNumberRow: Boolean = false" in kt_text
 
     android_src = discovered_targets.vitral_root / "apps" / "android" / "app" / "src"
     app_files, app_text = _read_non_generated_sources(android_src, (".kt", ".java"), exclude_names={"VitralTokens.kt"})

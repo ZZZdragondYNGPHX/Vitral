@@ -45,13 +45,20 @@ const MAX_FILTER_LEN: usize = 12;
 const DEV_APPS: &[&str] = &[
     "alacritty", "kitty", "wezterm", "wezterm-gui", "foot", "konsole",
     "terminal", "gnome-terminal", "gnome-terminal-server", "xfce4-terminal", "tilix",
-    "xterm", "urxvt", "windowsterminal", "wt", "cmd", "powershell", "pwsh",
+    "xterm", "urxvt", "windowsterminal", "wt", "cmd", "powershell", "pwsh", "termux",
     "mintty", "nvim", "vim", "gvim", "tmux", "code", "code-insiders", "code - insiders",
 ];
 const IDE_APPS: &[&str] = &[
     "codium", "cursor", "zed", "idea", "pycharm", "clion", "goland", "webstorm",
     "rider", "rustrover", "android studio", "android-studio", "studio64", "devenv", "sublime_text",
     "neovide", "emacs",
+];
+const SENSITIVE_APPS: &[&str] = &[
+    "1password", "onepassword", "keepass", "keepassx", "keepassxc", "bitwarden", "enpass", "polkit",
+    "polkit-gnome-authentication-agent-1", "polkit-kde-authentication-agent-1",
+    "gnome-keyring", "gnome-keyring-daemon", "kwallet", "kwalletd", "kwalletd5", "kwalletd6",
+    "kwalletmanager", "kwalletmanager5", "kwalletmanager6",
+    "tor browser", "tor-browser", "incognito", "private browsing",
 ];
 
 fn app_matches(app_id: &str, builtins: &[&str], custom: &[String]) -> bool {
@@ -63,6 +70,23 @@ fn app_matches(app_id: &str, builtins: &[&str], custom: &[String]) -> bool {
     })) || custom.iter().any(|rule| {
         let rule = rule.trim().to_lowercase();
         !rule.is_empty() && lower.contains(&rule)
+    })
+}
+
+pub(crate) fn is_dev_app(app_id: &str) -> bool {
+    app_matches(app_id, DEV_APPS, &[]) || app_matches(app_id, IDE_APPS, &[])
+}
+
+pub fn is_privacy_app(app_id: &str, custom: &[String]) -> bool {
+    if app_matches(app_id.trim(), SENSITIVE_APPS, custom) {
+        return true;
+    }
+    let lower = app_id.to_lowercase();
+    ["incognito", "private browsing"].iter().any(|label| {
+        lower.match_indices(label).any(|(start, _)| {
+            !lower[..start].ends_with(char::is_alphanumeric)
+                && !lower[start + label.len()..].starts_with(char::is_alphanumeric)
+        })
     })
 }
 
@@ -172,10 +196,16 @@ pub(super) enum TypoCorrectionLevel {
 pub struct EngineConfig {
     #[serde(default = "default_enabled")]
     pub prediction_enabled: bool,
+    #[serde(default = "default_enabled")]
+    pub prediction_skip_dev_apps: bool,
     #[serde(default = "default_prediction_delay")]
     pub prediction_delay_ms: u64,
     #[serde(default = "default_enabled")]
     pub profile_distill_enabled: bool,
+    #[serde(default = "default_voice_cleanup_mode")]
+    pub voice_cleanup_mode: String,
+    #[serde(default)]
+    pub privacy_apps: Vec<String>,
     #[serde(default = "crate::shortcuts::defaults")]
     pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
     #[serde(default = "default_enabled")]
@@ -192,8 +222,6 @@ pub struct EngineConfig {
     pub typo_correction_level: String,
     #[serde(default)]
     pub syllable_split: bool,
-    #[serde(default = "default_enabled")]
-    pub learn_from_clipboard: bool,
     #[serde(default = "default_enabled")]
     pub auto_english_for_dev_apps: bool,
     #[serde(default)]
@@ -267,6 +295,15 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    pub(crate) fn validate_voice_cleanup_mode(&self) -> Result<(), VitralError> {
+        if !matches!(self.voice_cleanup_mode.as_str(), "off" | "light" | "polish") {
+            return Err(VitralError::InvalidArgument(
+                "voice_cleanup_mode must be off, light or polish".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn validated_typo_correction_level(&self) -> Result<TypoCorrectionLevel, VitralError> {
         match self.typo_correction_level.as_str() {
             "off" => Ok(TypoCorrectionLevel::Off),
@@ -314,6 +351,7 @@ impl EngineConfig {
         let config: Self = serde_json::from_value(value).map_err(|e| VitralError::Parse(e.to_string()))?;
         if let Some(url) = config.model_catalog_url.as_deref().filter(|s| !s.is_empty()) { crate::models::validate_url(url)?; }
         config.validate_prediction()?;
+        config.validate_voice_cleanup_mode()?;
         config.validated_typo_correction_level()?;
         config.validate_quote_style()?;
         config.validated_fuzzy_pairs()?;
@@ -356,6 +394,10 @@ impl std::fmt::Debug for EngineConfig {
 
 fn default_prediction_delay() -> u64 { 380 }
 
+fn default_voice_cleanup_mode() -> String {
+    "light".into()
+}
+
 fn default_typo_correction_level() -> String {
     "standard".into()
 }
@@ -389,8 +431,11 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             prediction_enabled: true,
+            prediction_skip_dev_apps: default_enabled(),
             prediction_delay_ms: default_prediction_delay(),
             profile_distill_enabled: true,
+            voice_cleanup_mode: default_voice_cleanup_mode(),
+            privacy_apps: Vec::new(),
             shortcuts: crate::shortcuts::defaults(),
             linux_english_mode: true,
             adaptive_learning: true,
@@ -399,7 +444,6 @@ impl Default for EngineConfig {
             undo_commit_on_backspace: true,
             typo_correction_level: default_typo_correction_level(),
             syllable_split: false,
-            learn_from_clipboard: true,
             auto_english_for_dev_apps: true,
             default_english_apps: Vec::new(),
             disable_paired_punct_in_ide: true,
@@ -476,6 +520,10 @@ pub struct PageInfo {
     pub has_next: bool,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputAction {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,6 +532,8 @@ pub struct InputAction {
     pub schema: String,
     pub preedit: PreeditState,
     pub commit_text: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) clipboard_commit: bool,
     #[serde(default)]
     pub undo_commit_chars: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -621,6 +671,7 @@ pub struct EngineState {
     pub opencc_mode: OpenCcMode,
     pub lang_mode: LangMode,
     pub active_app_id: Option<String>,
+    pub(crate) active_app_no_learning: bool,
     pub last_committed_word: Option<String>,
     pub last_committed_code: Option<String>,
     pub last_committed_ms: u64,
@@ -730,6 +781,7 @@ impl EngineState {
             config,
             lang_mode: LangMode::Zh,
             active_app_id: None,
+            active_app_no_learning: false,
             last_committed_word: None,
             last_committed_code: None,
             last_committed_ms: 0,
@@ -889,6 +941,10 @@ impl EngineState {
     ) {
         self.undo_commit = None;
         self.settle_undo_regret(Some(canonical), retention);
+        if self.is_active_privacy_app() {
+            self.reset_commit_context();
+            return;
+        }
         let fully_deleted =
             self.last_committed_word.as_ref().is_some_and(|w| {
                 self.regret_backspaces == w.chars().count() && self.regret_backspaces > 0
@@ -1274,7 +1330,7 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) {
-        if canonical.is_empty() || !canonical.chars().all(crate::ret::is_cjk) {
+        if self.is_active_privacy_app() || canonical.is_empty() || !canonical.chars().all(crate::ret::is_cjk) {
             self.clear_pending_phrase();
             return;
         }
@@ -1380,17 +1436,36 @@ impl EngineState {
         }
     }
 
+    pub(crate) fn is_active_privacy_app(&self) -> bool {
+        self.active_app_no_learning
+            || self.active_app_id.as_deref().is_some_and(|app| is_privacy_app(app, &self.config.privacy_apps))
+    }
+
     pub fn on_app_focus(&mut self, app_id: &str) -> Result<AppFocusState, VitralError> {
+        self.on_app_focus_with_learning_flag(app_id, false)
+    }
+
+    pub(crate) fn on_app_focus_with_learning_flag(
+        &mut self,
+        app_id: &str,
+        no_personalized_learning: bool,
+    ) -> Result<AppFocusState, VitralError> {
         if app_id.trim().is_empty() {
             return Err(VitralError::InvalidArgument("app_id cannot be empty".into()));
         }
-        if self.active_app_id.as_deref() != Some(app_id) {
+        let was_private = self.is_active_privacy_app();
+        let app_changed = self.active_app_id.as_deref() != Some(app_id);
+        self.active_app_id = Some(app_id.to_string());
+        self.active_app_no_learning = no_personalized_learning;
+        let private = self.is_active_privacy_app();
+        let privacy_changed = was_private != private || (private && app_changed);
+        if app_changed || privacy_changed {
             self.reset_commit_context();
             self.last_committed_char = None;
             self.pending_undo_regret = None;
+            self.clear_pending_phrase();
         }
         let prev_lang = self.lang_mode;
-        self.active_app_id = Some(app_id.to_string());
         let remembered = self.app_lang_memory.contains_key(app_id);
         let lang_mode = *self.app_lang_memory.entry(app_id.to_string()).or_insert_with(|| {
             let builtins = if self.config.auto_english_for_dev_apps { DEV_APPS } else { &[] };
@@ -1401,7 +1476,7 @@ impl EngineState {
             }
         });
         self.lang_mode = lang_mode;
-        if prev_lang != lang_mode || lang_mode == LangMode::En {
+        if privacy_changed || prev_lang != lang_mode || lang_mode == LangMode::En {
             self.clear_composition_state();
         }
         Ok(AppFocusState {
@@ -1449,7 +1524,7 @@ impl EngineState {
             return Ok(());
         }
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        if self.schema == SchemaKind::RimeIce {
+        if self.schema == SchemaKind::RimeIce && !self.is_active_privacy_app() {
             if let Some(assets) = self
                 .resolved_assets_dir
                 .clone()
@@ -1521,10 +1596,10 @@ impl EngineState {
         { self.rime_session_id = None; rime_ffi::clear_runtime(); }
 
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        if let Some(root) = self.resolved_assets_dir.clone() {
-            if root.join("rime").is_dir() {
-                let _ = self.ensure_rime_session(&root)?;
-            }
+        if let Some(root) = self.resolved_assets_dir.clone().filter(|root| {
+            !self.is_active_privacy_app() && root.join("rime").is_dir()
+        }) {
+            let _ = self.ensure_rime_session(&root)?;
         }
 
         Ok(ReloadReport {
@@ -1642,7 +1717,7 @@ impl EngineState {
             self.notify_deleted_chars(1);
         }
         if keycode == 0x0d {
-            if self.config.adaptive_learning {
+            if self.config.adaptive_learning && !self.is_active_privacy_app() {
                 retention.record_english_casing(&self.raw_input);
             }
             self.reset_commit_context();
@@ -1739,7 +1814,7 @@ impl EngineState {
         }
 
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        {
+        if !self.is_active_privacy_app() {
             if let Some(assets_dir) = self.resolved_assets_dir.clone() {
                 if !hint.is_empty() && self.rime_input_start.is_some() {
                     self.clear_native_composition();
@@ -1858,7 +1933,7 @@ impl EngineState {
 
     pub(crate) fn settle_undo_regret(&mut self, selected: Option<&str>, retention: &mut RetentionEngine) {
         if let Some(regret) = self.pending_undo_regret.take() {
-            if selected != Some(regret.word.as_str()) {
+            if selected != Some(regret.word.as_str()) && !self.is_active_privacy_app() {
                 retention.penalize_selection(
                     &regret.code,
                     &regret.word,
@@ -1879,7 +1954,7 @@ impl EngineState {
         retention: &mut RetentionEngine,
     ) -> Result<InputAction, VitralError> {
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        if undo.native {
+        if undo.native && !self.is_active_privacy_app() {
             if let (Some(sid), Some(assets)) = (self.rime_session_id, &self.resolved_assets_dir) {
                 let snapshot = rime_ffi::with_runtime(
                     assets, &self.config.cache_dir, &self.config.data_dir, |rt| {
@@ -2176,25 +2251,31 @@ impl EngineState {
                 };
                 if let Some(pair) = pair {
                     let disable_pair = self.active_app_id.as_deref().is_some_and(|app| {
-                        let builtins = if self.config.disable_paired_punct_in_ide { IDE_APPS } else { &[] };
-                        app_matches(app, builtins, &self.config.disable_paired_punct_apps)
-                            || (self.config.disable_paired_punct_in_ide && app_matches(app, DEV_APPS, &[]))
+                        app_matches(app, &[], &self.config.disable_paired_punct_apps)
+                            || (self.config.disable_paired_punct_in_ide && is_dev_app(app))
                     });
                     let prefix = if !self.raw_input.is_empty() {
                         self.current_candidates.first().map(|c| c.text.clone())
                     } else {
                         None
                     };
-                    let allow_micro_space = prefix.is_none() || !self.is_clipboard_shortcut_candidate(0);
-                    self.settle_undo_regret(None, retention);
+                    let clipboard_commit = prefix.is_some() && self.is_clipboard_shortcut_candidate(0);
+                    if clipboard_commit {
+                        self.pending_undo_regret = None;
+                    } else {
+                        self.settle_undo_regret(None, retention);
+                    }
                     self.clear_composition_state();
                     let mut committed = prefix.unwrap_or_default();
                     if disable_pair {
                         committed.extend(pair.chars().take(1));
-                        return Ok(Some(self.commit_action(Some(committed), allow_micro_space)));
+                        let mut act = self.commit_action(Some(committed), !clipboard_commit);
+                        act.clipboard_commit = clipboard_commit;
+                        return Ok(Some(act));
                     }
                     committed.push_str(pair);
-                    let mut act = self.commit_action(Some(committed), allow_micro_space);
+                    let mut act = self.commit_action(Some(committed), !clipboard_commit);
+                    act.clipboard_commit = clipboard_commit;
                     act.paired_punctuation = Some(pair.to_string());
                     act.cursor_delta = -1;
                     return Ok(Some(act));
@@ -3030,7 +3111,7 @@ impl EngineState {
                     );
                 }
             } else if let Some(punctuation) = map_zh_punctuation(ch) {
-                let allow_micro_space = self.raw_input.is_empty() || !self.is_clipboard_shortcut_candidate(0);
+                let clipboard_commit = !self.raw_input.is_empty() && self.is_clipboard_shortcut_candidate(0);
                 let mut text = if self.raw_input.is_empty() {
                     String::new()
                 } else if !self.candidate_origins.is_empty() {
@@ -3042,7 +3123,9 @@ impl EngineState {
                 };
                 self.clear_composition_state();
                 text.push_str(punctuation);
-                return Ok(self.commit_action(Some(text), allow_micro_space));
+                let mut act = self.commit_action(Some(text), !clipboard_commit);
+                act.clipboard_commit = clipboard_commit;
+                return Ok(act);
             } else if !ch.is_control() && self.raw_input.is_empty() {
                 let text = ch.to_string();
                 return Ok(self.empty_action(Some(text)));
@@ -3855,7 +3938,6 @@ impl EngineState {
             let mut learned: Vec<_> = phrases
                 .into_iter()
                 .map(|p| {
-                    let clipboard = p.source == "clipboard";
                     let decay = if p.updated_ms == 0 {
                         1.0
                     } else {
@@ -3864,9 +3946,8 @@ impl EngineState {
                     };
                     (
                         p.word.as_str(),
-                        if clipboard { "剪贴板" } else { "习惯" },
-                        self.contextual_score(retention, &p.word, now_ms)
-                            + if clipboard { 0.35 * decay } else { 1.0 * decay },
+                        "习惯",
+                        self.contextual_score(retention, &p.word, now_ms) + decay,
                     )
                 })
                 .collect();
@@ -4180,7 +4261,8 @@ impl EngineState {
         imported: &ImportedLexiconIndex,
         retention: &mut RetentionEngine,
     ) -> Result<InputAction, VitralError> {
-        let allow_micro_space = !self.is_passthrough_active() && !self.is_clipboard_shortcut_candidate(index);
+        let clipboard_commit = self.is_clipboard_shortcut_candidate(index);
+        let allow_micro_space = !self.is_passthrough_active() && !clipboard_commit;
         let eligible = allow_micro_space && self.component_code().is_none() && !self.raw_input.is_empty()
             && self.raw_input.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'\'')
             && self.current_candidates.get(index).is_some_and(|item| {
@@ -4196,7 +4278,8 @@ impl EngineState {
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         let native = self.rime_input_start.is_some();
         let committed = self.select_candidate_on_backend(index, clipboard, imported, retention)?;
-        let action = self.commit_action(committed, allow_micro_space);
+        let mut action = self.commit_action(committed, allow_micro_space);
+        action.clipboard_commit = clipboard_commit;
         if eligible && self.last_committed_code.as_ref().is_some_and(|code| !code.is_empty()) {
             self.undo_commit = action.commit_text.clone().map(|text| UndoCommit {
                 text,
@@ -4244,7 +4327,11 @@ impl EngineState {
                     let code = self.base_code().to_owned();
                     self.track_phrase_selection(&canonical, &code, true, imported, retention);
                 } else {
-                    self.settle_undo_regret(Some(&canonical), retention);
+                    if self.is_clipboard_shortcut_candidate(index) {
+                        self.pending_undo_regret = None;
+                    } else {
+                        self.settle_undo_regret(Some(&canonical), retention);
+                    }
                     self.reset_commit_context();
                 }
                 self.clear_composition_state();
@@ -4256,6 +4343,10 @@ impl EngineState {
                 canonical,
                 ..
             } => {
+                if self.is_active_privacy_app() {
+                    self.clear_composition_state();
+                    return Ok(None);
+                }
                 let (Some(sid), Some(assets_dir)) =
                     (self.rime_session_id, &self.resolved_assets_dir)
                 else {
@@ -4456,6 +4547,7 @@ impl EngineState {
                 retroactive_slots: Vec::new(),
             },
             commit_text,
+            clipboard_commit: false,
             undo_commit_chars: 0,
             undo_commit_text: None,
             candidates: page_items,
@@ -5454,62 +5546,6 @@ mod personalization_tests {
         let habitual = run(&mut e, &imp, &mut r);
         assert_eq!(habitual[0].text, "你好");
         assert!(habitual.iter().any(|c| c.text == "妮好"));
-    }
-
-    #[test]
-    fn clipboard_learned_import_keeps_its_weight_in_both_paths() {
-        let (mut e, clip, mut imp, mut r) = fixture();
-        let high = "妮好";
-        let low = "你号";
-        let high_weight = 100_000;
-        imp.inject_hotwords(&[(low, 700), (high, high_weight)].map(|(word, weight)| {
-            crate::imp::ImportedLexiconEntry {
-                text: word.into(),
-                pinyin: "ni hao".into(),
-                toned_pinyin: "nǐ hǎo".into(),
-                xiaohe: "nihc".into(),
-                weight,
-            }
-        }));
-        r.harvest_clipboard_text(high, |_| ("ni hao".into(), "nihc".into()));
-        assert_eq!(r.user_phrases[high].source, "clipboard");
-        e.set_raw_input("nihao".into());
-        let high_score = e.contextual_score(&r, high, RetentionEngine::now_epoch_ms())
-            + 0.35
-            + 2.0
-            + f64::from(high_weight).ln();
-        let assert_ranking = |candidates: &[CandidateItem]| {
-            assert_eq!(candidates[0].text, high, "{candidates:?}");
-            assert_eq!(candidates[0].comment, "剪贴板");
-            assert!((candidates[0].frecency_score - high_score).abs() < 0.001);
-            assert_eq!(candidates.iter().filter(|c| c.text == high).count(), 1);
-            assert!(candidates.iter().any(|c| c.text == low));
-        };
-        let portable = e.process_key_pure_rust(0, &clip, &imp, &mut r).unwrap();
-        assert_ranking(&portable.candidates);
-
-        #[cfg(all(target_os = "linux", feature = "native-rime"))]
-        {
-            let snapshot = rime_ffi::RimeSnapshot {
-                commit_text: None,
-                preedit: "nihao".into(),
-                cursor_utf8: 5,
-                raw_input: "nihao".into(),
-                raw_cursor: 5,
-                page_index: 0,
-                page_size: 5,
-                has_prev: false,
-                has_next: false,
-                candidates: ["你好", high]
-                    .map(|word| rime_ffi::RimeRawCandidate {
-                        text: word.into(),
-                        comment: String::new(),
-                    })
-                    .to_vec(),
-            };
-            let native = e.apply_rime_snapshot(snapshot, false, false, &clip, &imp, &r);
-            assert_ranking(&native.candidates);
-        }
     }
 
     #[test]
@@ -7072,6 +7108,42 @@ mod personalization_tests {
 
     #[cfg(all(target_os = "linux", feature = "native-rime"))]
     #[test]
+    fn privacy_focus_clears_native_composition_and_resumes_rime_on_exit() {
+        let (mut e, clip, imp, mut retention) = fixture();
+        e.resolved_assets_dir = resolve_assets_dir("");
+        e.set_schema(SchemaKind::RimeIce);
+        e.on_app_focus("editor").unwrap();
+        type_code(&mut e, "ni", &clip, &imp, &mut retention);
+        assert!(e.rime_input_start.is_some());
+
+        for app in ["org.keepassxc.KeePassXC", "editor"] {
+            let before = retention.crdt_seq;
+            e.on_app_focus_with_learning_flag(app, app == "editor").unwrap();
+            assert!(e.is_active_privacy_app());
+            assert!(e.rime_input_start.is_none());
+            assert!(e.raw_input.is_empty());
+            assert!(e.current_candidates.is_empty());
+
+            type_code(&mut e, "nihao", &clip, &imp, &mut retention);
+            assert!(e.rime_input_start.is_none());
+            assert!(e.candidate_origins.iter().all(|origin| !matches!(origin, CandidateOrigin::Rime { .. })));
+            let index = e.current_candidates.iter().position(|c| c.text == "你好").unwrap();
+            assert_eq!(
+                e.select_candidate_action(index, &clip, &imp, &mut retention).unwrap().commit_text.as_deref(),
+                Some("你好")
+            );
+            assert_eq!(retention.crdt_seq, before);
+            assert!(e.speech_context_before().is_empty());
+            type_code(&mut e, "ni", &clip, &imp, &mut retention);
+            e.on_app_focus("editor").unwrap();
+            assert!(e.raw_input.is_empty());
+            type_code(&mut e, "ni", &clip, &imp, &mut retention);
+            assert!(e.rime_input_start.is_some());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "native-rime"))]
+    #[test]
     fn undo_candidate_commit_replays_native_rime_input() {
         let (mut e, clip, imp, mut r) = fixture();
         e.resolved_assets_dir = resolve_assets_dir("");
@@ -7404,7 +7476,6 @@ mod personalization_tests {
         assert!(r.frecency.contains_key("好"));
         assert!(r.code_preferences.is_empty());
         assert!(EngineConfig::parse_json("{}").unwrap().adaptive_learning);
-        assert!(EngineConfig::parse_json("{}").unwrap().learn_from_clipboard);
     }
 
     #[test]
@@ -7420,9 +7491,11 @@ mod personalization_tests {
 
         // Even with real bundled Rime assets present on Linux, non-empty TouchKeyHint routes to spatial lattice.
         let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
-        let mut cfg = EngineConfig::default();
-        cfg.schema = SchemaKind::RimeIce;
-        cfg.assets_dir = assets.to_string_lossy().into_owned();
+        let cfg = EngineConfig {
+            schema: SchemaKind::RimeIce,
+            assets_dir: assets.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         let mut native_eng = EngineState::new(cfg);
         let native_imp = ImportedLexiconIndex::new(Some(&assets));
         let mut native_ret = RetentionEngine::default();

@@ -12,10 +12,11 @@ use crate::sync::{
 };
 use chrono::{DateTime, SecondsFormat, Utc};
 use opendal::layers::TimeoutLayer;
-use opendal::{blocking, HttpTransporter, Operator};
+use opendal::{HttpTransporter, Operator};
 use opendal_http_transport_reqwest::ReqwestTransport;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use vitral_tokens::TOKENS;
@@ -55,7 +56,7 @@ pub(crate) fn rustls_client_config() -> &'static rustls::ClientConfig {
     })
 }
 
-fn run_on_blocking_dav_thread<T, F>(f: F) -> Result<T, VitralError>
+pub(crate) fn run_on_blocking_network_thread<T, F>(f: F) -> Result<T, VitralError>
 where
     T: Send,
     F: FnOnce() -> Result<T, VitralError> + Send,
@@ -63,11 +64,11 @@ where
     if tokio::runtime::Handle::try_current().is_ok() {
         std::thread::scope(|s| {
             std::thread::Builder::new()
-                .name("vitral-dav-blocking".to_string())
+                .name("vitral-network-blocking".to_string())
                 .spawn_scoped(s, f)
-                .map_err(|e| VitralError::Io(format!("spawn dav blocking thread failed: {e}")))?
+                .map_err(|e| VitralError::Io(format!("spawn network blocking thread failed: {e}")))?
                 .join()
-                .map_err(|_| VitralError::Internal("dav blocking thread panicked".into()))?
+                .map_err(|_| VitralError::Internal("network blocking thread panicked".into()))?
         })
     } else {
         f()
@@ -314,8 +315,39 @@ fn dav_http_client(follow_redirects: bool) -> Result<reqwest::Client, VitralErro
     Ok(pool.get_or_init(|| client).clone())
 }
 
+fn dav_http_error(error: reqwest::Error) -> VitralError {
+    VitralError::Io(error.without_url().to_string())
+}
+
+pub(crate) async fn read_http_metadata(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, VitralError> {
+    const MAX_METADATA_BYTES: usize = 10 * 1024 * 1024;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(dav_http_error)? {
+        if chunk.len() > MAX_METADATA_BYTES - body.len() {
+            return Err(VitralError::Io("HTTP metadata exceeds 10 MiB".into()));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[allow(
+    clippy::await_holding_lock,
+    reason = "This future runs via block_on on a blocking thread, and offline transitions drain its read guard"
+)]
+async fn send_http<T>(
+    guard: &OfflineGuard,
+    operation: &str,
+    future: impl Future<Output = Result<T, VitralError>>,
+) -> Result<T, VitralError> {
+    let _online = guard.enter_online(operation)?;
+    guard.wait_online(operation, future, || Ok(())).await
+}
+
 pub struct KoofrDavClient {
-    op: blocking::Operator,
+    op: Operator,
     cfg: DavConfig,
     guard: OfflineGuard,
     clean_root: String,
@@ -323,7 +355,10 @@ pub struct KoofrDavClient {
 }
 
 impl KoofrDavClient {
-    fn build_operator(cfg: &DavConfig, disable_create_dir: bool) -> Result<(blocking::Operator, String), VitralError> {
+    fn build_operator(
+        cfg: &DavConfig,
+        disable_create_dir: bool,
+    ) -> Result<(Operator, String), VitralError> {
         let trimmed_ep = cfg.endpoint.trim().trim_end_matches('/');
         if trimmed_ep.is_empty() {
             return Err(VitralError::InvalidArgument(
@@ -367,19 +402,12 @@ impl KoofrDavClient {
             .map_err(|e| VitralError::Io(format!("OpenDAL WebDAV builder failed: {e}")))?
             .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(15)));
         let ctx = base_op.base_context().with_http_transport(transport);
-        let async_op = base_op.with_context(ctx);
-
-        let rt = network_runtime()?;
-        let _rt_guard = rt.enter();
-        let blocking_op = blocking::Operator::new(async_op)
-            .map_err(|e| VitralError::Io(format!("OpenDAL blocking operator init failed: {e}")))?;
-        Ok((blocking_op, clean_root))
+        Ok((base_op.with_context(ctx), clean_root))
     }
 
     pub fn connect(guard: &OfflineGuard, cfg: &DavConfig) -> Result<Self, VitralError> {
         guard.require_online("koofr_webdav")?;
-        let (op, clean_root) =
-            run_on_blocking_dav_thread(|| Self::build_operator(cfg, false))?;
+        let (op, clean_root) = Self::build_operator(cfg, false)?;
         Ok(Self {
             op,
             cfg: cfg.clone(),
@@ -393,6 +421,19 @@ impl KoofrDavClient {
         &self.clean_root
     }
 
+    fn run_operation<T: Send>(
+        &self,
+        operation: &str,
+        future: impl Future<Output = opendal::Result<T>> + Send,
+    ) -> Result<opendal::Result<T>, VitralError> {
+        run_on_blocking_network_thread(|| {
+            // OpenDAL performs the sends and consumes the response inside this future.
+            network_runtime()?.block_on(send_http(&self.guard, operation, async {
+                Ok(future.await)
+            }))
+        })
+    }
+
     fn ensure_collections(&self, rel_parent: &str) -> Result<(), VitralError> {
         self.guard.require_online("dav_mkcol")?;
         let mut url = reqwest::Url::parse(self.cfg.endpoint.trim())
@@ -400,7 +441,7 @@ impl KoofrDavClient {
         let client = dav_http_client(false)?;
         let method = reqwest::Method::from_bytes(b"MKCOL")
             .map_err(|e| VitralError::Internal(e.to_string()))?;
-        run_on_blocking_dav_thread(|| {
+        run_on_blocking_network_thread(|| {
             network_runtime()?.block_on(async {
                 for segment in self
                     .clean_root
@@ -415,7 +456,6 @@ impl KoofrDavClient {
                         .pop_if_empty()
                         .push(segment)
                         .push("");
-                    self.guard.require_online("dav_mkcol")?;
                     let mut request = client.request(method.clone(), url.clone());
                     if let Some(user) = self
                         .cfg
@@ -433,13 +473,17 @@ impl KoofrDavClient {
                                 .filter(|s| !s.is_empty()),
                         );
                     }
-                    let response = request
-                        .send()
-                        .await
-                        .map_err(|e| VitralError::Io(e.without_url().to_string()))?;
+                    let response = send_http(&self.guard, "dav_mkcol", async {
+                        request.send().await.map_err(dav_http_error)
+                    })
+                    .await?;
                     if !response.status().is_success()
-                        && !matches!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED
-                            | reqwest::StatusCode::MOVED_PERMANENTLY | reqwest::StatusCode::FOUND)
+                        && !matches!(
+                            response.status(),
+                            reqwest::StatusCode::METHOD_NOT_ALLOWED
+                                | reqwest::StatusCode::MOVED_PERMANENTLY
+                                | reqwest::StatusCode::FOUND
+                        )
                     {
                         return Err(VitralError::Io(dav_error_summary(&format!(
                             "HTTP status {}",
@@ -460,47 +504,43 @@ impl KoofrDavClient {
                 "live_slot.enc is forbidden by PROPOSAL v1.2".into(),
             ));
         }
-        run_on_blocking_dav_thread(|| match self.op.write(&rel, data.to_vec()) {
+        match self.run_operation("dav_write", self.op.write(&rel, data.to_vec()))? {
             Ok(_) => Ok(()),
             Err(first_err) => {
                 let msg = first_err.to_string();
                 if msg.contains("deserialize xml") {
                     self.guard.require_online("dav_fallback_reconnect")?;
                     let (direct_op, _) = Self::build_operator(&self.cfg, true)?;
-                    return direct_op
-                        .write(&rel, data.to_vec())
+                    return self
+                        .run_operation("dav_write", direct_op.write(&rel, data.to_vec()))?
                         .map(|_| ())
                         .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())));
                 }
                 let parent_dir = rel.rsplit_once('/').map_or("", |(parent, _)| parent);
                 self.ensure_collections(parent_dir)?;
-                self.op
-                    .write(&rel, data.to_vec())
+                self.run_operation("dav_write", self.op.write(&rel, data.to_vec()))?
                     .map(|_| ())
                     .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
             }
-        })
+        }
     }
 
     pub fn read_bytes_opt(&self, rel_path: &str) -> Result<Option<Vec<u8>>, VitralError> {
         self.guard.require_online("dav_read")?;
         let rel = validate_rel_path(rel_path, false)?;
-        run_on_blocking_dav_thread(|| match self.op.read(&rel) {
+        match self.run_operation("dav_read", self.op.read(&rel))? {
             Ok(buf) => Ok(Some(buf.to_vec())),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
-        })
+        }
     }
 
     pub fn read_bytes(&self, rel_path: &str) -> Result<Vec<u8>, VitralError> {
         self.guard.require_online("dav_read")?;
         let rel = validate_rel_path(rel_path, false)?;
-        run_on_blocking_dav_thread(|| {
-            self.op
-                .read(&rel)
-                .map(|b| b.to_vec())
-                .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
-        })
+        self.run_operation("dav_read", self.op.read(&rel))?
+            .map(|b| b.to_vec())
+            .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
     }
 
     pub fn list_dir(&self, rel_dir: &str) -> Result<Vec<opendal::Entry>, VitralError> {
@@ -511,11 +551,11 @@ impl KoofrDavClient {
         } else {
             format!("{clean}/")
         };
-        run_on_blocking_dav_thread(|| match self.op.list(&dir) {
+        match self.run_operation("dav_list", self.op.list(&dir))? {
             Ok(entries) => Ok(entries),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
-        })
+        }
     }
 
     pub fn directory_bytes(&self, directory: &str) -> Result<u64, VitralError> {
@@ -523,20 +563,21 @@ impl KoofrDavClient {
         let mut visited = BTreeSet::new();
         let mut total = 0u64;
         while let Some(folder) = folders.pop() {
-            if !visited.insert(folder.clone()) { continue; }
+            if !visited.insert(folder.clone()) {
+                continue;
+            }
             for entry in self.list_dir(&folder)? {
                 let path = entry.path().trim_start_matches('/');
-                if path == folder || !path.starts_with(directory) { continue; }
+                if path == folder || !path.starts_with(directory) {
+                    continue;
+                }
                 if entry.metadata().is_dir() {
                     folders.push(path.to_owned());
                 } else {
-                    self.guard.require_online("storage")?;
-                    let len = run_on_blocking_dav_thread(|| {
-                        self.op
-                            .stat(path)
-                            .map(|m| m.content_length())
-                            .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))
-                    })?;
+                    let len = self
+                        .run_operation("storage", self.op.stat(path))?
+                        .map(|m| m.content_length())
+                        .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))?;
                     total = total.saturating_add(len);
                 }
             }
@@ -545,27 +586,25 @@ impl KoofrDavClient {
     }
 
     pub fn stat_mtime(&self, rel_path: &str) -> Option<SystemTime> {
-        self.guard.require_online("dav_stat").ok()?;
-        let rel = validate_rel_path(rel_path, false).ok()?;
-        run_on_blocking_dav_thread(|| {
-            Ok(self
-                .op
-                .stat(&rel)
-                .ok()
-                .and_then(|m| m.last_modified().map(SystemTime::from)))
-        })
-        .ok()
-        .flatten()
+        self.try_stat_mtime(rel_path).ok().flatten()
+    }
+
+    fn try_stat_mtime(&self, rel_path: &str) -> Result<Option<SystemTime>, VitralError> {
+        let rel = validate_rel_path(rel_path, false)?;
+        Ok(self
+            .run_operation("dav_stat", self.op.stat(&rel))?
+            .ok()
+            .and_then(|m| m.last_modified().map(SystemTime::from)))
     }
 
     pub fn delete_file(&self, rel_path: &str) -> Result<(), VitralError> {
         self.guard.require_online("dav_delete")?;
         let rel = validate_rel_path(rel_path, false)?;
-        run_on_blocking_dav_thread(|| match self.op.delete(&rel) {
+        match self.run_operation("dav_delete", self.op.delete(&rel))? {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(VitralError::Io(dav_error_summary(&e.to_string()))),
-        })
+        }
     }
 }
 
@@ -678,41 +717,75 @@ pub(crate) fn merge_clipboard_ring(
     capacity: usize,
 ) -> Result<Vec<ClipboardEntry>, VitralError> {
     let dav = KoofrDavClient::connect(guard, cfg)?;
-    let mut url = reqwest::Url::parse(&cfg.endpoint).map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
+    let mut url = reqwest::Url::parse(&cfg.endpoint)
+        .map_err(|e| VitralError::InvalidArgument(e.to_string()))?;
     {
-        let mut path = url.path_segments_mut().map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?;
-        path.pop_if_empty().extend(dav.clean_root.split('/')).push("clipboard").push("history_ring.jsonl.enc");
+        let mut path = url
+            .path_segments_mut()
+            .map_err(|_| VitralError::InvalidArgument("invalid WebDAV endpoint".into()))?;
+        path.pop_if_empty()
+            .extend(dav.clean_root.split('/'))
+            .push("clipboard")
+            .push("history_ring.jsonl.enc");
     }
     let client = dav_http_client(true)?;
     let request = |method| {
         let req = client.request(method, url.clone());
-        if let Some(user) = cfg.username.as_ref() { req.basic_auth(user, cfg.password.as_ref()) } else { req }
+        if let Some(user) = cfg.username.as_ref() {
+            req.basic_auth(user, cfg.password.as_ref())
+        } else {
+            req
+        }
     };
-    let io = |e: reqwest::Error| VitralError::Io(e.without_url().to_string());
-    run_on_blocking_dav_thread(|| {
+    run_on_blocking_network_thread(|| {
         for _ in 0..4 {
             let conditional = network_runtime()?.block_on(async {
-                guard.require_online("read clipboard revision")?;
-                let reply = request(reqwest::Method::GET).send().await.map_err(io)?;
-                let (cloud, tag, missing) = if reply.status() == reqwest::StatusCode::NOT_FOUND {
-                    (local.to_vec(), None, true)
-                } else {
-                    let reply = reply.error_for_status().map_err(io)?;
+                let (enc, tag) = send_http(guard, "read clipboard revision", async {
+                    let reply = request(reqwest::Method::GET)
+                        .send()
+                        .await
+                        .map_err(dav_http_error)?;
+                    if reply.status() == reqwest::StatusCode::NOT_FOUND {
+                        return Ok((None, None));
+                    }
+                    let reply = reply.error_for_status().map_err(dav_http_error)?;
                     let tag = reply.headers().get(reqwest::header::ETAG).cloned();
-                    let enc = reply.bytes().await.map_err(io)?;
-                    (decode_clipboard_ring_jsonl(&decrypt_envelope(&enc, cfg.sync_key.as_deref())?)?, tag, false)
+                    let enc = reply.bytes().await.map_err(dav_http_error)?;
+                    Ok((Some(enc), tag))
+                })
+                .await?;
+                let missing = enc.is_none();
+                let cloud = match enc {
+                    Some(enc) => decode_clipboard_ring_jsonl(&decrypt_envelope(
+                        &enc,
+                        cfg.sync_key.as_deref(),
+                    )?)?,
+                    None => local.to_vec(),
                 };
                 let merged = changes.merge(cloud, local, capacity);
-                let data = encrypt_envelope(&encode_clipboard_ring_jsonl(&merged)?, cfg.sync_key.as_deref())?;
+                let data = encrypt_envelope(
+                    &encode_clipboard_ring_jsonl(&merged)?,
+                    cfg.sync_key.as_deref(),
+                )?;
                 let mut put = request(reqwest::Method::PUT);
-                if missing { put = put.header(reqwest::header::IF_NONE_MATCH, "*"); }
-                else if let Some(tag) = tag { put = put.header(reqwest::header::IF_MATCH, tag); }
-                guard.require_online("write clipboard revision")?;
-                let result = put.body(data).send().await.map_err(io)?;
+                if missing {
+                    put = put.header(reqwest::header::IF_NONE_MATCH, "*");
+                } else if let Some(tag) = tag {
+                    put = put.header(reqwest::header::IF_MATCH, tag);
+                }
+                let result = send_http(guard, "write clipboard revision", async {
+                    put.body(data).send().await.map_err(dav_http_error)
+                })
+                .await?;
                 match result.status() {
                     reqwest::StatusCode::PRECONDITION_FAILED => Ok::<_, VitralError>(None),
-                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => Ok(Some((false, merged))),
-                    _ => { result.error_for_status().map_err(io)?; Ok(Some((true, merged))) }
+                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => {
+                        Ok(Some((false, merged)))
+                    }
+                    _ => {
+                        result.error_for_status().map_err(dav_http_error)?;
+                        Ok(Some((true, merged)))
+                    }
                 }
             })?;
             match conditional {
@@ -723,7 +796,9 @@ pub(crate) fn merge_clipboard_ring(
                 None => {}
             }
         }
-        Err(VitralError::Io("clipboard changed during synchronization".into()))
+        Err(VitralError::Io(
+            "clipboard changed during synchronization".into(),
+        ))
     })
 }
 
@@ -758,18 +833,30 @@ pub(crate) fn sync_current_copy(
             req
         }
     };
-    let io = |e: reqwest::Error| VitralError::Io(e.without_url().to_string());
-    run_on_blocking_dav_thread(|| {
+    run_on_blocking_network_thread(|| {
         for attempt in 0..4 {
             let outcome = network_runtime()?.block_on(async {
-                guard.require_online("synchronize current clipboard")?;
                 let mut get = request(reqwest::Method::GET);
                 let conditional = known_etag.filter(|_| attempt == 0 && local.is_some());
                 if let Some(tag) = conditional {
                     get = get.header(reqwest::header::IF_NONE_MATCH, tag);
                 }
-                let reply = get.send().await.map_err(io)?;
-                if reply.status() == reqwest::StatusCode::NOT_MODIFIED {
+                let (status, tag, data) = send_http(guard, "read current clipboard", async {
+                    let reply = get.send().await.map_err(dav_http_error)?;
+                    let status = reply.status();
+                    if matches!(
+                        status,
+                        reqwest::StatusCode::NOT_MODIFIED | reqwest::StatusCode::NOT_FOUND
+                    ) {
+                        return Ok((status, None, None));
+                    }
+                    let reply = reply.error_for_status().map_err(dav_http_error)?;
+                    let tag = reply.headers().get(reqwest::header::ETAG).cloned();
+                    let data = reply.bytes().await.map_err(dav_http_error)?;
+                    Ok((status, tag, Some(data)))
+                })
+                .await?;
+                if status == reqwest::StatusCode::NOT_MODIFIED {
                     let tag = conditional.ok_or_else(|| {
                         VitralError::Io("unexpected WebDAV 304 without a clipboard ETag".into())
                     })?;
@@ -778,24 +865,16 @@ pub(crate) fn sync_current_copy(
                         etag: Some(tag.to_owned()),
                     }));
                 }
-                let missing = reply.status() == reqwest::StatusCode::NOT_FOUND;
-                let (cloud, tag) = if missing {
-                    (None, None)
-                } else {
-                    let reply = reply.error_for_status().map_err(io)?;
-                    let tag = reply.headers().get(reqwest::header::ETAG).cloned();
-                    let data = reply.bytes().await.map_err(io)?;
-                    (
-                        Some(
-                            serde_json::from_slice::<ClipboardEntry>(&decrypt_envelope(
-                                &data,
-                                cfg.sync_key.as_deref(),
-                            )?)
-                            .map_err(|e| VitralError::Parse(e.to_string()))?,
-                        ),
-                        tag,
-                    )
-                };
+                let missing = status == reqwest::StatusCode::NOT_FOUND;
+                let cloud = data
+                    .map(|data| {
+                        serde_json::from_slice::<ClipboardEntry>(&decrypt_envelope(
+                            &data,
+                            cfg.sync_key.as_deref(),
+                        )?)
+                        .map_err(|e| VitralError::Parse(e.to_string()))
+                    })
+                    .transpose()?;
                 let local = match local {
                     Some(local)
                         if cloud.as_ref().is_none_or(|e| {
@@ -826,32 +905,33 @@ pub(crate) fn sync_current_copy(
                 }
                 let data =
                     serde_json::to_vec(local).map_err(|e| VitralError::Parse(e.to_string()))?;
-                guard.require_online("write current clipboard")?;
-                let response = put
-                    .body(encrypt_envelope(&data, cfg.sync_key.as_deref())?)
-                    .send()
-                    .await
-                    .map_err(io)?;
-                match response.status() {
-                    reqwest::StatusCode::PRECONDITION_FAILED => Ok(CurrentCopyOutcome::Retry),
-                    reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND if missing => {
-                        Ok(CurrentCopyOutcome::CreateCollection)
+                let put = put.body(encrypt_envelope(&data, cfg.sync_key.as_deref())?);
+                send_http(guard, "write current clipboard", async {
+                    let response = put.send().await.map_err(dav_http_error)?;
+                    match response.status() {
+                        reqwest::StatusCode::PRECONDITION_FAILED => Ok(CurrentCopyOutcome::Retry),
+                        reqwest::StatusCode::CONFLICT | reqwest::StatusCode::NOT_FOUND
+                            if missing =>
+                        {
+                            Ok(CurrentCopyOutcome::CreateCollection)
+                        }
+                        _ => {
+                            let response = response.error_for_status().map_err(dav_http_error)?;
+                            let etag = response
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|tag| tag.to_str().ok())
+                                .map(str::to_owned);
+                            // Finish reading the reply so the connection can return to the pool.
+                            let _ = response.bytes().await;
+                            Ok::<_, VitralError>(CurrentCopyOutcome::Synced(CurrentCopySync {
+                                entry: Some(local.clone()),
+                                etag,
+                            }))
+                        }
                     }
-                    _ => {
-                        let response = response.error_for_status().map_err(io)?;
-                        let etag = response
-                            .headers()
-                            .get(reqwest::header::ETAG)
-                            .and_then(|tag| tag.to_str().ok())
-                            .map(str::to_owned);
-                        // Finish reading the reply so the connection can return to the pool.
-                        let _ = response.bytes().await;
-                        Ok::<_, VitralError>(CurrentCopyOutcome::Synced(CurrentCopySync {
-                            entry: Some(local.clone()),
-                            etag,
-                        }))
-                    }
-                }
+                })
+                .await
             })?;
             match outcome {
                 CurrentCopyOutcome::Synced(state) => return Ok(state),
@@ -1096,19 +1176,21 @@ pub fn cleanup_koofr_orphans_with_config(
             all_files.entry(s.clone()).or_default().push(rel.clone());
         }
 
-        let mut mtime = entry
-            .metadata()
-            .last_modified()
-            .map(SystemTime::from)
-            .or_else(|| client.stat_mtime(&rel));
+        let mut mtime = match entry.metadata().last_modified() {
+            Some(mtime) => Some(SystemTime::from(mtime)),
+            None => client.try_stat_mtime(&rel)?,
+        };
 
         if mtime.is_none() && rel.ends_with(".meta.json") {
-            if let Ok(Some(meta_bytes)) = client.read_bytes_opt(&rel) {
-                if let Ok(meta) = serde_json::from_slice::<RelayMeta>(&meta_bytes) {
-                    if let Ok(dt) = DateTime::parse_from_rfc3339(&meta.created_at_utc) {
-                        mtime = Some(SystemTime::from(dt));
-                    }
+            match client.read_bytes_opt(&rel) {
+                Ok(Some(meta_bytes)) => {
+                    mtime = serde_json::from_slice::<RelayMeta>(&meta_bytes)
+                        .ok()
+                        .and_then(|meta| DateTime::parse_from_rfc3339(&meta.created_at_utc).ok())
+                        .map(SystemTime::from);
                 }
+                Err(err @ VitralError::PureOfflineViolation(_)) => return Err(err),
+                _ => {}
             }
         }
 
@@ -1363,6 +1445,98 @@ mod device_tests {
 mod http_device_tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    fn current_clipboard_entry() -> ClipboardEntry {
+        ClipboardEntry {
+            id: "copy".into(),
+            content: "copy content".into(),
+            mime_type: "text/plain".into(),
+            source_device: "sender".into(),
+            timestamp_ms: 10,
+            pinned: false,
+            shortcut_code: None,
+        }
+    }
+
+    #[test]
+    fn pure_offline_blocks_webdav_before_sending() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let cfg = DavConfig {
+            endpoint: format!("http://{}", server.server_addr()),
+            ..Default::default()
+        };
+        let guard = OfflineGuard::new(false);
+        let client = KoofrDavClient::connect(&guard, &cfg).unwrap();
+        guard.set_pure_offline(true);
+        assert!(matches!(
+            client.write_bytes("clipboard/pending", b"pending"),
+            Err(VitralError::PureOfflineViolation(_))
+        ));
+        assert!(matches!(
+            sync_current_copy(&guard, &cfg, Some(&current_clipboard_entry()), None),
+            Err(VitralError::PureOfflineViolation(_))
+        ));
+        assert!(server
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pure_offline_interrupts_in_flight_webdav_requests() {
+        for current_clipboard in [false, true] {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let cfg = DavConfig {
+                endpoint: format!("http://{}", server.server_addr()),
+                ..Default::default()
+            };
+            let (received, wait) = mpsc::channel();
+            let (release, stalled) = mpsc::channel();
+            let mock = std::thread::spawn(move || {
+                let receive = || {
+                    server
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap()
+                        .unwrap()
+                };
+                let mut request = receive();
+                assert_eq!(request.method().as_str(), "GET");
+                if current_clipboard {
+                    request.respond(tiny_http::Response::empty(404)).unwrap();
+                    request = receive();
+                    assert_eq!(request.method().as_str(), "PUT");
+                    let mut body = Vec::new();
+                    request.as_reader().read_to_end(&mut body).unwrap();
+                    assert!(body.starts_with(b"VTRL1"));
+                }
+                received.send(()).unwrap();
+                // Keep the request unanswered until the client's cancellation completes.
+                stalled.recv_timeout(Duration::from_secs(5)).unwrap();
+                drop(request);
+            });
+            let guard = OfflineGuard::new(false);
+            let worker_guard = guard.clone();
+            let request = std::thread::spawn(move || {
+                if current_clipboard {
+                    sync_current_copy(&worker_guard, &cfg, Some(&current_clipboard_entry()), None)
+                        .map(|_| ())
+                } else {
+                    KoofrDavClient::connect(&worker_guard, &cfg)?
+                        .read_bytes("clipboard/pending")
+                        .map(|_| ())
+                }
+            });
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            guard.set_pure_offline(true);
+            assert!(matches!(
+                request.join().unwrap(),
+                Err(VitralError::PureOfflineViolation(_))
+            ));
+            release.send(()).unwrap();
+            mock.join().unwrap();
+        }
+    }
 
     #[test]
     fn clipboard_put_etag_reuses_http_connection_for_conditional_get() {
@@ -1403,15 +1577,7 @@ mod http_device_tests {
                 request.respond(response).unwrap();
             }
         });
-        let entry = ClipboardEntry {
-            id: "copy".into(),
-            content: "copy content".into(),
-            mime_type: "text/plain".into(),
-            source_device: "sender".into(),
-            timestamp_ms: 10,
-            pinned: false,
-            shortcut_code: None,
-        };
+        let entry = current_clipboard_entry();
         let guard = OfflineGuard::new(false);
         let initial = sync_current_copy(&guard, &cfg, Some(&entry), None).unwrap();
         assert_eq!(initial.entry.as_ref(), Some(&entry));

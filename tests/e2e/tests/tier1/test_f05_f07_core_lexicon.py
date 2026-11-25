@@ -267,7 +267,7 @@ def test_f06_quanpin_long_sentence_monotonic_accuracy(
         cands_short = _candidate_texts(action_short)
         if cands_short and cands_short[0] == first_step["resolved"]:
             short_prefix_hits += 1
-        vitral_target.select_candidate(0)
+        vitral_target.process_key("Escape")
 
         action_full = _type_keys(vitral_target, case["pinyin"])
         cands_full = _candidate_texts(action_full)
@@ -275,7 +275,7 @@ def test_f06_quanpin_long_sentence_monotonic_accuracy(
             f"{case['id']} full long sentence expected top-1 {case['expected_text']!r}, got {cands_full}"
         )
         full_sentence_hits += 1
-        vitral_target.select_candidate(0)
+        vitral_target.process_key("Escape")
 
     assert full_sentence_hits >= short_prefix_hits
     assert full_sentence_hits == len(long_cases)
@@ -395,7 +395,7 @@ def test_f07_import_unannotated_txt_context_aware_polyphones(
         )
     )
 
-    vitral_target.init({})
+    vitral_target.init({"typo_correction_level": "off"})
     report = vitral_target.import_lexicon(txt_path, "txt")
     assert report["imported_count"] == len(oracle["cases"])
     assert report["skipped_count"] == 0

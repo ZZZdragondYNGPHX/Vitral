@@ -1,4 +1,7 @@
 //! Optional local models. The development assets tree remains a read-only fallback.
+use crate::dav::{
+    network_runtime, read_http_metadata, run_on_blocking_network_thread, rustls_client_config,
+};
 use crate::{eng::EngineConfig, error::VitralError, offline_guard::OfflineGuard};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -18,6 +21,10 @@ use std::{
 
 pub const DEFAULT_CATALOG_URL: &str =
     "https://github.com/ZZZdragondYNGPHX/Vitral/releases/download/models-v1/models-catalog.json";
+const MODEL_DOWNLOAD: &str = "model_download";
+const CATALOG_REFRESH: &str = "models_refresh_catalog";
+const MAX_REDIRECTS: usize = 5;
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, VitralError>;
 fn io(e: impl std::fmt::Display) -> VitralError {
@@ -25,6 +32,67 @@ fn io(e: impl std::fmt::Display) -> VitralError {
 }
 fn invalid(s: impl Into<String>) -> VitralError {
     VitralError::InvalidArgument(s.into())
+}
+
+fn model_http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .tls_backend_preconfigured(rustls_client_config().clone())
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(20))
+        .read_timeout(Duration::from_secs(45))
+        .build()
+        .map_err(model_http_error)
+}
+
+fn model_http_error(error: reqwest::Error) -> VitralError {
+    io(error.without_url())
+}
+
+async fn get_model_response(
+    client: &reqwest::Client,
+    url: &str,
+    existing: u64,
+    guard: &OfflineGuard,
+    operation: &str,
+    check_cancel: impl Fn() -> Result<()> + Copy,
+) -> Result<reqwest::Response> {
+    let mut url = reqwest::Url::parse(url).map_err(|e| invalid(e.to_string()))?;
+    for hop in 0..=MAX_REDIRECTS {
+        guard.require_online(operation)?;
+        check_cancel()?;
+        validate_url(url.as_str())?;
+        let mut request = client
+            .get(url.clone())
+            .header("Accept-Encoding", "identity");
+        if existing > 0 {
+            request = request.header("Range", format!("bytes={existing}-"));
+        }
+        let response = guard
+            .wait_online(
+                operation,
+                async {
+                    tokio::time::timeout(RESPONSE_TIMEOUT, request.send())
+                        .await
+                        .map_err(io)?
+                        .map_err(model_http_error)
+                },
+                check_cancel,
+            )
+            .await?;
+        if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+            return Ok(response);
+        }
+        if hop == MAX_REDIRECTS {
+            break;
+        }
+        let location = response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .ok_or_else(|| io("模型下载重定向缺少 Location"))?;
+        url = url.join(location.to_str().map_err(io)?).map_err(io)?;
+    }
+    Err(io("模型下载重定向次数过多"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -546,7 +614,7 @@ impl ModelManager {
         guard: &OfflineGuard,
         on_complete: impl FnOnce() -> Result<()> + Send + 'static,
     ) -> Result<ModelsState> {
-        guard.require_online("model_download")?;
+        guard.require_online(MODEL_DOWNLOAD)?;
         let _op = self.inner.operations.lock();
         let m = self.model(id)?;
         let downloading = self
@@ -617,20 +685,20 @@ impl ModelManager {
         guard: &OfflineGuard,
         cancel: &AtomicBool,
     ) -> Result<()> {
-        let check = || {
+        let check_cancel = || {
             if cancel.load(Ordering::SeqCst) {
                 Err(invalid("下载已取消"))
             } else {
-                guard.require_online("model_download")
+                Ok(())
             }
         };
+        let check = || {
+            check_cancel()?;
+            guard.require_online(MODEL_DOWNLOAD)
+        };
         fs::create_dir_all(tmp).map_err(io)?;
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_connect(Some(Duration::from_secs(20)))
-            .timeout_recv_response(Some(Duration::from_secs(30)))
-            .timeout_per_read(Some(Duration::from_secs(5)))
-            .build()
-            .into();
+        let client = model_http_client()?;
+        let runtime = network_runtime()?;
         let mut completed = 0;
         for (idx, f) in m.files.iter().enumerate() {
             let part = tmp.join(format!("{idx}.part"));
@@ -671,7 +739,7 @@ impl ModelManager {
                             std::thread::sleep(
                                 until
                                     .saturating_duration_since(Instant::now())
-                                    .min(Duration::from_millis(50)),
+                                    .min(Duration::from_millis(25)),
                             );
                         }
                     }
@@ -690,77 +758,64 @@ impl ModelManager {
                         if existing == f.size && part.is_file() {
                             return verify();
                         }
-                        let mut request = agent.get(url).header("Accept-Encoding", "identity");
-                        if existing > 0 {
-                            request = request.header("Range", format!("bytes={existing}-"));
-                        }
-                        let mut response = request.call().map_err(io)?;
-                        let append = response.status() == 206 && existing > 0;
-                        if response.status() != 200 && !append {
-                            return Err(io(format!(
-                                "unexpected HTTP status {}",
-                                response.status()
-                            )));
-                        }
-                        let mut out = fs::OpenOptions::new()
-                            .create(true)
-                            .write(true)
-                            .append(append)
-                            .truncate(!append)
-                            .open(&part)
-                            .map_err(io)?;
-                        let mut n = if append { existing } else { 0 };
-                        self.inner
-                            .progress
-                            .lock()
-                            .get_mut(&m.id)
-                            .unwrap()
-                            .downloaded_bytes = completed + n;
-                        let mut reader = response.body_mut().as_reader();
-                        let mut last_progress = Instant::now();
-                        let mut buf = [0u8; 65536];
-                        loop {
-                            check()?;
-                            let len = match reader.read(&mut buf) {
-                                Ok(len) => len,
-                                Err(e)
-                                    if matches!(
-                                        e.kind(),
-                                        std::io::ErrorKind::TimedOut
-                                            | std::io::ErrorKind::WouldBlock
-                                            | std::io::ErrorKind::Interrupted
-                                    ) || e
-                                        .get_ref()
-                                        .and_then(|e| e.downcast_ref::<ureq::Error>())
-                                        .is_some_and(|e| matches!(e, ureq::Error::Timeout(_))) =>
-                                {
-                                    check()?;
-                                    if last_progress.elapsed() >= Duration::from_secs(45) {
-                                        return Err(io(e));
-                                    }
-                                    continue;
-                                }
-                                Err(e) => return Err(io(e)),
-                            };
-                            if len == 0 {
-                                break;
-                            }
-                            n += len as u64;
-                            if n > f.size {
-                                return Err(VitralError::Integrity(format!(
-                                    "{} 文件过大",
-                                    f.rel_path
+                        let online = guard.enter_online(MODEL_DOWNLOAD)?;
+                        let (out, n) = runtime.block_on(async {
+                            let mut response = get_model_response(
+                                &client,
+                                url,
+                                existing,
+                                guard,
+                                MODEL_DOWNLOAD,
+                                check_cancel,
+                            )
+                            .await?;
+                            let append = response.status() == 206 && existing > 0;
+                            if response.status() != 200 && !append {
+                                return Err(io(format!(
+                                    "unexpected HTTP status {}",
+                                    response.status()
                                 )));
                             }
-                            out.write_all(&buf[..len]).map_err(io)?;
-                            last_progress = Instant::now();
+                            let mut out = fs::OpenOptions::new()
+                                .create(true)
+                                .write(true)
+                                .append(append)
+                                .truncate(!append)
+                                .open(&part)
+                                .map_err(io)?;
+                            let mut n = if append { existing } else { 0 };
                             self.inner
                                 .progress
                                 .lock()
                                 .get_mut(&m.id)
                                 .unwrap()
                                 .downloaded_bytes = completed + n;
-                        }
+                            while let Some(chunk) = guard
+                                .wait_online(
+                                    MODEL_DOWNLOAD,
+                                    async { response.chunk().await.map_err(model_http_error) },
+                                    check_cancel,
+                                )
+                                .await?
+                            {
+                                n += chunk.len() as u64;
+                                if n > f.size {
+                                    return Err(VitralError::Integrity(format!(
+                                        "{} 文件过大",
+                                        f.rel_path
+                                    )));
+                                }
+                                out.write_all(&chunk).map_err(io)?;
+                                self.inner
+                                    .progress
+                                    .lock()
+                                    .get_mut(&m.id)
+                                    .unwrap()
+                                    .downloaded_bytes = completed + n;
+                            }
+                            Ok((out, n))
+                        })?;
+                        drop(online);
                         out.sync_all().map_err(io)?;
                         if n < f.size {
                             return Err(io(format!("{} 下载中断，等待断点续传", f.rel_path)));
@@ -773,6 +828,9 @@ impl ModelManager {
                             break 'mirrors;
                         }
                         Err(e) => {
+                            if matches!(e, VitralError::PureOfflineViolation(_)) {
+                                return Err(e);
+                            }
                             check()?;
                             let corrupt = matches!(e, VitralError::Integrity(_));
                             last_error = e;
@@ -811,7 +869,7 @@ impl ModelManager {
         atomic_json(&self.inner.root.join("state.json"), &*state)
     }
     pub fn refresh_catalog(&self, url: &str, guard: &OfflineGuard) -> Result<ModelsState> {
-        guard.require_online("models_refresh_catalog")?;
+        guard.require_online(CATALOG_REFRESH)?;
         validate_url(url)?;
         let _op = self.inner.operations.lock();
         if self
@@ -823,14 +881,27 @@ impl ModelManager {
         {
             return Err(invalid("请等待下载结束后刷新模型目录"));
         }
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
-            .build()
-            .into();
-        let mut response = agent.get(url).call().map_err(io)?;
-        let json = response.body_mut().read_to_string().map_err(io)?;
-        guard.require_online("models_refresh_catalog")?;
-        let catalog = Catalog::parse(&json)?;
+        let client = model_http_client()?;
+        let json = run_on_blocking_network_thread(|| {
+            let _online = guard.enter_online(CATALOG_REFRESH)?;
+            network_runtime()?.block_on(async {
+                tokio::time::timeout(RESPONSE_TIMEOUT, async {
+                    let response =
+                        get_model_response(&client, url, 0, guard, CATALOG_REFRESH, || Ok(()))
+                            .await?;
+                    if !response.status().is_success() {
+                        return Err(io(format!("unexpected HTTP status {}", response.status())));
+                    }
+                    guard
+                        .wait_online(CATALOG_REFRESH, read_http_metadata(response), || Ok(()))
+                        .await
+                })
+                .await
+                .map_err(io)?
+            })
+        })?;
+        guard.require_online(CATALOG_REFRESH)?;
+        let catalog = Catalog::parse(&String::from_utf8_lossy(&json))?;
         atomic_json(&self.inner.root.join("catalog.json"), &catalog)?;
         *self.inner.catalog.write() = catalog;
         Ok(self.models_state())
@@ -1326,6 +1397,153 @@ mod tests {
         assert!(!m.inner.root.join(".tmp/test-model").exists());
         assert!(!m.inner.root.join("test/model.bin").exists());
     }
+    #[test]
+    fn catalog_follows_at_most_five_redirects() {
+        for redirects in [MAX_REDIRECTS, MAX_REDIRECTS + 1] {
+            let t = Temp::new();
+            let catalog = Catalog::builtin();
+            let m = manager(&t, &catalog);
+            let server = Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}/0", server.server_addr());
+            let serve = std::thread::spawn(move || {
+                for hop in 0..=MAX_REDIRECTS {
+                    let request = server
+                        .recv_timeout(Duration::from_secs(2))
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(request.url(), format!("/{hop}"));
+                    if hop == redirects {
+                        request
+                            .respond(Response::from_data(serde_json::to_vec(&catalog).unwrap()))
+                            .unwrap();
+                    } else {
+                        let location =
+                            tiny_http::Header::from_bytes("Location", format!("/{}", hop + 1))
+                                .unwrap();
+                        request
+                            .respond(Response::empty(302).with_header(location))
+                            .unwrap();
+                    }
+                }
+                assert!(server
+                    .recv_timeout(Duration::from_millis(100))
+                    .unwrap()
+                    .is_none());
+            });
+            let result = m.refresh_catalog(&url, &OfflineGuard::new(false));
+            serve.join().unwrap();
+            assert_eq!(result.is_ok(), redirects == MAX_REDIRECTS);
+            assert_eq!(m.inner.root.join("catalog.json").exists(), result.is_ok());
+        }
+    }
+
+    #[test]
+    fn offline_during_catalog_redirect_blocks_the_target() {
+        let t = Temp::new();
+        let source = Server::http("127.0.0.1:0").unwrap();
+        let target = Server::http("127.0.0.1:0").unwrap();
+        let source_url = format!("http://{}/catalog.json", source.server_addr());
+        let guard = OfflineGuard::new(false);
+        let refresh_guard = guard.clone();
+        let m = manager(&t, &Catalog::builtin());
+        let refresh = std::thread::spawn(move || m.refresh_catalog(&source_url, &refresh_guard));
+        let request = source
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        let start = Instant::now();
+        guard.set_pure_offline(true);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let location = format!("http://{}/redirected.json", target.server_addr());
+        let _ = request.respond(
+            Response::empty(302)
+                .with_header(tiny_http::Header::from_bytes("Location", location).unwrap()),
+        );
+        assert!(target
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            refresh.join().unwrap(),
+            Err(VitralError::PureOfflineViolation(_))
+        ));
+    }
+
+    #[test]
+    fn stalled_downloads_stop_on_cancel_or_pure_offline() {
+        use std::io::{BufRead, BufReader};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+
+        for (send_headers, offline) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let t = Temp::new();
+            let core =
+                crate::VitralCore::init(&serde_json::to_string(&t.config()).unwrap()).unwrap();
+            core.set_pure_offline(false);
+            let server = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.local_addr().unwrap());
+            let (ready, requested) = mpsc::channel();
+            let (release, hold) = mpsc::channel();
+            let connection = std::thread::spawn(move || {
+                let (mut stream, _) = server.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = BufReader::new(&stream);
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(request.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                }
+                if send_headers {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\na")
+                        .unwrap();
+                }
+                ready.send(()).unwrap();
+                let _ = hold.recv_timeout(Duration::from_secs(3));
+            });
+            let m = &core.models;
+            *m.inner.catalog.write() = fixture(vec![url], &"0".repeat(64), 4);
+            m.start_download("test-model", &core.offline_guard, || {
+                panic!("download completed")
+            })
+            .unwrap();
+            requested.recv_timeout(Duration::from_secs(2)).unwrap();
+            if send_headers {
+                let start = Instant::now();
+                while m.inner.progress.lock()["test-model"].downloaded_bytes == 0 {
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+
+            let start = Instant::now();
+            let result = if offline {
+                core.set_pure_offline(true);
+                wait(m, "test-model")
+            } else {
+                m.cancel_download("test-model").unwrap();
+                m.inner.progress.lock()["test-model"].clone()
+            };
+            let elapsed = start.elapsed();
+            let _ = release.send(());
+            connection.join().unwrap();
+            assert!(elapsed < Duration::from_millis(500), "{elapsed:?}");
+            if offline {
+                assert_eq!(result.status, "failed");
+                assert!(result.error.unwrap().contains("pure_offline"));
+            } else {
+                assert_eq!(result.status, "cancelled");
+            }
+            assert!(!m.inner.root.join(".tmp").exists());
+            assert!(!m.inner.root.join("test/model.bin").exists());
+        }
+    }
+
     #[test]
     fn offline_guard_blocks_download_and_catalog_refresh() {
         let t = Temp::new();

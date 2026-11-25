@@ -1153,7 +1153,7 @@ private:
         text->setCursor(Qt::PointingHandCursor);
         text->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
         connect(text, &QToolButton::clicked, this, [this, content] {
-          commit(content);
+          commit(content, true);
           history_->hide();
           refreshToolbar();
         });
@@ -1218,9 +1218,10 @@ private:
     }
   }
 
-  void commit(const QString &text) {
+  void commit(const QString &text, bool fromClipboard = false) {
     if (!text.isEmpty())
-      request("commit-text", {{"text", text}});
+      request("commit-text",
+              {{"text", text}, {"clipboard_commit", fromClipboard}});
   }
 
   QToolButton *option(QString label, std::function<void()> click) {

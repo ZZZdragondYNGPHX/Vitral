@@ -295,7 +295,7 @@ def test_f07_unannotated_polyphone_disambiguation_and_tones(
     unannotated = lex_dir / "polyphone_unannotated.txt"
     oracle = json.loads((lex_dir / "expected_polyphones.json").read_text(encoding="utf-8"))
 
-    vitral_target.init({"schema": "rime_ice"})
+    vitral_target.init({"schema": "rime_ice", "typo_correction_level": "off"})
     res = vitral_target.import_lexicon(unannotated, format_hint="txt")
     # PROJECT.md:126 contract: { imported_count, skipped_count, warnings }
     assert int(res.get("imported_count", 0)) == len(oracle["cases"])

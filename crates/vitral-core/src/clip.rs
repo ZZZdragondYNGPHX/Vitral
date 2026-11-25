@@ -420,3 +420,35 @@ impl ClipboardManager {
         self.seen_while_ime_open = false;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_clipboard_json_preserves_copy_data() {
+        let expected = json!({
+            "id": "old-copy",
+            "content": "旧剪贴板内容\nOpenAI",
+            "mime_type": "text/plain",
+            "source_device": "phone",
+            "timestamp_ms": 42,
+            "pinned": true,
+            "shortcut_code": "copy",
+        });
+        let mut legacy = expected.clone();
+        legacy["source_app"] = json!("editor");
+        legacy["from_privacy_app"] = json!(true);
+
+        let history: Vec<ClipboardEntry> = serde_json::from_value(json!([legacy])).unwrap();
+        let current: ClipboardCurrent =
+            serde_json::from_value(json!({"current_copy": legacy})).unwrap();
+        assert_eq!(current.current_copy.as_ref(), history.first());
+        assert_eq!(serde_json::to_value(&history).unwrap(), json!([expected]));
+
+        let payload: ClipboardPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(payload.content, history[0].content);
+        assert_eq!(payload.source_device, history[0].source_device);
+    }
+}

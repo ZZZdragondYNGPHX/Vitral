@@ -1454,6 +1454,24 @@ impl PolyphoneAnnotator {
     }
 }
 
+pub fn default_assets_dir_candidates() -> Option<PathBuf> {
+    if let Ok(env_dir) = std::env::var("VITRAL_ASSETS_DIR") {
+        let p = PathBuf::from(env_dir.trim());
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+    let cwd_assets = PathBuf::from("assets");
+    if cwd_assets.join("rime").is_dir() {
+        return Some(cwd_assets);
+    }
+    let manifest_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets");
+    if manifest_assets.join("rime").is_dir() {
+        return Some(manifest_assets);
+    }
+    None
+}
+
 #[cfg(test)]
 mod corpus_tests {
     use super::*;
@@ -1711,22 +1729,4 @@ mod corpus_tests {
             assert_eq!(bucket[limit - 1].1, 101 - limit as u64);
         }
     }
-}
-
-pub fn default_assets_dir_candidates() -> Option<PathBuf> {
-    if let Ok(env_dir) = std::env::var("VITRAL_ASSETS_DIR") {
-        let p = PathBuf::from(env_dir.trim());
-        if p.is_dir() {
-            return Some(p);
-        }
-    }
-    let cwd_assets = PathBuf::from("assets");
-    if cwd_assets.join("rime").is_dir() {
-        return Some(cwd_assets);
-    }
-    let manifest_assets = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets");
-    if manifest_assets.join("rime").is_dir() {
-        return Some(manifest_assets);
-    }
-    None
 }

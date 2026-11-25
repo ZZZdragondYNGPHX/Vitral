@@ -420,13 +420,15 @@ def test_w04_koofr_webdav_sync_v12_quick_paste_relay_and_full_restore(
         assert c_b["consumed"]["content"] == "qp-sync-alpha"
         assert _qp_content(dev_b.quick_paste_state()) is None
 
-        # (3) on_ime_open -> on_ime_close clears locally only
+        # (3) on_ime_open -> on_ime_close preserves; dismiss_quick_paste clears locally only
         dev_a.clipboard_push("qp-ime-cycle", source_device="w04-dev-a")
         dev_b.clipboard_ingest_remote("qp-ime-cycle", is_cold_boot=False)
         open_a = dev_a.on_ime_open()
         assert open_a["seen_while_ime_open"] is True
         assert _qp_content(open_a) == "qp-ime-cycle"
         dev_a.on_ime_close()
+        assert _qp_content(dev_a.quick_paste_state()) == "qp-ime-cycle"
+        dev_a.dismiss_quick_paste()
         assert _qp_content(dev_a.quick_paste_state()) is None
         dev_a.on_ime_open()
         assert _qp_content(dev_a.quick_paste_state()) is None
@@ -467,6 +469,10 @@ def test_w04_koofr_webdav_sync_v12_quick_paste_relay_and_full_restore(
         dev_a.relay_cleanup_orphans()
         assert webdav_server.file_exists("relay/fresh_23h59m.enc")
         assert not webdav_server.file_exists("relay/stale_24h01m.enc")
+
+        # Release Device A & B workers before booting Device C within the 4 GiB cgroup cap
+        dev_b.close()
+        dev_a.close()
 
         # Full device restore onto Device C
         dev_c.init({"device_id": "w04-dev-c"})
@@ -791,8 +797,8 @@ def test_w10_mobile_docked_floating_layout_and_spacebar_backspace_gestures(
     assert ergo["spacebarVoiceHoldThresholdMs"] == 350
     assert ergo["spacebarVoiceVisual"] == "in-place-waveform"
     assert ergo["schemaKeycaps"]["double_pinyin_flypy"]["rows"] == 4
-    assert ergo["schemaKeycaps"]["rime_ice_quanpin"]["rows"] == 5
-    assert ergo["schemaKeycaps"]["rime_ice_quanpin"]["dedicatedTopNumberRow"] is True
+    assert ergo["schemaKeycaps"]["rime_ice_quanpin"]["rows"] == 4
+    assert ergo["schemaKeycaps"]["rime_ice_quanpin"]["dedicatedTopNumberRow"] is False
 
     root = discovered_targets.vitral_root
     kt_tokens = (
