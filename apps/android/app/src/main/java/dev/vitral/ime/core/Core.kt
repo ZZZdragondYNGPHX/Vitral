@@ -34,6 +34,18 @@ object VitralNative {
     @JvmStatic
     external fun processKey(handle: Long, keycode: Int, modifiers: Int, swipeDir: Int): String
 
+    @JvmStatic
+    external fun processTouchKey(
+        handle: Long,
+        keycode: Int,
+        modifiers: Int,
+        swipeDir: Int,
+        alt1Char: Int,
+        alt1Penalty: Float,
+        alt2Char: Int,
+        alt2Penalty: Float,
+    ): String
+
     @JvmStatic external fun selectCandidate(handle: Long, index: Int): String
 
     @JvmStatic external fun pinCandidate(handle: Long, index: Int): String

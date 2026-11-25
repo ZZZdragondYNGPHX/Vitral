@@ -39,6 +39,9 @@ with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=5) as
     assets = Path("assets")
     for name in ("rime/cn_dicts/8105.dict.yaml", "rime/cn_dicts/41448.dict.yaml",
                  "rime/cn_dicts/base.dict.yaml", "rime/cn_dicts/ext.dict.yaml", "rime/cn_dicts/others.dict.yaml",
+                 "rime/en_dicts/en.dict.yaml", "rime/en_dicts/en_ext.dict.yaml",
+                 "rime/en_dicts/cn_en.txt", "rime/en_dicts/cn_en_flypy.txt",
+                 "rime/radical_pinyin.dict.yaml",
                  "rime/LICENSE"):
         out.write(assets / name)
     for source in sorted((assets / "opencc").rglob("*")):

@@ -1,5 +1,5 @@
 use jni::objects::{JClass, JFloatArray, JLongArray, JShortArray, JString};
-use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
+use jni::sys::{jboolean, jfloat, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
 use serde::Serialize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,7 +10,7 @@ use vitral_core::eng::{OpenCcMode, SchemaKind, SwipeDir};
 use vitral_core::error::VitralError;
 use vitral_core::hw::{HwMode, StrokePoint};
 use vitral_core::imp::LexiconFormat;
-use vitral_core::VitralCore;
+use vitral_core::{TouchKeyHint, VitralCore};
 
 const ABI_VERSION: jint = 1;
 
@@ -265,12 +265,30 @@ pub extern "system" fn Java_dev_vitral_ime_core_VitralNative_onAppFocus(
 
 #[no_mangle]
 pub extern "system" fn Java_dev_vitral_ime_core_VitralNative_processKey(
+    env: JNIEnv<'_>,
+    class: JClass<'_>,
+    handle: jlong,
+    keycode: jint,
+    modifiers: jint,
+    swipe_dir: jint,
+) -> jstring {
+    Java_dev_vitral_ime_core_VitralNative_processTouchKey(
+        env, class, handle, keycode, modifiers, swipe_dir, 0, 0.0, 0, 0.0,
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_dev_vitral_ime_core_VitralNative_processTouchKey(
     mut env: JNIEnv<'_>,
     _class: JClass<'_>,
     handle: jlong,
     keycode: jint,
     modifiers: jint,
     swipe_dir: jint,
+    alt1_char: jint,
+    alt1_penalty: jfloat,
+    alt2_char: jint,
+    alt2_penalty: jfloat,
 ) -> jstring {
     guard_jstring(&mut env, |env| {
         let core = match core_from_handle(handle) {
@@ -285,7 +303,11 @@ pub extern "system" fn Java_dev_vitral_ime_core_VitralNative_processKey(
             4 => SwipeDir::Right,
             _ => return err_envelope(env, 3, "invalid swipeDir"),
         };
-        match core.process_key(keycode as u32, modifiers as u32, dir) {
+        let hint = TouchKeyHint::from_keycodes(
+            keycode as u32,
+            [(alt1_char as u32, alt1_penalty), (alt2_char as u32, alt2_penalty)],
+        );
+        match core.process_touch_key(keycode as u32, modifiers as u32, dir, hint) {
             Ok(act) => ok_envelope(env, &act),
             Err(e) => err_envelope(env, status_code(&e), &e.to_string()),
         }

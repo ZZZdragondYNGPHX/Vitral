@@ -201,4 +201,40 @@ class KeyboardInteractionTest {
         assertTrue(strong.first > light.first)
         assertTrue(strong.second > light.second)
     }
+
+    @Test
+    fun spatial2dTouchHintCapturesEightNeighborhoodAndPersonalThumbBias() {
+        val w = 100f
+        val h = 120f
+        val keys =
+            listOf(
+                SpatialKeyCenter('r', 350f, 60f, w, h),
+                SpatialKeyCenter('t', 450f, 60f, w, h),
+                SpatialKeyCenter('f', 375f, 180f, w, h),
+                SpatialKeyCenter('g', 475f, 180f, w, h),
+                SpatialKeyCenter('h', 575f, 180f, w, h),
+                SpatialKeyCenter('v', 425f, 300f, w, h),
+                SpatialKeyCenter('b', 525f, 300f, w, h),
+            )
+        val primaryG = keys.first { it.ch == 'g' }
+        // Tap near top-left corner of 'g' -> vertical/diagonal neighbors 't' and 'f' rank ahead of 'h'.
+        val topLeft = computeSpatialTouchHint(432f, 128f, primaryG, keys)
+        assertEquals('t'.code, topLeft.alt1Char)
+        assertEquals('f'.code, topLeft.alt2Char)
+        assertTrue(topLeft.alt1Penalty > 0f && topLeft.alt1Penalty < topLeft.alt2Penalty)
+
+        // Personal thumb bias shifts effective tap back toward center; EMA stays clamped within 0.25 * size.
+        val estimator = ThumbBiasEstimator()
+        repeat(40) { estimator.observe(38f, -40f, w, h) }
+        assertTrue(estimator.biasX in 18f..25f)
+        assertTrue(estimator.biasY in -30f..-20f)
+        // Wild outlier outside 0.45 * size and non-finite inputs must not move or poison bias.
+        val prevX = estimator.biasX
+        val prevY = estimator.biasY
+        estimator.observe(-90f, 90f, w, h)
+        estimator.observe(Float.NaN, 0f, w, h)
+        estimator.observe(0f, Float.POSITIVE_INFINITY, w, h)
+        assertEquals(prevX, estimator.biasX)
+        assertEquals(prevY, estimator.biasY)
+    }
 }

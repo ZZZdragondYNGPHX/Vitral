@@ -110,7 +110,7 @@ pub(super) enum RerankerLock {
 }
 
 pub(super) struct RerankerBusy;
-type MaskedScores = Vec<Vec<Option<f32>>>;
+pub(crate) type MaskedScores = Vec<Vec<Option<f32>>>;
 
 #[cfg(feature = "native-onnx")]
 #[derive(Default)]
@@ -195,6 +195,11 @@ impl HwOnnxBundle {
                 .entry(paths.clone())
                 .or_insert_with(|| Arc::new(Self::load(paths))),
         )
+    }
+
+    #[cfg(feature = "native-onnx")]
+    pub(crate) fn try_cached_paths(paths: &crate::models::ModelPaths) -> Option<Arc<Self>> {
+        BUNDLE_CACHE.get()?.try_lock()?.get(paths).cloned()
     }
 
     fn load(paths: &crate::models::ModelPaths) -> Self {
@@ -451,6 +456,36 @@ impl HwOnnxBundle {
         .flatten()
     }
 
+    /// Score only if the existing session is ready and can be acquired immediately.
+    #[cfg_attr(not(feature = "native-onnx"), allow(dead_code))]
+    pub(crate) fn try_score_rbt3_masked_batch_if_warm(
+        &self,
+        sequences: &[Vec<i64>],
+        mask_positions: &[usize],
+        cands_per_item: &[Vec<char>],
+    ) -> Option<MaskedScores> {
+        #[cfg(feature = "native-onnx")]
+        {
+            let session = parking_lot::MutexGuard::try_map(
+                self.rerank_session.session.try_lock()?,
+                |cell| cell.get_mut()?.as_mut(),
+            )
+            .ok()?;
+            self.score_masked_batch(session, sequences, mask_positions, cands_per_item)
+        }
+        #[cfg(not(feature = "native-onnx"))]
+        {
+            let _ = (sequences, mask_positions, cands_per_item);
+            None
+        }
+    }
+
+    #[cfg(all(test, feature = "native-onnx"))]
+    pub(crate) fn with_locked_reranker_for_test(&self, f: impl FnOnce()) {
+        let _guard = self.rerank_session.session.lock();
+        f();
+    }
+
     pub(super) fn score_rbt3_with_lock(
         &self,
         sequences: &[Vec<i64>],
@@ -465,35 +500,45 @@ impl HwOnnxBundle {
         }
         #[cfg(feature = "native-onnx")]
         {
-            let Some(mut session) = self.rerank_session.lock(lock)? else {
+            let Some(session) = self.rerank_session.lock(lock)? else {
                 return Ok(None);
             };
-            let logits =
-                self.run_masked_batch(&mut session, sequences, mask_positions, cands_per_item);
-            drop(session);
-            Ok(logits.and_then(|(max_len, logits)| {
-                let tok = self.tokenizer.as_ref()?;
-                let (shape, logits) = logits.try_extract_tensor::<f32>().ok()?;
-                let bsz = sequences.len();
-                if shape.len() != 3 || shape[0] as usize != bsz || shape[1] as usize != max_len {
-                    return None;
-                }
-                let vocab_size = shape[2] as usize;
-                let scores = mask_positions
-                    .iter()
-                    .zip(cands_per_item)
-                    .enumerate()
-                    .map(|(batch, (&pos, candidates))| {
-                        if pos >= max_len {
-                            return vec![None; candidates.len()];
-                        }
-                        let start = (batch * max_len + pos) * vocab_size;
-                        score_masked_row(&logits[start..start + vocab_size], tok, candidates)
-                    })
-                    .collect();
-                Some(scores)
-            }))
+            Ok(self.score_masked_batch(session, sequences, mask_positions, cands_per_item))
         }
+    }
+
+    #[cfg(feature = "native-onnx")]
+    fn score_masked_batch(
+        &self,
+        mut session: parking_lot::MappedMutexGuard<'_, Session>,
+        sequences: &[Vec<i64>],
+        mask_positions: &[usize],
+        cands_per_item: &[Vec<char>],
+    ) -> Option<MaskedScores> {
+        let output = self.run_masked_batch(&mut session, sequences, mask_positions, cands_per_item);
+        drop(session);
+        let (max_len, logits) = output?;
+        let tok = self.tokenizer.as_ref()?;
+        let (shape, logits) = logits.try_extract_tensor::<f32>().ok()?;
+        let bsz = sequences.len();
+        if shape.len() != 3 || shape[0] as usize != bsz || shape[1] as usize != max_len {
+            return None;
+        }
+        let vocab_size = shape[2] as usize;
+        Some(
+            mask_positions
+                .iter()
+                .zip(cands_per_item)
+                .enumerate()
+                .map(|(batch, (&pos, candidates))| {
+                    if pos >= max_len {
+                        return vec![None; candidates.len()];
+                    }
+                    let start = (batch * max_len + pos) * vocab_size;
+                    score_masked_row(&logits[start..start + vocab_size], tok, candidates)
+                })
+                .collect(),
+        )
     }
 
     #[cfg(feature = "native-onnx")]
@@ -608,8 +653,19 @@ mod context_tests {
         let paths = crate::models::ModelPaths::bundled(Some(&assets));
         let semantic_only = HwOnnxBundle::load(&paths);
         assert!(semantic_only.hw_session.session.lock().get().is_none());
+        let tok = semantic_only.tokenizer.as_ref().unwrap();
+        let (sequence, mask_pos) = tok.encode_char_slots(&['你', '好'], Some(1));
+        let score_if_warm = |bundle: &HwOnnxBundle| {
+            bundle.try_score_rbt3_masked_batch_if_warm(
+                std::slice::from_ref(&sequence),
+                &[mask_pos],
+                &[vec!['好']],
+            )
+        };
+        assert!(score_if_warm(&semantic_only).is_none());
         assert!(semantic_only.rerank_session.session.lock().get().is_none());
         assert!(semantic_only.encode_rbt3_context(&['你', '好']).is_some());
+        assert!(score_if_warm(&semantic_only).is_some());
         assert!(semantic_only.hw_session.session.lock().get().is_none());
         let visual_only = HwOnnxBundle::load(&paths);
         assert!(visual_only.has_hw_onnx());
@@ -653,6 +709,7 @@ mod context_tests {
         let preview = std::thread::scope(|scope| {
             let guard = bundle.rerank_session.session.lock();
             scope.spawn(|| {
+                assert!(score_if_warm(&bundle).is_none());
                 tx.send(session.push_stroke_with_context(&stroke, true, &ctx))
                     .unwrap();
             });

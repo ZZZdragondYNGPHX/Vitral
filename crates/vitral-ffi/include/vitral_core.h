@@ -193,6 +193,22 @@ struct VitralStringResult vitral_process_key(struct VitralEngine *engine,
                                              VitralSwipeDir swipe_dir);
 
 /**
+ * Process a key with up to two alternate lowercase ASCII keys. Zero means absent.
+ *
+ * # Safety
+ * Caller must ensure any non-null pointer arguments are valid for reads/writes of the
+ * expected C types and any returned strings are freed via `vitral_free_string` / `vitral_free_result`.
+ */
+struct VitralStringResult vitral_process_touch_key(struct VitralEngine *engine,
+                                                   uint32_t keycode,
+                                                   uint32_t modifiers,
+                                                   VitralSwipeDir swipe_dir,
+                                                   uint32_t alt1_char,
+                                                   float alt1_penalty,
+                                                   uint32_t alt2_char,
+                                                   float alt2_penalty);
+
+/**
  * # Safety
  * Caller must ensure any non-null pointer arguments are valid for reads/writes of the
  * expected C types and any returned strings are freed via `vitral_free_string` / `vitral_free_result`.

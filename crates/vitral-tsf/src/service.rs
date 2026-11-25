@@ -815,10 +815,21 @@ impl ITfCompositionSink_Impl for Service_Impl {
 struct Action {
     cmd: &'static str,
     args: Value,
+    anchor_commit: bool,
 }
 impl Action {
     fn new(cmd: &'static str, args: Value) -> Self {
-        Self { cmd, args }
+        Self { cmd, args, anchor_commit: cmd == "select-candidate" }
+    }
+
+    fn composing_digit(code: u32, composing: bool, shift: bool) -> Option<Self> {
+        let digit = char::from_u32(code)?;
+        if !composing || shift || !('1'..='5').contains(&digit) {
+            return None;
+        }
+        let mut action = Self::new("process-key", json!({"keycode":digit.to_string()}));
+        action.anchor_commit = true;
+        Some(action)
     }
 }
 impl Service_Impl {
@@ -914,12 +925,8 @@ impl Service_Impl {
         if !composing && code == u32::from(VK_BACK.0) {
             return Some(Action::new("process-key", json!({"keycode":"BackSpace"})));
         }
-        if composing
-            && (49..=53).contains(&code)
-            && !down(0x10)
-            && ((code - 49) as usize) < view.words.len()
-        {
-            return Some(Action::new("select-candidate", json!({"idx":code-49})));
+        if let Some(action) = Action::composing_digit(code, composing, down(0x10)) {
+            return Some(action);
         }
         if code == 32 && !view.words.is_empty() && !composing {
             return Some(Action::new("select-candidate", json!({"idx":0})));
@@ -1370,7 +1377,7 @@ impl ITfEditSession_Impl for Edit_Impl {
                 let sel = self.ctx.SetSelection(ec, std::slice::from_ref(&selection));
                 ManuallyDrop::drop(&mut selection.range);
                 sel?;
-                if a.cmd == "select-candidate" && commit.is_some() && pre.is_empty() && delta == 0 {
+                if a.anchor_commit && commit.is_some() && pre.is_empty() && delta == 0 {
                     // Keep the anchor at the original end when text is inserted there.
                     if let Ok(end) = caret.Clone() {
                         if end.SetGravity(ec, TF_GRAVITY_BACKWARD, TF_GRAVITY_BACKWARD).is_ok() {
@@ -1575,6 +1582,19 @@ unsafe extern "C" fn panel_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn composing_digits_are_routed_to_process_key() {
+        for digit in '1'..='5' {
+            let action = Action::composing_digit(u32::from(digit), true, false).unwrap();
+            assert_eq!(action.cmd, "process-key");
+            assert_eq!(action.args, json!({"keycode": digit.to_string()}));
+            assert!(action.anchor_commit);
+            assert!(Action::composing_digit(u32::from(digit), false, false).is_none());
+            assert!(Action::composing_digit(u32::from(digit), true, true).is_none());
+        }
+        assert!(Action::composing_digit(u32::from('6'), true, false).is_none());
+    }
 
     #[implement(ITfComposition)]
     struct ReconnectComposition {

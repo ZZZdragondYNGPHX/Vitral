@@ -9,7 +9,7 @@ use vitral_core::eng::{OpenCcMode, SchemaKind, SwipeDir};
 use vitral_core::error::VitralError;
 use vitral_core::hw::{HwMode, StrokePoint};
 use vitral_core::imp::LexiconFormat;
-use vitral_core::VitralCore;
+use vitral_core::{TouchKeyHint, VitralCore};
 
 pub const VITRAL_ABI_VERSION: u32 = 1;
 
@@ -576,9 +576,31 @@ pub unsafe extern "C" fn vitral_process_key(
     modifiers: u32,
     swipe_dir: VitralSwipeDir,
 ) -> VitralStringResult {
+    unsafe { vitral_process_touch_key(engine, keycode, modifiers, swipe_dir, 0, 0.0, 0, 0.0) }
+}
+
+#[no_mangle]
+/// Process a key with up to two alternate lowercase ASCII keys. Zero means absent.
+///
+/// # Safety
+/// Caller must ensure any non-null pointer arguments are valid for reads/writes of the
+/// expected C types and any returned strings are freed via `vitral_free_string` / `vitral_free_result`.
+pub unsafe extern "C" fn vitral_process_touch_key(
+    engine: *mut VitralEngine,
+    keycode: u32,
+    modifiers: u32,
+    swipe_dir: VitralSwipeDir,
+    alt1_char: u32,
+    alt1_penalty: f32,
+    alt2_char: u32,
+    alt2_penalty: f32,
+) -> VitralStringResult {
+    let hint = TouchKeyHint::from_keycodes(
+        keycode, [(alt1_char, alt1_penalty), (alt2_char, alt2_penalty)],
+    );
     guard_result(|| match unsafe { engine_ref(engine) } {
         Ok(core) => match SwipeDir::try_from(swipe_dir) {
-            Ok(dir) => match core.process_key(keycode, modifiers, dir) {
+            Ok(dir) => match core.process_touch_key(keycode, modifiers, dir, hint) {
                 Ok(act) => VitralStringResult::ok_json(&act),
                 Err(e) => VitralStringResult::from_core_err(e),
             },
@@ -1135,6 +1157,38 @@ pub unsafe extern "C" fn vitral_restore_from_koofr(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn process_touch_key_roundtrips_a_corrected_candidate() {
+        unsafe {
+            let cfg = CString::new(
+                r#"{"platform":"android","schema":"rime_ice","assets_dir":"/nonexistent-vitral-assets"}"#,
+            ).unwrap();
+            let mut engine = std::ptr::null_mut();
+            assert_eq!(vitral_init(cfg.as_ptr(), &mut engine, std::ptr::null_mut()), VitralStatus::Ok);
+            for (key, alternative) in [(b'b', b'n'), (b'i', 0), (b'h', 0), (b's', b'a'), (b'o', 0)] {
+                let result = vitral_process_touch_key(
+                    engine, u32::from(key), 0, VitralSwipeDir::None,
+                    u32::MAX, f32::NAN, u32::from(alternative), 1.0,
+                );
+                assert_eq!(result.status, VitralStatus::Ok);
+                let action: serde_json::Value =
+                    serde_json::from_slice(CStr::from_ptr(result.json_utf8).to_bytes()).unwrap();
+                vitral_free_result(result);
+                if key == b'o' {
+                    assert_eq!(action["preedit"]["text"], "bihso");
+                    assert_eq!(action["candidates"][0]["text"], "你好");
+                }
+            }
+            let result = vitral_select_candidate(engine, 0);
+            assert_eq!(result.status, VitralStatus::Ok);
+            let action: serde_json::Value =
+                serde_json::from_slice(CStr::from_ptr(result.json_utf8).to_bytes()).unwrap();
+            vitral_free_result(result);
+            assert_eq!(action["commit_text"], "你好");
+            vitral_shutdown(engine);
+        }
+    }
 
     #[test]
     fn abi_version_and_init_shutdown_roundtrip() {

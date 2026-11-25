@@ -35,6 +35,7 @@ use crate::eng::{
     AppFocusState, EngineConfig, EngineState, InputAction, OpenCcMode, ReloadReport, SchemaKind,
     SwipeDir,
 };
+pub use crate::eng::{SpatialAlt, TouchKeyHint};
 use crate::error::VitralError;
 use crate::hw::{
     HandwritingPayload, HandwritingSession, HwDecodeContext, HwMode, Mode2Result, StrokePoint,
@@ -47,7 +48,7 @@ use crate::imp::{
 };
 use crate::lan::send_via_relay_with_config;
 use crate::offline_guard::OfflineGuard;
-use crate::ret::{RetentionEngine, DEFAULT_FRECENCY_HALF_LIFE_SEC};
+use crate::ret::{ClipboardCandidates, RetentionEngine, DEFAULT_FRECENCY_HALF_LIFE_SEC};
 use crate::sync::{
     sort_devices_mru, CleanupResult, LexiconSnapshotPayload, ProfileBackup, RelayDevice,
     RelayPollResult, RelaySendResult, RestoreResult,
@@ -66,6 +67,8 @@ pub struct InputState {
     pub voice: VoiceSession,
     #[cfg(feature = "native-onnx")]
     semantic_worker_running: bool,
+    #[cfg(feature = "native-onnx")]
+    neural_rerank_worker_running: bool,
 }
 
 pub struct SyncState {
@@ -155,6 +158,8 @@ pub struct VitralCore {
     profile_distill_model: Mutex<()>,
     #[cfg(feature = "native-onnx")]
     semantic_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    #[cfg(feature = "native-onnx")]
+    neural_rerank_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     sync: Arc<Mutex<SyncState>>,
 }
 
@@ -171,12 +176,15 @@ impl Drop for VitralCore {
         self.prediction.cancel();
         #[cfg(feature = "native-onnx")]
         {
-            let handle = {
-                let mut worker = self.semantic_worker.lock();
-                self.input.lock().engine.reset_commit_context();
-                worker.take()
+            let handles = {
+                let mut semantic = self.semantic_worker.lock();
+                let mut rerank = self.neural_rerank_worker.lock();
+                let mut st = self.input.lock();
+                st.engine.reset_commit_context();
+                st.engine.clear_neural_rerank_cache();
+                [semantic.take(), rerank.take()]
             };
-            if let Some(handle) = handle {
+            for handle in handles.into_iter().flatten() {
                 let _ = handle.join();
             }
         }
@@ -297,9 +305,13 @@ impl VitralCore {
                 voice,
                 #[cfg(feature = "native-onnx")]
                 semantic_worker_running: false,
+                #[cfg(feature = "native-onnx")]
+                neural_rerank_worker_running: false,
             })),
             #[cfg(feature = "native-onnx")]
             semantic_worker: Mutex::new(None),
+            #[cfg(feature = "native-onnx")]
+            neural_rerank_worker: Mutex::new(None),
             sync: Arc::new(Mutex::new(SyncState {
                 clipboard,
                 devices,
@@ -330,12 +342,15 @@ impl VitralCore {
         self.predict_cancel();
         #[cfg(feature = "native-onnx")]
         {
-            let handle = {
-                let mut worker = self.semantic_worker.lock();
-                self.input.lock().engine.cancel_pending_semantic_context();
-                worker.take()
+            let handles = {
+                let mut semantic = self.semantic_worker.lock();
+                let mut rerank = self.neural_rerank_worker.lock();
+                let mut st = self.input.lock();
+                st.engine.cancel_pending_semantic_context();
+                st.engine.clear_neural_rerank_cache();
+                [semantic.take(), rerank.take()]
             };
-            if let Some(handle) = handle {
+            for handle in handles.into_iter().flatten() {
                 let _ = handle.join();
             }
         }
@@ -402,6 +417,50 @@ impl VitralCore {
                     self.input.lock().semantic_worker_running = false;
                     drop(worker);
                     eprintln!("Vitral: failed to start semantic context worker: {error}");
+                }
+            }
+        }
+    }
+
+    fn schedule_neural_rerank(&self) {
+        #[cfg(feature = "native-onnx")]
+        {
+            let mut worker = self.neural_rerank_worker.lock();
+            let task = {
+                let mut st = self.input.lock();
+                if st.neural_rerank_worker_running {
+                    return;
+                }
+                let Some(task) = st.engine.take_neural_rerank() else { return };
+                st.neural_rerank_worker_running = true;
+                task
+            };
+            let input = Arc::downgrade(&self.input);
+            let result = std::thread::Builder::new()
+                .name("vitral-neural-rerank".into())
+                .spawn(move || {
+                    let mut task = task;
+                    loop {
+                        // Score before acquiring the input lock. The sync lock is never needed.
+                        let scores = task.score();
+                        let Some(input) = input.upgrade() else { break };
+                        let mut st = input.lock();
+                        if let Some(scores) = scores {
+                            st.engine.apply_neural_rerank(task, scores);
+                        }
+                        if let Some(next) = st.engine.take_neural_rerank() {
+                            task = next;
+                        } else {
+                            st.neural_rerank_worker_running = false;
+                            break;
+                        }
+                    }
+                });
+            match result {
+                Ok(handle) => *worker = Some(handle),
+                Err(error) => {
+                    self.input.lock().neural_rerank_worker_running = false;
+                    eprintln!("Vitral: failed to start neural rerank worker: {error}");
                 }
             }
         }
@@ -1088,6 +1147,16 @@ impl VitralCore {
         modifiers: u32,
         swipe_dir: SwipeDir,
     ) -> Result<InputAction, VitralError> {
+        self.process_touch_key(keycode, modifiers, swipe_dir, TouchKeyHint::default())
+    }
+
+    pub fn process_touch_key(
+        &self,
+        keycode: u32,
+        modifiers: u32,
+        swipe_dir: SwipeDir,
+        hint: TouchKeyHint,
+    ) -> Result<InputAction, VitralError> {
         let (act, sync_now, raw_commit) = {
             let mut st = self.input.lock();
             let before_seq = st.retention.crdt_seq;
@@ -1114,7 +1183,7 @@ impl VitralCore {
             let unmodified = modifiers == 0 && swipe_dir == SwipeDir::None;
             let raw_commit = unmodified && matches!(keycode, 0x0d | 0xff0d)
                 && !st.engine.raw_input.is_empty();
-            if unmodified {
+            if unmodified && !st.engine.is_filter_tone_key(keycode) {
                 let index = match keycode {
                     0x20 if st.engine.lang_mode == eng::LangMode::Zh => Some(0),
                     0x31..=0x35 if st.engine.lang_mode == eng::LangMode::Zh && !st.engine.raw_input.is_empty() => Some((keycode - 0x31) as usize),
@@ -1132,18 +1201,13 @@ impl VitralCore {
             let mut sync_st = self.sync.lock();
             let act = if raw_commit {
                 let passthrough = engine.is_passthrough_active();
-                let raw = if passthrough {
-                    engine.raw_input.clone()
-                } else {
-                    let prefix: String = engine.composing.chars().take_while(|c| !c.is_ascii()).collect();
-                    format!("{}{}", prefix, engine.raw_input)
-                };
+                let raw = engine.raw_commit_text();
                 engine.settle_undo_regret(None, retention);
                 engine.clear_composition_state();
                 engine.commit_action(Some(raw), !passthrough)
             } else {
                 let imported = self.imported_lexicon.read();
-                engine.process_key(keycode, modifiers, swipe_dir, &sync_st.clipboard, &imported, retention)?
+                engine.process_touch_key(keycode, modifiers, swipe_dir, hint, &sync_st.clipboard, &imported, retention)?
             };
             let changed = retention.crdt_seq != before_seq || modifiers & eng::MOD_LANG_TOGGLE != 0;
             let background_sync = engine.config.background_sync;
@@ -1152,6 +1216,7 @@ impl VitralCore {
             }
             (act, changed && !background_sync, raw_commit)
         };
+        self.schedule_neural_rerank();
         if sync_now {
             self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
@@ -1201,6 +1266,7 @@ impl VitralCore {
             }
             (action, changed && !background_sync)
         };
+        self.schedule_neural_rerank();
         if sync_now {
             self.sync_tier1_best_effort(Tier1Sync::Changed);
         }
@@ -1609,18 +1675,28 @@ impl VitralCore {
             st.retention.learned_reset_ms
         };
         // Annotation may initialize a corpus; hold neither input nor sync while it runs.
-        let mut harvested = RetentionEngine::default();
-        harvested.harvest_clipboard_text(&payload.content, |phrase| {
-            let corpus = Arc::clone(self.imported_lexicon.read().corpus());
-            let ann = imp::polyphone::PolyphoneAnnotator::new(corpus).annotate_text(phrase);
-            (
-                ann.untoned.split_whitespace().collect(),
-                imp::xiaohe::pinyin_phrase_to_xiaohe(&ann.untoned),
-            )
+        let cached_annotator = std::cell::OnceCell::new();
+        let annotator = || {
+            cached_annotator.get_or_init(|| {
+                let corpus = Arc::clone(self.imported_lexicon.read().corpus());
+                imp::polyphone::PolyphoneAnnotator::new(corpus)
+            })
+        };
+        let candidates = ClipboardCandidates::extract(&payload.content, |chars| {
+            annotator().corpus().lookup_word_chars(chars).is_some()
+                || self
+                    .imported_lexicon
+                    .read()
+                    .lookup_imported_score_chars(chars)
+                    .is_some()
         });
-        if harvested.user_phrases.is_empty() && harvested.user_english.is_empty() {
+        if candidates.is_empty() {
             return;
         }
+        let readings = candidates.annotate(|phrase| {
+            let ann = annotator().annotate_text(phrase);
+            (ann.untoned, ann.xiaohe)
+        });
         let changed = {
             let mut st = self.input.lock();
             if !st.engine.config.adaptive_learning
@@ -1631,12 +1707,9 @@ impl VitralCore {
             }
             let before = st.retention.crdt_seq;
             st.retention
-                .harvest_clipboard_text(&payload.content, |word| {
-                    harvested
-                        .user_phrases
-                        .get(word)
-                        .map(|p| (p.quanpin.clone(), p.xiaohe.clone()))
-                        .unwrap_or_default()
+                .apply_clipboard_candidates(candidates, |word| {
+                    let (quanpin, xiaohe) = &readings[word];
+                    (quanpin.as_str(), xiaohe.as_str())
                 });
             st.retention.crdt_seq != before
         };
@@ -7962,7 +8035,7 @@ mod device_regression_tests {
             let core = temp.core();
             let index = {
                 let mut st = core.input.lock();
-                st.engine.raw_input = "wo'yaoquka".into();
+                st.engine.set_raw_input("wo'yaoquka".into());
                 let imp = core.imported_lexicon.read();
                 let clip = core.sync.lock();
                 let InputState {
@@ -8042,7 +8115,7 @@ mod device_regression_tests {
                     {
                         let mut st = core.input.lock();
                         st.engine.config.prediction_enabled = enabled;
-                        st.engine.raw_input = raw.into();
+                        st.engine.set_raw_input(raw.into());
                         st.engine.composing = composing.into();
                     }
                     assert_eq!(
@@ -8493,6 +8566,34 @@ mod input_feature_tests {
         fn drop(&mut self) {
             // Core has no pending network jobs in these offline fixtures.
             let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn precision_tone_key_precedes_function_selection_only_after_the_marker() {
+        for schema in [SchemaKind::RimeIce, SchemaKind::DoublePinyinFlypy] {
+            let f = Fixture::new(schema, true);
+            f.add_words(&[("妈", "ma")]);
+            {
+                let mut state = f.core.input.lock();
+                state.engine.config.shortcuts = vec![shortcuts::ShortcutBinding {
+                    action: shortcuts::ShortcutAction::Settings,
+                    key: String::new(),
+                    text: "ma".into(),
+                }];
+            }
+            f.type_code("ma");
+            assert_eq!(f.key('1' as u32).function_action, Some(shortcuts::ShortcutAction::Settings));
+            let marker = f.type_code("ma`");
+            assert_eq!(marker.candidates[0].function_action, Some(shortcuts::ShortcutAction::Settings));
+            let filtered = f.key('1' as u32);
+            assert_eq!(filtered.preedit.text, "ma`1");
+            assert_eq!(filtered.candidates[0].text, "妈");
+            assert!(filtered.function_action.is_none());
+            assert_eq!(f.key('1' as u32).commit_text.as_deref(), Some("妈"));
+            assert_eq!(f.core.input.lock().retention.code_preferences["ma"].len(), 1);
+            f.type_code("ma`1");
+            assert_eq!(f.key(0xff0d).commit_text.as_deref(), Some("ma`1"));
         }
     }
 

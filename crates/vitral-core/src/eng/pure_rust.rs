@@ -1,7 +1,11 @@
+use super::english::{lookup_core_english, EnglishDictionary};
 use crate::eng::gram::RimeGramDb;
 #[cfg(test)]
 use crate::eng::quanpin::{decode_quanpin_with_fuzzy, decode_xiaohe_long_context};
-use crate::eng::quanpin::{decode_quanpin_context, decode_xiaohe_context, FuzzyPairs, QuanpinCandidate};
+#[cfg(test)]
+use crate::eng::quanpin::decode_quanpin_context;
+use crate::eng::quanpin::{decode_quanpin_with_touch, decode_xiaohe_with_touch, FuzzyPairs, QuanpinCandidate};
+use crate::eng::spatial::TouchKeyHint;
 use crate::eng::{CandidateItem, OpenCcMode, PageInfo, SchemaKind, TypoCorrectionLevel};
 use crate::imp::polyphone::RimeDictCorpus;
 use crate::imp::ImportedLexiconIndex;
@@ -11,113 +15,58 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use vitral_tokens::TOKENS;
 
-// Canonical casing is shared by the native and pure-Rust candidate paths.
-pub(super) fn mixed_english<'a>(
-    raw: &str,
-    retention: Option<&'a RetentionEngine>,
-) -> Option<&'a str> {
-    const WORDS: &[&str] = &[
-        "OK",
-        "App",
-        "iPhone",
-        "iPad",
-        "Mac",
-        "GitHub",
-        "VSCode",
-        "Python",
-        "Rust",
-        "Java",
-        "Linux",
-        "Android",
-        "Windows",
-        "Wi-Fi",
-        "PDF",
-        "API",
-        "URL",
-        "HTTP",
-        "JSON",
-        "SQL",
-        "AI",
-        "LLM",
-        "CPU",
-        "GPU",
-        "RAM",
-        "USB",
-        "VPN",
-        "UI",
-        "UX",
-        "Git",
-        "Docker",
-        "Chrome",
-        "WeChat",
-        "Google",
-        "Apple",
-        "Email",
-        "Gmail",
-        "Office",
-        "Excel",
-        "Word",
-        "PPT",
-        "Hello",
-        "Thanks",
-        "Sorry",
-        "Please",
-        "Test",
-        "Demo",
-        "Beta",
-        "Pro",
-        "Max",
-        "Mini",
-        "Plus",
-        "VIP",
-        "TODO",
-        "BUG",
-        "Fix",
-        "WebDAV",
-        "Koofr",
-        "Vitral",
-        "OpenAI",
-        "ChatGPT",
-        "HTML",
-        "CSS",
-        "JavaScript",
-        "TypeScript",
-        "React",
-        "Node",
-        "NPM",
-        "SDK",
-        "IDE",
-        "HTTPS",
-        "TCP",
-        "IP",
-        "DNS",
-        "SSH",
-        "FTP",
-        "SSD",
-        "HDD",
-        "WiFi",
-        "Bluetooth",
-        "Zoom",
-    ];
-    if raw.len() < 2 || !raw.bytes().all(|b| b.is_ascii_lowercase()) {
-        return None;
-    }
-    retention
-        .and_then(|r| r.query_user_english(raw))
-        .or_else(|| {
-            WORDS
-                .iter()
-                .copied()
-                .find(|word| word.eq_ignore_ascii_case(raw))
-        })
-        .filter(|word| !retention.is_some_and(|r| r.erased_words.contains(*word)))
-}
-
 #[derive(Debug)]
 pub(crate) struct DecodedCandidate {
     pub item: CandidateItem,
     pub canonical: String,
     pub consumed_len: usize,
+    pub lm_score: f64,
+    pub spatial_edits: u8,
+    pub spatial_guarded: bool,
+}
+
+impl DecodedCandidate {
+    pub(super) fn language(
+        word: &str,
+        text: String,
+        comment: &str,
+        consumed_len: usize,
+        retention: Option<&RetentionEngine>,
+    ) -> Option<Self> {
+        if retention.is_some_and(|r| r.erased_words.contains(word) || r.erased_words.contains(&text)) {
+            return None;
+        }
+        let pinned = retention.is_some_and(|r| {
+            r.pinned_words.contains(word) || r.pinned_words.contains(&text)
+        });
+        Some(Self {
+            item: CandidateItem {
+                index: 0,
+                text,
+                comment: comment.into(),
+                pinned,
+                is_clipboard_shortcut: false,
+                quick_paste_id: None,
+                function_action: None,
+                shortcut_code: None,
+                frecency_score: 0.0,
+            },
+            canonical: word.into(),
+            consumed_len,
+            lm_score: 0.0,
+            spatial_edits: 0,
+            spatial_guarded: false,
+        })
+    }
+}
+
+pub(super) const PERSONAL_PRIORITY_THRESHOLD: f64 = 0.5;
+
+pub(super) fn personal_boost(frecency_score: f64) -> f64 {
+    // Express personal history in decoder score units, with diminishing gains
+    // and a finite limit even for long-running histories.
+    let log_score = frecency_score.max(0.0).ln_1p();
+    24.0 * (1.0 - 1.5 / (1.5 + log_score * log_score))
 }
 
 #[derive(Debug)]
@@ -127,6 +76,7 @@ pub struct PureRustEngine {
     corpus_cache_dir: Option<PathBuf>,
     corpus: OnceLock<Arc<RimeDictCorpus>>,
     gram: OnceLock<Option<Arc<RimeGramDb>>>,
+    english: OnceLock<Arc<EnglishDictionary>>,
     #[cfg(all(test, target_os = "linux", feature = "native-rime"))]
     pub(super) decode_calls: std::cell::Cell<usize>,
     pub(super) confirmed_prefix: String,
@@ -151,6 +101,7 @@ impl PureRustEngine {
             grammar_path: crate::models::ModelPaths::bundled(assets_dir).grammar,
             corpus: OnceLock::new(),
             gram: OnceLock::new(),
+            english: OnceLock::new(),
             #[cfg(all(test, target_os = "linux", feature = "native-rime"))]
             decode_calls: std::cell::Cell::new(0),
             confirmed_prefix: String::new(),
@@ -169,6 +120,8 @@ impl PureRustEngine {
         self.grammar_path = crate::models::ModelPaths::bundled(assets_dir).grammar;
         self.corpus = OnceLock::new();
         self.gram = OnceLock::new();
+        self.english = OnceLock::new();
+        EnglishDictionary::invalidate(assets_dir);
     }
 
     pub fn set_model_paths(&mut self, paths: &crate::models::ModelPaths) {
@@ -183,6 +136,11 @@ impl PureRustEngine {
                 self.corpus_cache_dir.as_deref(),
             )
         })
+    }
+
+    pub(super) fn english_dictionary(&self) -> &EnglishDictionary {
+        self.english
+            .get_or_init(|| EnglishDictionary::open_cached(self.assets_dir.as_deref()))
     }
 
     pub(crate) fn get_gram(&self) -> Option<&RimeGramDb> {
@@ -464,7 +422,7 @@ impl PureRustEngine {
         adaptive: bool,
     ) -> Vec<DecodedCandidate> {
         self.query_candidates_with_prediction(
-            raw_input, schema, opencc_mode, imported, retention, prev_context, app_id, adaptive,
+            raw_input, schema, opencc_mode, imported, retention, prev_context, app_id, adaptive, None,
         )
         .0
     }
@@ -480,10 +438,11 @@ impl PureRustEngine {
         prev_context: Option<&str>,
         app_id: Option<&str>,
         adaptive: bool,
+        touch_hints: Option<&[TouchKeyHint]>,
     ) -> (Vec<DecodedCandidate>, Option<(String, f64)>) {
-        let decoded = self.decode_candidates(raw_input, schema, imported, retention);
+        let decoded = self.decode_candidates(raw_input, schema, imported, retention, touch_hints);
         self.rank_candidates(&decoded, raw_input, schema, opencc_mode, imported, retention,
-            prev_context, app_id, adaptive)
+            prev_context, app_id, adaptive, Some(self.english_dictionary()))
     }
 
     pub(super) fn decode_candidates(
@@ -492,6 +451,7 @@ impl PureRustEngine {
         schema: SchemaKind,
         imported: Option<&ImportedLexiconIndex>,
         retention: Option<&RetentionEngine>,
+        touch_hints: Option<&[TouchKeyHint]>,
     ) -> Vec<QuanpinCandidate> {
         if raw_input.is_empty() {
             return Vec::new();
@@ -503,7 +463,7 @@ impl PureRustEngine {
         let gram = self.get_gram();
         let fuzzy = if self.fuzzy_pinyin { self.fuzzy_pairs } else { FuzzyPairs::NONE };
         let mut decoded = match schema {
-            SchemaKind::RimeIce => decode_quanpin_context(
+            SchemaKind::RimeIce => decode_quanpin_with_touch(
                 raw_input,
                 corpus,
                 gram,
@@ -514,8 +474,9 @@ impl PureRustEngine {
                 self.syllable_split,
                 &self.confirmed_prefix,
                 self.typo_correction_level,
+                touch_hints,
             ),
-            SchemaKind::DoublePinyinFlypy => decode_xiaohe_context(
+            SchemaKind::DoublePinyinFlypy => decode_xiaohe_with_touch(
                 raw_input,
                 corpus,
                 gram,
@@ -525,6 +486,7 @@ impl PureRustEngine {
                 fuzzy,
                 &self.confirmed_prefix,
                 self.typo_correction_level,
+                touch_hints,
             ),
         };
 
@@ -557,30 +519,30 @@ impl PureRustEngine {
         prev_context: Option<&str>,
         app_id: Option<&str>,
         adaptive: bool,
+        dictionary: Option<&EnglishDictionary>,
     ) -> (Vec<DecodedCandidate>, Option<(String, f64)>) {
         if raw_input.is_empty() {
             return (Vec::new(), None);
         }
         let corpus = self.get_corpus();
         let xiaohe_fuzzy = schema == SchemaKind::DoublePinyinFlypy && self.fuzzy_pinyin;
-        let exact_reading = |syllables: &[String]| {
+        let matches_reading = |syllables: &[String], code: &str| {
             syllables
                 .iter()
                 .all(|s| crate::imp::xiaohe::canonical_syllable_set().contains(s.as_str()))
                 && super::quanpin::matches_exact_reading(
-                    syllables, raw_input, schema == SchemaKind::DoublePinyinFlypy,
+                    syllables, code, schema == SchemaKind::DoublePinyinFlypy,
                 )
         };
-        let has_exact_chinese = decoded.iter().any(|c| {
-            c.consumed_len == raw_input.len()
-                && c.segments.len() == 1
-                && c.text.chars().all(crate::ret::is_cjk)
-                && exact_reading(&c.syllables)
-                && !retention.is_some_and(|r| r.erased_words.contains(&c.text))
-        }) || retention.is_some_and(|r| {
+        let exact_reading = |syllables: &[String]| matches_reading(syllables, raw_input);
+        let mut has_exact_chinese = retention.is_some_and(|r| {
             !r.query_user_phrases(raw_input, schema == SchemaKind::DoublePinyinFlypy)
                 .is_empty()
         });
+        let mut has_complete_chinese = has_exact_chinese;
+        let mut has_abbreviated_chinese = false;
+        let short_quanpin = dictionary.is_some() && schema == SchemaKind::RimeIce
+            && raw_input.len() <= 4 && raw_input.bytes().all(|b| b.is_ascii_lowercase());
         let leading_weight = retention.map_or(0, |_| {
             decoded.iter()
                 .filter(|c| c.consumed_len == raw_input.len() && exact_reading(&c.syllables))
@@ -603,8 +565,10 @@ impl PureRustEngine {
         };
         for cand in exact.into_iter().chain(other) {
             let flypy = schema == SchemaKind::DoublePinyinFlypy;
-            let reading = if schema == SchemaKind::RimeIce {
+            let reading = if !flypy {
                 cand.syllables.concat()
+            } else if cand.spatial_edits > 0 {
+                crate::imp::xiaohe::pinyin_phrase_to_xiaohe(&cand.syllables.join(" "))
             } else {
                 raw_input[..cand.consumed_len].to_string()
             };
@@ -619,6 +583,28 @@ impl PureRustEngine {
                 })
             {
                 continue;
+            }
+            let exact = cand.consumed_len == raw_input.len() && exact_reading(&cand.syllables);
+            if cand.consumed_len == raw_input.len() && cand.text.chars().all(crate::ret::is_cjk) {
+                if exact {
+                    has_complete_chinese = true;
+                    has_exact_chinese |= cand.segments.len() == 1;
+                } else if cand.spatial_edits > 0 {
+                    has_complete_chinese = true;
+                } else if short_quanpin && !has_abbreviated_chinese && cand.segments.len() == 1 {
+                    // A fully covered abbreviation such as ru + g can have a strong
+                    // Chinese match even though the input has no exact pinyin reading.
+                    let ends_in_initial = cand.syllables.split_last().is_some_and(|(last, prefix)| {
+                        !prefix.is_empty() && (1..=2).any(|len| {
+                            let (full, initial) = raw_input.split_at(raw_input.len().saturating_sub(len));
+                            super::quanpin::is_initial_token(initial)
+                                && last.starts_with(initial)
+                                && matches_reading(prefix, full)
+                        })
+                    });
+                    has_abbreviated_chinese = ends_in_initial
+                        || corpus.abbreviations(raw_input).any(|(word, _)| word == cand.text);
+                }
             }
             let converted = pure_rust_opencc(opencc_mode, &cand.text);
             if !seen.insert(converted.clone()) {
@@ -644,7 +630,6 @@ impl PureRustEngine {
                     }
                 })
                 .unwrap_or(0.0);
-            let exact = cand.consumed_len == raw_input.len() && exact_reading(&cand.syllables);
             let single_syllable = cand.syllables.len() == 1;
             let comment = cand.syllables.join(" ");
             let item = CandidateItem {
@@ -662,11 +647,15 @@ impl PureRustEngine {
                 item,
                 canonical: cand.text.clone(),
                 consumed_len: cand.consumed_len,
+                lm_score: cand.score - cand.full_span_frecency_bonus,
+                spatial_edits: cand.spatial_edits,
+                spatial_guarded: cand.spatial_guarded,
             };
             if pinned && decoded.consumed_len == raw_input.len() && (!xiaohe_fuzzy || exact) {
                 pinned_items.push(decoded);
             } else {
-                ranked.push((decoded, cand.score, exact, single_syllable));
+                let score = decoded.lm_score + personal_boost(decoded.item.frecency_score);
+                ranked.push((decoded, score, exact, single_syllable));
             }
         }
 
@@ -683,31 +672,26 @@ impl PureRustEngine {
                     (single_query && *b_single && *b_exact)
                         .cmp(&(single_query && *a_single && *a_exact))
                 })
-                .then_with(|| {
-                    let a_frecency = a.item.frecency_score.max(0.0);
-                    let b_frecency = b.item.frecency_score.max(0.0);
-                    if single_query || !self.fuzzy_pinyin {
-                        b_frecency.total_cmp(&a_frecency).then_with(|| b_score.total_cmp(a_score))
-                    } else {
-                        (b_score + b_frecency).total_cmp(&(a_score + a_frecency))
-                    }
-                })
+                .then_with(|| b_score.total_cmp(a_score))
                 .then_with(|| b.consumed_len.cmp(&a.consumed_len))
                 .then_with(|| b_exact.cmp(a_exact))
         });
         let mut normal_items: Vec<_> = ranked
             .into_iter()
-            .map(|(candidate, score, _, _)| (candidate, score))
+            .map(|(candidate, _, _, _)| candidate)
             .collect();
         let personal_count = normal_items
             .iter()
-            .take_while(|(c, _)| c.consumed_len == raw_input.len() && c.item.frecency_score > 0.0)
+            .take_while(|c| {
+                c.consumed_len == raw_input.len()
+                    && c.item.frecency_score >= PERSONAL_PRIORITY_THRESHOLD
+            })
             .count();
-        pinned_items.extend(normal_items.drain(..personal_count).map(|(c, _)| c));
+        pinned_items.extend(normal_items.drain(..personal_count));
         // Keep typo/completion ranking intact until there is an exact full reading.
         let has_sentence = pinned_items
             .iter()
-            .chain(normal_items.iter().map(|(c, _)| c))
+            .chain(&normal_items)
             .any(|c| {
                 c.consumed_len == raw_input.len()
                     && c.item.comment.split_whitespace().count() > 1
@@ -720,16 +704,16 @@ impl PureRustEngine {
             });
         let has_partial = normal_items
             .iter()
-            .any(|(c, _)| c.consumed_len < raw_input.len());
+            .any(|c| c.consumed_len < raw_input.len());
         if has_sentence && has_partial {
             let mut full = Vec::new();
             let mut prefixes = Vec::new();
             let mut singles = Vec::new();
             let mut remaining = Vec::new();
             let mut lengths = HashSet::new();
-            for (candidate, score) in normal_items {
+            for candidate in normal_items {
                 if candidate.consumed_len == raw_input.len() {
-                    full.push((candidate, score));
+                    full.push(candidate);
                 } else if candidate.canonical.chars().count() > 1
                     && (schema == SchemaKind::DoublePinyinFlypy || {
                         let reading: String = candidate.item.comment.split_whitespace().collect();
@@ -752,17 +736,17 @@ impl PureRustEngine {
                     })
                     && lengths.insert(candidate.consumed_len)
                 {
-                    prefixes.push((candidate, score));
+                    prefixes.push(candidate);
                 } else if candidate.canonical.chars().count() == 1
                     && candidate.item.comment.split_whitespace().count() == 1
                 {
                     let frequency = corpus
                         .spaced_pinyin_words(&candidate.item.comment)
                         .find(|(w, _)| *w == candidate.canonical)
-                        .map_or(score, |(_, weight)| (weight as f64 + 1.0).ln());
+                        .map_or(candidate.lm_score, |(_, weight)| (weight as f64 + 1.0).ln());
                     singles.push((candidate, frequency));
                 } else {
-                    remaining.push((candidate, score));
+                    remaining.push(candidate);
                 }
             }
             // Preserve the best sentences, then expose selectable prefixes and homophones.
@@ -771,33 +755,52 @@ impl PureRustEngine {
             let rest_full = full.split_off(head_count);
             let rest_singles = singles.split_off(singles.len().min(2));
             full.extend(prefixes);
-            full.extend(singles);
+            full.extend(singles.into_iter().map(|(candidate, _)| candidate));
             full.extend(rest_full);
             full.extend(remaining);
-            full.extend(rest_singles);
+            full.extend(rest_singles.into_iter().map(|(candidate, _)| candidate));
             normal_items = full;
         }
-        pinned_items.extend(normal_items.into_iter().map(|(candidate, _)| candidate));
-        if let Some(word) = mixed_english(raw_input, retention) {
-            let at = usize::from(has_exact_chinese).min(pinned_items.len());
-            pinned_items.insert(
-                at,
-                DecodedCandidate {
-                    item: CandidateItem {
-                        index: at,
-                        text: word.into(),
-                        comment: "英文".into(),
-                        pinned: false,
-                        is_clipboard_shortcut: false,
-                        quick_paste_id: None,
-                        function_action: None,
-                        shortcut_code: None,
-                        frecency_score: 0.0,
-                    },
-                    canonical: word.into(),
-                    consumed_len: raw_input.len(),
-                },
-            );
+        pinned_items.extend(normal_items);
+        let mut insert_language = |at: usize, word: &str, text: String, comment: &str| {
+            let Some(candidate) = DecodedCandidate::language(word, text, comment, raw_input.len(), retention) else {
+                return;
+            };
+            if seen.insert(candidate.item.text.clone()) {
+                let pinned_end = pinned_items.iter().take_while(|c| c.item.pinned).count();
+                let target = if candidate.item.pinned {
+                    pinned_end
+                } else {
+                    pinned_end + at
+                };
+                pinned_items.insert(target.min(pinned_items.len()), candidate);
+            }
+        };
+        let exact_english = match dictionary {
+            Some(dictionary) => dictionary.lookup_english(raw_input, retention),
+            None => lookup_core_english(raw_input, retention),
+        };
+        let exact_word_at = usize::from(has_exact_chinese);
+        if let Some(word) = exact_english {
+            let at = if dictionary.is_some() && raw_input.len() <= 4
+                && (has_complete_chinese || has_abbreviated_chinese)
+                && lookup_core_english(raw_input, retention) != Some(word)
+            {
+                3
+            } else {
+                exact_word_at
+            };
+            insert_language(at, word, word.to_owned(), "英文");
+        } else if let Some(dictionary) = dictionary.filter(|_| !has_complete_chinese) {
+            let at = if has_abbreviated_chinese { 3 } else { 0 };
+            for (offset, word) in dictionary.complete_english(raw_input, retention, 2).into_iter().enumerate() {
+                insert_language(at + offset, word, word.to_owned(), "英文");
+            }
+        }
+        if let Some(dictionary) = dictionary {
+            for (offset, word) in dictionary.lookup_cn_en(raw_input, schema, retention).enumerate() {
+                insert_language(exact_word_at + offset, word, pure_rust_opencc(opencc_mode, word), "中英");
+            }
         }
         let prediction = prev_context
             .filter(|_| !self.confirming_initials)
@@ -833,12 +836,20 @@ impl PureRustEngine {
                 });
                 let text = pure_rust_opencc(opencc_mode, word);
                 let pinned = retention.is_some_and(|r| r.pinned_words.contains(word));
-                pinned_items.retain(|c| c.item.text != text);
+                let (lm_score, spatial_edits, spatial_guarded) = pinned_items
+                    .iter()
+                    .position(|c| c.item.text == text)
+                    .map_or((0.0, 0, false), |index| {
+                        let candidate = pinned_items.remove(index);
+                        (candidate.lm_score, candidate.spatial_edits, candidate.spatial_guarded)
+                    });
                 let at = pinned_items
                     .iter()
                     .rposition(|c| {
                         c.item.pinned
-                            || (!pinned && c.item.frecency_score.max(0.0) > frecency_score.max(0.0))
+                            || (!pinned
+                                && c.item.frecency_score >= PERSONAL_PRIORITY_THRESHOLD
+                                && c.item.frecency_score > frecency_score.max(0.0))
                     })
                     .map_or(0, |index| index + 1);
                 pinned_items.insert(
@@ -857,6 +868,9 @@ impl PureRustEngine {
                         },
                         canonical: word.clone(),
                         consumed_len: raw_input.len(),
+                        lm_score,
+                        spatial_edits,
+                        spatial_guarded,
                     },
                 );
             }
@@ -877,6 +891,9 @@ impl PureRustEngine {
                 },
                 canonical: raw_input.to_string(),
                 consumed_len: raw_input.len(),
+                lm_score: 0.0,
+                spatial_edits: 0,
+                spatial_guarded: false,
             });
         }
         for (i, candidate) in pinned_items.iter_mut().enumerate() {
@@ -966,6 +983,45 @@ pub fn pure_rust_opencc(mode: OpenCcMode, mut text: &str) -> String {
 #[cfg(test)]
 mod device_tests {
     use super::*;
+
+    #[test]
+    fn bundled_mixed_language_candidates_follow_schema_and_opencc() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let mut engine = PureRustEngine::new(None);
+        let query = |engine: &PureRustEngine, code, schema, retention| {
+            engine.query_all_candidates_contextual(
+                code, schema, OpenCcMode::Traditional, None, retention, None, None, true,
+            )
+        };
+        assert!(!query(&engine, "xguang", SchemaKind::RimeIce, None)
+            .iter().any(|c| c.item.comment == "中英"));
+        engine.reload_assets(Some(&assets));
+        for (schema, code, word) in [
+            (SchemaKind::RimeIce, "xguang", "X光"),
+            (SchemaKind::DoublePinyinFlypy, "xgl", "X光"),
+            (SchemaKind::RimeIce, "txu", "T恤"),
+            (SchemaKind::DoublePinyinFlypy, "txu", "T恤"),
+            (SchemaKind::RimeIce, "adgainai", "AD鈣奶"),
+            (SchemaKind::DoublePinyinFlypy, "adgdnd", "AD鈣奶"),
+        ] {
+            let candidates = query(&engine, code, schema, None);
+            assert_eq!(candidates[0].item.text, word, "{code}");
+            assert_eq!(candidates[0].item.comment, "中英", "{code}");
+        }
+        let candidates = query(&engine, "agu", SchemaKind::RimeIce, None);
+        assert!(candidates[0].item.text.chars().all(crate::ret::is_cjk));
+        assert_eq!(candidates[1].item.text, "A股");
+        assert_eq!(candidates[1].item.comment, "中英");
+        let candidates = query(&engine, "shang", SchemaKind::RimeIce, None);
+        assert!(!candidates.iter().any(|c| c.item.comment == "英文"));
+        let mut retention = RetentionEngine::default();
+        retention.erased_words.insert("AD钙奶".to_owned());
+        assert!(!query(&engine, "adgainai", SchemaKind::RimeIce, Some(&retention))
+            .iter().any(|c| c.item.text == "AD鈣奶"));
+        engine.reload_assets(None);
+        assert!(!query(&engine, "xguang", SchemaKind::RimeIce, None)
+            .iter().any(|c| c.item.comment == "中英"));
+    }
 
     #[test]
     fn xiaohe_fuzzy_candidates_follow_exact_matches_even_with_personal_weight() {
@@ -1242,7 +1298,7 @@ mod device_tests {
         }
         let code = "womenjintianquchifna";
         engine.fuzzy_pinyin = true;
-        let decoded = engine.decode_candidates(code, SchemaKind::RimeIce, None, None);
+        let decoded = engine.decode_candidates(code, SchemaKind::RimeIce, None, None, None);
         assert!(
             decoded.iter().any(|c| {
                 c.text == "我们今天去吃饭"
@@ -1764,5 +1820,77 @@ mod device_tests {
                 .item
                 .pinned
         );
+    }
+
+    #[test]
+    fn full_span_word_history_is_counted_once_in_final_ranking() {
+        let mut engine = PureRustEngine::new(None);
+        engine.typo_correction_level = TypoCorrectionLevel::Off;
+        let mut imported = ImportedLexiconIndex::new(None);
+        let preferred = "你号";
+        let learned = "妮好";
+        imported.inject_hotwords(&[(preferred, 2_000), (learned, 1_000)].map(|(word, weight)| {
+            crate::imp::ImportedLexiconEntry {
+                text: word.into(),
+                pinyin: "ni hao".into(),
+                toned_pinyin: "nǐ hǎo".into(),
+                xiaohe: "nihc".into(),
+                weight,
+            }
+        }));
+        let mut retention = RetentionEngine::default();
+        let now = RetentionEngine::now_epoch_ms();
+        let three_half_lives_ms = (retention.half_life_sec * 3_000.0) as u64;
+        retention.record_selection_at(learned, now - three_half_lives_ms, 2.0);
+        let code = "nihao";
+        let schema = SchemaKind::RimeIce;
+        let decoded = engine.decode_candidates(code, schema, Some(&imported), Some(&retention), None);
+        let from_beam = decoded.iter().find(|c| c.text == learned).unwrap();
+        assert_eq!(from_beam.segments, [learned]);
+        assert!(from_beam.full_span_frecency_bonus > 0.0);
+
+        let (ranked, _) = engine.rank_candidates(
+            &decoded, code, schema, OpenCcMode::Simplified, Some(&imported),
+            Some(&retention), None, None, true, None,
+        );
+        let top = &ranked[0];
+        let learned = ranked.iter().find(|c| c.canonical == learned).unwrap();
+        let boost = personal_boost(learned.item.frecency_score);
+        assert!(from_beam.score + boost > top.lm_score);
+        assert!(learned.lm_score + boost < top.lm_score);
+        assert_eq!(top.canonical, preferred);
+    }
+
+    #[test]
+    fn decayed_history_keeps_common_words_and_sentences_first() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let engine = PureRustEngine::new(Some(&assets));
+        let now = RetentionEngine::now_epoch_ms();
+        for (code, expected) in [("ni", "你"), ("jintiantianqizhenhao", "今天天气真好")] {
+            let query = |retention| {
+                engine.query_all_candidates_contextual(
+                    code,
+                    SchemaKind::RimeIce,
+                    OpenCcMode::Simplified,
+                    None,
+                    retention,
+                    None,
+                    None,
+                    true,
+                )
+            };
+            let baseline = query(None);
+            assert_eq!(baseline[0].canonical, expected);
+            let old = baseline.iter()
+                .find(|c| c.consumed_len == code.len() && baseline[0].lm_score - c.lm_score > 1.0)
+                .unwrap_or_else(|| panic!("{code}: missing a full-span alternative"));
+            let mut retention = RetentionEngine::default();
+            let six_half_lives_ms = (retention.half_life_sec * 6_000.0) as u64;
+            retention.record_selection_at(&old.canonical, now - six_half_lives_ms, 3.2);
+            assert!((retention.decayed_score_at(&old.canonical, now) - 0.05).abs() < 1e-9);
+            let ranked = query(Some(&retention));
+            assert_eq!(ranked[0].canonical, expected, "{code}: {:?}", &ranked[..2]);
+            assert!(ranked.iter().any(|c| c.canonical == old.canonical));
+        }
     }
 }

@@ -1106,6 +1106,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         event.unicodeChar.toChar().toString()
                     keyCode in KeyEvent.KEYCODE_0..KeyEvent.KEYCODE_9 && composing ->
                         event.unicodeChar.toChar().toString()
+                    composing &&
+                        !english &&
+                        !event.isShiftPressed &&
+                        event.unicodeChar.let { it == '`'.code || it == '['.code || it == ']'.code } ->
+                        event.unicodeChar.toChar().toString()
                     else -> null
                 }
             if (text != null) {
@@ -1220,6 +1225,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         keycode: Int,
         modifiers: Int = 0,
         swipeDir: Int = 0,
+        touchHint: SpatialTouchHint? = null,
         onComplete: () -> Unit = {},
         onSameEditorPanelSwitched: ((JSONObject) -> Unit)? = null,
         done: (JSONObject) -> Unit = {},
@@ -1227,7 +1233,24 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         runNativeAction(
             onComplete = onComplete,
             onSameEditorPanelSwitched = onSameEditorPanelSwitched,
-            operation = { h -> unpack(VitralNative.processKey(h, keycode, modifiers, swipeDir)) as JSONObject },
+            operation = { h ->
+                val raw =
+                    if (touchHint != null && !touchHint.isEmpty) {
+                        VitralNative.processTouchKey(
+                            h,
+                            keycode,
+                            modifiers,
+                            swipeDir,
+                            touchHint.alt1Char,
+                            touchHint.alt1Penalty,
+                            touchHint.alt2Char,
+                            touchHint.alt2Penalty,
+                        )
+                    } else {
+                        VitralNative.processKey(h, keycode, modifiers, swipeDir)
+                    }
+                unpack(raw) as JSONObject
+            },
             done = done,
         )
 
@@ -4653,8 +4676,22 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         // Non-zero modifier prevents core from triggering undo on queued BackSpace when host
         // has not pre-verified & deleted the committed text synchronously.
         val keyModifiers = if (backspace && preDeletedUndoText == null) 1 else 0
+        val touchHint =
+            if (::body.isInitialized) {
+                val isChineseLetter = !english && keyModifiers == 0 && nativeCode in 'a'.code..'z'.code
+                val hint = body.consumeCommittedTouchHint(recordBias = isChineseLetter)
+                if (isChineseLetter && !hint.isEmpty) hint else null
+            } else {
+                null
+            }
         if (nativeCode >= 0) {
-            processKeyDirect(nativeCode, modifiers = keyModifiers, onComplete = onComplete, done = onResult)
+            processKeyDirect(
+                nativeCode,
+                modifiers = keyModifiers,
+                touchHint = touchHint,
+                onComplete = onComplete,
+                done = onResult,
+            )
         } else {
             call("process-key", json("keycode" to code), onComplete = onComplete, done = onResult)
         }

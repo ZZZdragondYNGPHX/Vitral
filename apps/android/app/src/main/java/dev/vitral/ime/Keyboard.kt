@@ -286,6 +286,8 @@ internal class Key(
     private val backspaceHold = BackspaceHold()
     private var downX = 0f
     private var downY = 0f
+    private var lastX = 0f
+    private var lastY = 0f
     private var swipeUpActive = false
     private var spaceScrubbing = false
     private var spaceAnchorX = 0f
@@ -338,7 +340,7 @@ internal class Key(
     internal val keyLabel: String
         get() = label
 
-    internal fun canRolloverCommit(): Boolean =
+    internal fun canRolloverCommit(x: Float = lastX, y: Float = lastY): Boolean =
         label.length == 1 &&
             label[0] in 'a'..'z' &&
             isPressed &&
@@ -346,7 +348,9 @@ internal class Key(
             !recording &&
             !spaceScrubbing &&
             !repeatingDelete &&
-            !clearAllArmed
+            !clearAllArmed &&
+            x in -context.dpF(8f)..(width + context.dpF(8f)) &&
+            y in -context.dpF(8f)..(height + context.dpF(8f))
 
     internal fun commitRollover() {
         removeCallbacks(startVoice)
@@ -898,6 +902,8 @@ internal class Key(
             MotionEvent.ACTION_DOWN -> {
                 downX = e.x
                 downY = e.y
+                lastX = e.x
+                lastY = e.y
                 spaceAnchorX = e.x
                 spaceScrubbing = false
                 swipeUpActive = false
@@ -919,6 +925,8 @@ internal class Key(
                 }
             }
             MotionEvent.ACTION_MOVE -> {
+                lastX = e.x
+                lastY = e.y
                 if (!clearAllArmed && (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14))) {
                     removeCallbacks(startVoice)
                     removeCallbacks(repeatDelete)
@@ -1164,10 +1172,116 @@ internal fun pickSpatialHitKey(
     return if (isLegalNextPinyinChar(rawPreedit, flypy, neighbor)) neighbor else primaryChar
 }
 
+internal data class SpatialKeyCenter(
+    val ch: Char,
+    val cx: Float,
+    val cy: Float,
+    val width: Float,
+    val height: Float,
+)
+
+internal data class SpatialTouchHint(
+    val alt1Char: Int = 0,
+    val alt1Penalty: Float = 0f,
+    val alt2Char: Int = 0,
+    val alt2Penalty: Float = 0f,
+) {
+    val isEmpty: Boolean
+        get() = alt1Char == 0
+}
+
+/**
+ * Lightweight per-session EMA estimator for single-handed thumb landing bias.
+ * Updates only on clean inner taps so wild misses never poison the offset.
+ */
+internal class ThumbBiasEstimator {
+    var biasX: Float = 0f
+        private set
+    var biasY: Float = 0f
+        private set
+
+    fun observe(dx: Float, dy: Float, keyWidth: Float, keyHeight: Float) {
+        if (!dx.isFinite() || !dy.isFinite() || !keyWidth.isFinite() || !keyHeight.isFinite()) return
+        if (keyWidth <= 0f || keyHeight <= 0f) return
+        if (abs(dx) > keyWidth * 0.45f || abs(dy) > keyHeight * 0.45f) return
+        val alpha = 0.08f
+        val maxX = keyWidth * 0.25f
+        val maxY = keyHeight * 0.25f
+        biasX = (biasX + alpha * (dx - biasX)).coerceIn(-maxX, maxX)
+        biasY = (biasY + alpha * (dy - biasY)).coerceIn(-maxY, maxY)
+    }
+
+    fun reset() {
+        biasX = 0f
+        biasY = 0f
+    }
+}
+
+/**
+ * 2D Gaussian soft spatial model over all letter keys (horizontal, vertical, diagonal 8-neighborhood).
+ * Returns up to 2 spatially nearby alternative lowercase letters ordered by increasing log-penalty.
+ */
+internal fun computeSpatialTouchHint(
+    tapX: Float,
+    tapY: Float,
+    primary: SpatialKeyCenter,
+    allLetters: List<SpatialKeyCenter>,
+    biasX: Float = 0f,
+    biasY: Float = 0f,
+): SpatialTouchHint {
+    val pChar = primary.ch.lowercaseChar()
+    if (pChar !in 'a'..'z' || primary.width <= 0f || primary.height <= 0f) {
+        return SpatialTouchHint()
+    }
+    val adjX = tapX - biasX
+    val adjY = tapY - biasY
+    val sigmaX = primary.width * 0.52f
+    val sigmaY = primary.height * 0.58f
+    val dx0 = (adjX - primary.cx) / sigmaX
+    val dy0 = (adjY - primary.cy) / sigmaY
+    val d0Sq = dx0 * dx0 + dy0 * dy0
+
+    var best1Char = 0
+    var best1Pen = Float.POSITIVE_INFINITY
+    var best2Char = 0
+    var best2Pen = Float.POSITIVE_INFINITY
+
+    for (cand in allLetters) {
+        val ch = cand.ch.lowercaseChar()
+        if (ch !in 'a'..'z' || ch == pChar) continue
+        val rawDx = abs(adjX - cand.cx)
+        val rawDy = abs(adjY - cand.cy)
+        if (rawDx > primary.width * 1.35f || rawDy > primary.height * 1.35f) continue
+        val nx = (adjX - cand.cx) / sigmaX
+        val ny = (adjY - cand.cy) / sigmaY
+        val dSq = nx * nx + ny * ny
+        val penalty = ((dSq - d0Sq).coerceAtLeast(0.15f)) * 0.5f
+        if (penalty > 4.5f) continue
+        val code = ch.code
+        if (penalty < best1Pen) {
+            best2Char = best1Char
+            best2Pen = best1Pen
+            best1Char = code
+            best1Pen = penalty
+        } else if (penalty < best2Pen && code != best1Char) {
+            best2Char = code
+            best2Pen = penalty
+        }
+    }
+    if (best1Char == 0) return SpatialTouchHint()
+    return SpatialTouchHint(
+        alt1Char = best1Char,
+        alt1Penalty = best1Pen,
+        alt2Char = if (best2Char != 0) best2Char else 0,
+        alt2Penalty = if (best2Char != 0) best2Pen else 0f,
+    )
+}
+
 /**
  * Unified keyboard touch coordinator:
  * - Two-thumb key rollover (earlier letter key commits immediately on 2nd pointer down)
  * - Dynamic spatial hitbox border rescue on 26-key Chinese layout
+ * - 2D 8-neighborhood soft touch alternatives + personal EMA thumb bias calibration
  * - Android 10+ edge system-gesture exclusion along left/right letter borders
  */
 internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
@@ -1176,9 +1290,29 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
     var flypyProvider: () -> Boolean = { true }
     var englishProvider: () -> Boolean = { false }
 
+    private data class PendingTouchSample(
+        val hint: SpatialTouchHint,
+        val dx: Float,
+        val dy: Float,
+        val keyWidth: Float,
+        val keyHeight: Float,
+    )
+
     private val activePointers = LinkedHashMap<Int, Key>()
-    private val redirectedPointers = HashSet<Int>()
+    private val pointerSamples = HashMap<Int, PendingTouchSample>()
+    private val thumbBias = ThumbBiasEstimator()
+    private var committedTouchSample: PendingTouchSample? = null
     private val gestureExclusions = ArrayList<Rect>(2)
+
+    fun consumeCommittedTouchHint(recordBias: Boolean = true): SpatialTouchHint {
+        val sample = committedTouchSample
+        committedTouchSample = null
+        if (sample == null) return SpatialTouchHint()
+        if (recordBias) {
+            thumbBias.observe(sample.dx, sample.dy, sample.keyWidth, sample.keyHeight)
+        }
+        return sample.hint
+    }
 
     init {
         orientation = VERTICAL
@@ -1202,7 +1336,7 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
         }
     }
 
-    private fun resolveKey(hostX: Float, hostY: Float): Pair<Key, Boolean>? {
+    private fun resolveKey(hostX: Float, hostY: Float): Key? {
         for (rowIdx in 0 until childCount) {
             val row = getChildAt(rowIdx) as? LinearLayout ?: continue
             if (hostY < row.top || hostY > row.bottom) continue
@@ -1224,26 +1358,7 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
                 // Clamp edge margins to nearest key in this row (prevents dead zones on curved edges).
                 hitIdx = if (rowX < keysInRow.first().left) 0 else keysInRow.lastIndex
             }
-            val primary = keysInRow[hitIdx]
-            val pChar = primary.keyLabel.singleOrNull()
-            if (pChar != null && pChar in 'a'..'z') {
-                val leftKey = keysInRow.getOrNull(hitIdx - 1)?.takeIf { it.keyLabel.length == 1 && it.keyLabel[0] in 'a'..'z' }
-                val rightKey = keysInRow.getOrNull(hitIdx + 1)?.takeIf { it.keyLabel.length == 1 && it.keyLabel[0] in 'a'..'z' }
-                val chosen =
-                    pickSpatialHitKey(
-                        rawPreedit = preeditProvider(),
-                        flypy = flypyProvider(),
-                        english = englishProvider(),
-                        xInKey = (rowX - primary.left).coerceIn(0f, primary.width.toFloat()),
-                        keyWidth = primary.width.toFloat(),
-                        primaryChar = pChar,
-                        leftNeighbor = leftKey?.keyLabel?.get(0),
-                        rightNeighbor = rightKey?.keyLabel?.get(0),
-                    )
-                if (chosen == leftKey?.keyLabel?.get(0)) return leftKey to true
-                if (chosen == rightKey?.keyLabel?.get(0)) return rightKey to true
-            }
-            return primary to false
+            return keysInRow[hitIdx]
         }
         return null
     }
@@ -1253,13 +1368,9 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
         action: Int,
         source: MotionEvent,
         pointerIndex: Int,
-        clampX: Boolean,
     ) {
         val row = key.parent as? View ?: return
-        val rawLocalX = source.getX(pointerIndex) - row.left - key.left
-        val localX =
-            if (clampX && key.width > 0) rawLocalX.coerceIn(1f, (key.width - 1f).coerceAtLeast(1f))
-            else rawLocalX
+        val localX = source.getX(pointerIndex) - row.left - key.left
         val localY = source.getY(pointerIndex) - row.top - key.top
         val synthetic =
             MotionEvent.obtain(
@@ -1279,7 +1390,59 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
 
     fun resetActiveTouches() {
         activePointers.clear()
-        redirectedPointers.clear()
+        pointerSamples.clear()
+    }
+
+    private fun computeSampleForTouch(hostX: Float, hostY: Float, target: Key): PendingTouchSample? {
+        if (englishProvider()) return null
+        val targetChar = target.keyLabel.singleOrNull()?.lowercaseChar() ?: return null
+        if (targetChar !in 'a'..'z' || target.width <= 0 || target.height <= 0) {
+            return null
+        }
+        val targetRow = target.parent as? View ?: return null
+        val primaryCenter =
+            SpatialKeyCenter(
+                ch = targetChar,
+                cx = targetRow.left + target.left + target.width * 0.5f,
+                cy = targetRow.top + target.top + target.height * 0.5f,
+                width = target.width.toFloat(),
+                height = target.height.toFloat(),
+            )
+        val letters = ArrayList<SpatialKeyCenter>(26)
+        for (rowIdx in 0 until childCount) {
+            val row = getChildAt(rowIdx) as? LinearLayout ?: continue
+            for (i in 0 until row.childCount) {
+                val k = row.getChildAt(i) as? Key ?: continue
+                val ch = k.keyLabel.singleOrNull()?.lowercaseChar() ?: continue
+                if (ch in 'a'..'z' && k.width > 0 && k.height > 0) {
+                    letters.add(
+                        SpatialKeyCenter(
+                            ch = ch,
+                            cx = row.left + k.left + k.width * 0.5f,
+                            cy = row.top + k.top + k.height * 0.5f,
+                            width = k.width.toFloat(),
+                            height = k.height.toFloat(),
+                        )
+                    )
+                }
+            }
+        }
+        val hint =
+            computeSpatialTouchHint(
+                tapX = hostX,
+                tapY = hostY,
+                primary = primaryCenter,
+                allLetters = letters,
+                biasX = thumbBias.biasX,
+                biasY = thumbBias.biasY,
+            )
+        return PendingTouchSample(
+            hint = hint,
+            dx = hostX - primaryCenter.cx,
+            dy = hostY - primaryCenter.cy,
+            keyWidth = primaryCenter.width,
+            keyHeight = primaryCenter.height,
+        )
     }
 
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
@@ -1291,7 +1454,7 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
             MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
                 val idx = ev.actionIndex
                 val pid = ev.getPointerId(idx)
-                val (target, redirected) = resolveKey(ev.getX(idx), ev.getY(idx)) ?: return false
+                val target = resolveKey(ev.getX(idx), ev.getY(idx)) ?: return false
                 // Ignore a second finger landing on the exact same active key (e.g. space/backspace).
                 if (activePointers.values.any { it === target }) {
                     return true
@@ -1299,24 +1462,41 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
                 if (ev.actionMasked == MotionEvent.ACTION_POINTER_DOWN && activePointers.isNotEmpty()) {
                     val toRollover =
                         activePointers.entries
-                            .filter { (_, k) -> k !== target && k.canRolloverCommit() }
+                            .filter { (oldPid, k) ->
+                                if (k === target) return@filter false
+                                val oldIdx = ev.findPointerIndex(oldPid)
+                                val row = k.parent as? View
+                                if (oldIdx >= 0 && row != null) {
+                                    k.canRolloverCommit(
+                                        ev.getX(oldIdx) - row.left - k.left,
+                                        ev.getY(oldIdx) - row.top - k.top,
+                                    )
+                                } else {
+                                    k.canRolloverCommit()
+                                }
+                            }
                             .map { it.key to it.value }
                     for ((oldPid, oldKey) in toRollover) {
                         activePointers.remove(oldPid)
-                        redirectedPointers.remove(oldPid)
-                        oldKey.commitRollover()
+                        committedTouchSample = pointerSamples.remove(oldPid)
+                        try {
+                            oldKey.commitRollover()
+                        } finally {
+                            committedTouchSample = null
+                        }
                     }
                 }
                 activePointers[pid] = target
-                if (redirected) redirectedPointers.add(pid) else redirectedPointers.remove(pid)
-                dispatchLocal(target, MotionEvent.ACTION_DOWN, ev, idx, clampX = redirected)
+                val sample = computeSampleForTouch(ev.getX(idx), ev.getY(idx), target)
+                if (sample != null) pointerSamples[pid] = sample else pointerSamples.remove(pid)
+                dispatchLocal(target, MotionEvent.ACTION_DOWN, ev, idx)
                 return true
             }
             MotionEvent.ACTION_MOVE -> {
                 for (i in 0 until ev.pointerCount) {
                     val pid = ev.getPointerId(i)
                     val key = activePointers[pid] ?: continue
-                    dispatchLocal(key, MotionEvent.ACTION_MOVE, ev, i, clampX = pid in redirectedPointers)
+                    dispatchLocal(key, MotionEvent.ACTION_MOVE, ev, i)
                 }
                 return true
             }
@@ -1324,9 +1504,14 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
                 val idx = ev.actionIndex
                 val pid = ev.getPointerId(idx)
                 val key = activePointers.remove(pid)
-                val wasRedirected = redirectedPointers.remove(pid)
+                val sample = pointerSamples.remove(pid)
                 if (key != null) {
-                    dispatchLocal(key, MotionEvent.ACTION_UP, ev, idx, clampX = wasRedirected)
+                    committedTouchSample = sample
+                    try {
+                        dispatchLocal(key, MotionEvent.ACTION_UP, ev, idx)
+                    } finally {
+                        committedTouchSample = null
+                    }
                 }
                 if (ev.actionMasked == MotionEvent.ACTION_UP) {
                     resetActiveTouches()

@@ -32,6 +32,7 @@ pub struct IdsIndex {
     by_radical_pinyin: HashMap<(String, String), Vec<char>>,
     /// Compact readings from radical_pinyin.dict.yaml (two or three components).
     by_component_code: HashMap<String, Vec<char>>,
+    component_readings: HashMap<char, Vec<Box<str>>>,
 }
 
 static IDS_CACHE: OnceLock<Mutex<HashMap<PathBuf, Arc<IdsIndex>>>> = OnceLock::new();
@@ -86,6 +87,26 @@ fn cjk_block_priority(ch: char) -> u8 {
         1 // CJK Extension A
     } else {
         2 // Ext-B+
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn aux_codes_match_bundled_component_readings() {
+    let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+    let index = IdsIndex::load_cached(Some(&assets));
+    for (ch, codes) in [
+        ('的', ["b", "bs", "bai", "baishao"]),
+        ('地', ["t", "ty", "tu", "tuye"]),
+        ('明', ["r", "ry", "ri", "riyue"]),
+        ('𳑸', ["n", "nz", "neng", "nengzhong"]),
+    ] {
+        for code in codes {
+            assert!(index.matches_aux_code(ch, code), "{ch}: {code}");
+        }
+    }
+    for code in ["", "BS", "b1", "白", "shao", "baishaoa", "aaaaaaaaaaaaa"] {
+        assert!(!index.matches_aux_code('的', code), "{code}");
     }
 }
 
@@ -225,13 +246,18 @@ impl IdsIndex {
                 let Some(ch) = it.next() else {
                     continue;
                 };
-                if it.next().is_some() || !is_cjk_ideograph(ch) {
+                if it.next().is_some() {
                     continue;
                 }
-                let parts: Vec<&str> = code_str.trim().split('\'').collect();
-                if (2..=3).contains(&parts.len()) && parts.iter().all(|syl| {
+                let code = code_str.trim();
+                let parts: Vec<&str> = code.split('\'').collect();
+                if !parts.iter().all(|syl| {
                     !syl.is_empty() && syl.bytes().all(|byte| byte.is_ascii_lowercase())
                 }) {
+                    continue;
+                }
+                idx.component_readings.entry(ch).or_default().push(code.into());
+                if is_cjk_ideograph(ch) && (2..=3).contains(&parts.len()) {
                     idx.by_component_code.entry(parts.concat()).or_default().push(ch);
                     if let [first, second] = parts.as_slice() {
                         idx.by_radical_pinyin
@@ -252,6 +278,19 @@ impl IdsIndex {
 
     pub fn is_empty(&self) -> bool {
         self.by_char.is_empty() && self.by_component_code.is_empty()
+    }
+
+    pub(crate) fn matches_aux_code(&self, ch: char, aux: &str) -> bool {
+        if !(1..=12).contains(&aux.len()) || !aux.bytes().all(|byte| byte.is_ascii_lowercase()) {
+            return false;
+        }
+        self.component_readings.get(&ch).is_some_and(|readings| {
+            readings.iter().any(|reading| {
+                let parts = reading.split('\'');
+                parts.clone().map(|part| part.as_bytes()[0]).take(aux.len()).eq(aux.bytes())
+                    || parts.flat_map(str::bytes).take(aux.len()).eq(aux.bytes())
+            })
+        })
     }
 
     pub fn lookup_pair(&self, op: IdcOp, a: char, b: char) -> Vec<char> {

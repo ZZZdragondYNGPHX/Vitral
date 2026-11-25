@@ -11,6 +11,9 @@ val bundledModels = tasks.register<Sync>("bundleModels") {
     from(rootProject.file("../../assets")) {
         include("rime/cn_dicts/8105.dict.yaml", "rime/cn_dicts/41448.dict.yaml",
             "rime/cn_dicts/base.dict.yaml", "rime/cn_dicts/ext.dict.yaml", "rime/cn_dicts/others.dict.yaml",
+            "rime/en_dicts/en.dict.yaml", "rime/en_dicts/en_ext.dict.yaml",
+            "rime/en_dicts/cn_en.txt", "rime/en_dicts/cn_en_flypy.txt",
+            "rime/radical_pinyin.dict.yaml",
             "rime/LICENSE", "opencc/**")
         exclude("**/.*.sha256")
     }
@@ -50,8 +53,8 @@ android {
         applicationId = "dev.vitral.ime"
         minSdk = 29
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.4.13"
+        versionCode = 17
+        versionName = "0.4.14"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64") }
     }
     buildFeatures { compose = true }
