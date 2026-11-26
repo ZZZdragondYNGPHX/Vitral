@@ -87,6 +87,12 @@ const GUID profile = {0x4aabb15d,
                       {0xab, 0x90, 0x67, 0xef, 0x1c, 0xd9, 0xe2, 0x02}};
 constexpr wchar_t key[] =
     L"SOFTWARE\\Classes\\CLSID\\{7C9E6679-7425-40DE-944B-E07FC1F90AE7}";
+const GUID *const categoriesSupported[] = {
+    &GUID_TFCAT_TIP_KEYBOARD,
+    &GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
+    &GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
+};
 
 const ThemePalette &currentPalette() {
   DWORD value = 0;
@@ -126,8 +132,12 @@ HRESULT reg(bool install) {
     return hr;
   if (!install) {
     HRESULT p = profiles->UnregisterProfile(clsid, 0x0804, profile, 0);
-    HRESULT c =
-        categories->UnregisterCategory(clsid, GUID_TFCAT_TIP_KEYBOARD, clsid);
+    HRESULT c = S_OK;
+    for (const auto category : categoriesSupported) {
+      const HRESULT result = categories->UnregisterCategory(clsid, *category, clsid);
+      if (FAILED(result) && SUCCEEDED(c))
+        c = result;
+    }
     LONG del = RegDeleteTreeW(HKEY_LOCAL_MACHINE, key);
     if (del != ERROR_SUCCESS && del != ERROR_FILE_NOT_FOUND)
       return HRESULT_FROM_WIN32(del);
@@ -147,13 +157,18 @@ HRESULT reg(bool install) {
   if (SUCCEEDED(hr))
     hr = setString(h, L"ThreadingModel", L"Apartment");
   RegCloseKey(h);
-  if (SUCCEEDED(hr))
-    hr = categories->RegisterCategory(clsid, GUID_TFCAT_TIP_KEYBOARD, clsid);
-  if (SUCCEEDED(hr))
-    hr = profiles->RegisterProfile(clsid, 0x0804, profile, L"Vitral", 6, path,
-                                   n, 0, nullptr, 0, TRUE, 0);
+  for (const auto category : categoriesSupported) {
+    if (SUCCEEDED(hr))
+      hr = categories->RegisterCategory(clsid, *category, clsid);
+  }
+  if (SUCCEEDED(hr)) {
+    hr = profiles->RegisterProfile(clsid, 0x0804, profile, L"Vitral", 6,
+                                   path, n, static_cast<ULONG>(-101),
+                                   nullptr, 0, TRUE, 0);
+  }
   if (FAILED(hr)) {
-    categories->UnregisterCategory(clsid, GUID_TFCAT_TIP_KEYBOARD, clsid);
+    for (const auto category : categoriesSupported)
+      categories->UnregisterCategory(clsid, *category, clsid);
     RegDeleteTreeW(HKEY_LOCAL_MACHINE, key);
   }
   return hr;
@@ -798,6 +813,50 @@ extern "C" HRESULT vitral_register(bool install) {
   if (SUCCEEDED(init))
     CoUninitialize();
   return hr;
+}
+extern "C" HICON vitral_mode_icon(bool english) {
+  const int size = (std::max)(16, GetSystemMetrics(SM_CXSMICON));
+  BITMAPINFO info{};
+  info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+  info.bmiHeader.biWidth = size;
+  info.bmiHeader.biHeight = -size;
+  info.bmiHeader.biPlanes = 1;
+  info.bmiHeader.biBitCount = 32;
+  HDC dc = CreateCompatibleDC(nullptr);
+  if (!dc) return nullptr;
+  uint32_t *pixels = nullptr;
+  HBITMAP color = CreateDIBSection(dc, &info, DIB_RGB_COLORS,
+                                  reinterpret_cast<void **>(&pixels), nullptr, 0);
+  if (!color) { DeleteDC(dc); return nullptr; }
+  std::fill(pixels, pixels + size * size, 0);
+  HGDIOBJ oldBitmap = SelectObject(dc, color);
+  HFONT font = CreateFontW(-size, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                          ANTIALIASED_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei UI");
+  HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, RGB(255, 255, 255));
+  RECT rect{0, 0, size, size};
+  DrawTextW(dc, english ? L"英" : L"中", 1, &rect,
+            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+  GdiFlush();
+  for (int i = 0; i < size * size; ++i) {
+    const uint32_t alpha = (std::max)({pixels[i] & 255u, (pixels[i] >> 8) & 255u,
+                                     (pixels[i] >> 16) & 255u});
+    // TEXTCOLORICON maps black glyph pixels to the current system text color.
+    pixels[i] = alpha << 24;
+  }
+  if (oldFont) SelectObject(dc, oldFont);
+  if (font) DeleteObject(font);
+  SelectObject(dc, oldBitmap);
+  std::vector<BYTE> maskBits(((size + 15) / 16) * 2 * size, 0);
+  HBITMAP mask = CreateBitmap(size, size, 1, 1, maskBits.data());
+  ICONINFO iconInfo{TRUE, 0, 0, mask, color};
+  HICON icon = mask ? CreateIconIndirect(&iconInfo) : nullptr;
+  if (mask) DeleteObject(mask);
+  DeleteObject(color);
+  DeleteDC(dc);
+  return icon;
 }
 extern "C" unsigned vitral_module_path(wchar_t *path, unsigned size) {
   return GetModuleFileNameW(module(), path, size);

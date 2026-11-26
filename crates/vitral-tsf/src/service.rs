@@ -20,14 +20,38 @@ use windows::{
         UI::{
             Input::KeyboardAndMouse::*,
             TextServices::*,
-            WindowsAndMessaging::{KillTimer, SetTimer},
+            WindowsAndMessaging::{GetClassNameW, GetWindowLongW, IsChild, KillTimer, SendMessageW, SetTimer, ES_PASSWORD, GWL_STYLE},
         },
     },
 };
 
+#[path = "langbar.rs"]
+mod langbar;
+
 const CLASS: GUID = GUID::from_u128(0x7c9e6679_7425_40de_944b_e07fc1f90ae7);
 const INTERACTIVE_IPC_TIMEOUT: Duration = Duration::from_millis(150);
 const IPC_BACKOFF: Duration = Duration::from_millis(1500);
+
+// Opt-in diagnostics contain only operation names and HRESULTs, never input text.
+// Place vitral-tsf.diagnostics beside the DLL before starting a test application.
+fn trace_failure(operation: &str, hr: HRESULT) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static COUNT: AtomicU32 = AtomicU32::new(0);
+    if !*ENABLED.get_or_init(|| {
+        let mut buf = vec![0u16; 32768];
+        let n = unsafe { vitral_module_path(buf.as_mut_ptr(), buf.len() as _) };
+        if n == 0 || n as usize >= buf.len() { return false; }
+        PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]))
+            .with_file_name("vitral-tsf.diagnostics").is_file()
+    }) || COUNT.fetch_add(1, Ordering::Relaxed) >= 256 { return; }
+    let Some(base) = std::env::var_os("LOCALAPPDATA") else { return; };
+    let path = PathBuf::from(base).join("Vitral/tsf-diagnostics.log");
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let line = format!("pid={} operation={} hr={:08X}\n", std::process::id(), operation, hr.0 as u32);
+        let _ = file.write_all(line.as_bytes());
+    }
+}
 
 fn ipc_in_backoff(until: Option<Instant>, now: Instant) -> bool {
     until.is_some_and(|until| now < until)
@@ -140,7 +164,7 @@ impl IClassFactory_Impl for Factory_Impl {
         if outer.is_some() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
-        let tip: ITfTextInputProcessor = Service::new()?.into();
+        let tip: ITfTextInputProcessorEx = Service::new()?.into();
         unsafe { tip.query(iid, out).ok() }
     }
     fn LockServer(&self, lock: BOOL) -> Result<()> {
@@ -188,6 +212,7 @@ struct Editor {
     prediction_timer: Cell<usize>,
     prediction_polls: Cell<u32>,
     prediction_trigger: Cell<bool>,
+    language_bar: RefCell<Option<langbar::LanguageBar>>,
 }
 thread_local! {
     static PREDICTION_TIMERS: RefCell<BTreeMap<usize, Weak<Editor>>> = const { RefCell::new(BTreeMap::new()) };
@@ -238,6 +263,7 @@ impl Editor {
             &self.host, &self.id, name, &v, timeout,
         );
         result.map_err(|error| {
+            trace_failure("engine-request", E_FAIL);
             self.ipc_failed.set(true);
             if error.is::<std::io::Error>() {
                 self.ipc_backoff_until.set(Some(Instant::now() + IPC_BACKOFF));
@@ -253,6 +279,7 @@ impl Editor {
     }
     fn draw(&self, glow: bool, activity: bool) {
         let v = self.view.borrow();
+        if let Some(bar) = self.language_bar.borrow().as_ref() { bar.update(v.english); }
         let prediction =
             (!v.prediction_text.is_empty() && self.composition.borrow().is_none() && v.mode == 0)
                 .then(|| format!("Tab 补全：{}", v.prediction_text));
@@ -379,9 +406,11 @@ impl Editor {
     }
     fn input_access(&self, ctx: Option<&ITfContext>) -> InputAccess {
         let Some(ctx) = ctx else {
+            trace_failure("input-context-missing", E_POINTER);
             return InputAccess::Blocked;
         };
         if input_disabled(ctx) {
+            trace_failure("input-context-disabled", S_FALSE);
             return InputAccess::Blocked;
         }
         let access = Rc::new(Cell::new(InputAccess::Unknown));
@@ -392,10 +421,10 @@ impl Editor {
         }
         .into();
         let result = unsafe { ctx.RequestEditSession(self.tid.get(), &session, TF_ES_SYNC | TF_ES_READ) };
-        if result.is_ok_and(|hr| hr.is_ok()) {
-            access.get()
-        } else {
-            InputAccess::Unknown
+        match result {
+            Ok(hr) if hr.is_ok() => access.get(),
+            Ok(hr) => { trace_failure("input-scope-session", hr); InputAccess::Unknown }
+            Err(error) => { trace_failure("request-input-scope-session", error.code()); InputAccess::Unknown }
         }
     }
     fn clear_input(&self, edit: Option<(&ITfContext, u32)>) {
@@ -648,23 +677,72 @@ fn classify_scopes(scopes: &[InputScope]) -> InputAccess {
         InputAccess::Allowed
     }
 }
+// Some native RichEdit hosts expose no InputScope attribute and return E_FAIL.
+// Only fall back for a verified native editor belonging to this TSF view;
+// unknown hosts and password controls remain excluded.
+fn native_edit_access(hwnd: HWND) -> InputAccess {
+    const EM_GETPASSWORDCHAR: u32 = 0x00d2;
+    unsafe {
+        let mut class = [0u16; 256];
+        let n = GetClassNameW(hwnd, &mut class);
+        if n == 0 { return InputAccess::Unknown; }
+        let class = String::from_utf16_lossy(&class[..n as usize]).to_ascii_lowercase();
+        if !matches!(class.as_str(), "edit" | "richedit" | "richedit20a" | "richedit20w" |
+            "richedit50w" | "richeditd2d" | "richeditd2dpt") {
+            return InputAccess::Unknown;
+        }
+        if GetWindowLongW(hwnd, GWL_STYLE) & ES_PASSWORD != 0 ||
+            SendMessageW(hwnd, EM_GETPASSWORDCHAR, WPARAM(0), LPARAM(0)).0 != 0 {
+            InputAccess::Blocked
+        } else {
+            InputAccess::Allowed
+        }
+    }
+}
+fn native_scope_fallback(ctx: &ITfContext) -> InputAccess {
+    unsafe {
+        let Ok(view) = ctx.GetActiveView().and_then(|v| v.GetWnd()) else {
+            return InputAccess::Unknown;
+        };
+        let focus = GetFocus();
+        if focus.is_invalid() || (focus != view && !IsChild(view, focus).as_bool()) {
+            return InputAccess::Unknown;
+        }
+        native_edit_access(focus)
+    }
+}
 // App input-scope properties require a read edit cookie for the current selection.
 fn read_input_scope(ctx: &ITfContext, ec: u32) -> Result<InputAccess> {
     unsafe {
-        let property = ctx.GetAppProperty(&GUID_PROP_INPUTSCOPE)?;
+        let property = ctx.GetAppProperty(&GUID_PROP_INPUTSCOPE)
+            .inspect_err(|e| trace_failure("scope-get-property", e.code()))?;
         let mut selection = [TF_SELECTION::default()];
         let mut fetched = 0;
         let selected = ctx.GetSelection(ec, TF_DEFAULT_SELECTION, &mut selection, &mut fetched);
         let range = ManuallyDrop::take(&mut selection[0].range);
-        selected?;
+        selected.inspect_err(|e| trace_failure("scope-get-selection", e.code()))?;
         let Some(range) = range.filter(|_| fetched != 0) else {
+            trace_failure("scope-no-selection", S_FALSE);
             return Ok(InputAccess::Unknown);
         };
-        let value = property.GetValue(ec, &range)?;
+        let value = match property.GetValue(ec, &range) {
+            Ok(value) => value,
+            Err(error) if matches!(error.code(), E_FAIL | E_NOTIMPL) => {
+                let access = native_scope_fallback(ctx);
+                trace_failure("scope-native-fallback", HRESULT(match access {
+                    InputAccess::Allowed => 1, InputAccess::Blocked => 0, InputAccess::Unknown => -1,
+                }));
+                return Ok(access);
+            }
+            Err(error) => return Err(error),
+        };
         if value.is_empty() {
             return Ok(InputAccess::Allowed);
         }
-        let scope = IUnknown::try_from(&value)?.cast::<ITfInputScope>()?;
+        let scope = IUnknown::try_from(&value)
+            .inspect_err(|e| trace_failure("scope-variant-unknown", e.code()))?
+            .cast::<ITfInputScope>()
+            .inspect_err(|e| trace_failure("scope-query-interface", e.code()))?;
         let mut scopes = ptr::null_mut();
         let mut count = 0;
         let result = scope.GetInputScopes(&mut scopes, &mut count);
@@ -676,7 +754,7 @@ fn read_input_scope(ctx: &ITfContext, ec: u32) -> Result<InputAccess> {
             classify_scopes(std::slice::from_raw_parts(scopes, count as usize))
         };
         CoTaskMemFree(Some(scopes.cast()));
-        result?;
+        result.inspect_err(|e| trace_failure("scope-get-input-scopes", e.code()))?;
         Ok(access)
     }
 }
@@ -688,7 +766,7 @@ struct InputScopeCheck {
 }
 impl ITfEditSession_Impl for InputScopeCheck_Impl {
     fn DoEditSession(&self, ec: u32) -> Result<()> {
-        self.access.set(read_input_scope(&self.ctx, ec)?);
+        self.access.set(read_input_scope(&self.ctx, ec).inspect_err(|e| trace_failure("read-input-scope", e.code()))?);
         Ok(())
     }
 }
@@ -760,7 +838,7 @@ impl ITfEditSession_Impl for Finish_Impl {
     }
 }
 #[implement(
-    ITfTextInputProcessor,
+    ITfTextInputProcessorEx,
     ITfKeyEventSink,
     ITfCompositionSink,
     ITfThreadMgrEventSink
@@ -803,18 +881,39 @@ impl Service {
                 prediction_timer: Cell::new(0),
                 prediction_polls: Cell::new(0),
                 prediction_trigger: Cell::new(false),
+                language_bar: RefCell::new(None),
             }),
             _live: Live::new(),
         })
     }
 }
+impl ITfTextInputProcessorEx_Impl for Service_Impl {
+    fn ActivateEx(&self, mgr: Option<&ITfThreadMgr>, tid: u32, flags: u32) -> Result<()> {
+        trace_failure("activate-ex-flags", HRESULT(flags as i32));
+        self.Activate(mgr, tid)
+    }
+}
 impl ITfTextInputProcessor_Impl for Service_Impl {
     fn Activate(&self, mgr: Option<&ITfThreadMgr>, tid: u32) -> Result<()> {
+        trace_failure("activate", S_OK);
         self.Deactivate()?;
         let mgr = mgr.ok_or(E_POINTER)?;
         let keys: ITfKeystrokeMgr = mgr.cast()?;
         let source: ITfSource = mgr.cast()?;
         unsafe {
+            if let Ok(compartments) = mgr.cast::<ITfCompartmentMgr>() {
+                let value = compartments.GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE)
+                    .and_then(|c| c.GetValue());
+                match value {
+                    Ok(value) => trace_failure("keyboard-open", HRESULT(i32::try_from(&value).unwrap_or(-1))),
+                    Err(error) => trace_failure("keyboard-open-error", error.code()),
+                }
+            }
+            // Selecting this TIP opens its keyboard. Its own language mode handles
+            // ASCII pass-through; a closed TSF keyboard can bypass the key sink.
+            mgr.cast::<ITfCompartmentMgr>()?
+                .GetCompartment(&GUID_COMPARTMENT_KEYBOARD_OPENCLOSE)?
+                .SetValue(tid, &VARIANT::from(1i32))?;
             keys.AdviseKeyEventSink(tid, &self.to_interface::<ITfKeyEventSink>(), true)?;
             let sink = self.to_interface::<ITfThreadMgrEventSink>();
             match source.AdviseSink(&ITfThreadMgrEventSink::IID, &sink.cast::<IUnknown>()?) {
@@ -826,6 +925,12 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
             }
             self.editor.tid.set(tid);
             self.editor.mgr.replace(Some(mgr.clone()));
+            let bar = langbar::LanguageBar::new(mgr, (self as *const Self).cast(),
+                mode_button_toggle, &self.editor.host, tid);
+            match bar {
+                Ok(bar) => { self.editor.language_bar.replace(Some(bar)); }
+                Err(error) => trace_failure("language-bar-add", error.code()),
+            }
             self.editor
                 .panel
                 .set(vitral_panel_open((self as *const Self).cast(), panel_event));
@@ -836,6 +941,7 @@ impl ITfTextInputProcessor_Impl for Service_Impl {
         Ok(())
     }
     fn Deactivate(&self) -> Result<()> {
+        self.editor.language_bar.take();
         self.editor.focus(false);
         let mgr = self.editor.mgr.borrow_mut().take();
         if let Some(mgr) = mgr {
@@ -1125,7 +1231,7 @@ impl Service_Impl {
         if handled.get() {
             return Ok(true);
         }
-        result?;
+        result.inspect_err(|e| trace_failure("key-edit-session", e.code()))?;
         Ok(false)
     }
 }
@@ -1135,6 +1241,7 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok(())
     }
     fn OnTestKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
+        trace_failure("test-key-down", S_OK);
         if self.editor.bypass_keys() || !self.editor.protect_input(ctx, true) {
             return Ok(false.into());
         }
@@ -1670,6 +1777,9 @@ impl ITfEditSession_Impl for Edit_Impl {
         Ok(())
     }
 }
+unsafe fn mode_button_toggle(owner: *const c_void) {
+    panel_event(owner, 1, 0, ptr::null(), ptr::null(), 0);
+}
 unsafe extern "C" fn panel_event(
     owner: *const c_void,
     op: i32,
@@ -1679,7 +1789,7 @@ unsafe extern "C" fn panel_event(
     n: usize,
 ) {
     let service = &*owner.cast::<Service_Impl>();
-    let _live: ITfTextInputProcessor = service.to_interface();
+    let _live: ITfTextInputProcessorEx = service.to_interface();
     let ed = &service.editor;
     let Some(ctx) = ed.current_context() else { return };
     ed.ipc_failed.set(false);
@@ -1779,6 +1889,44 @@ unsafe extern "C" fn panel_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_scope_fallback_rejects_password_and_unknown_controls() {
+        use windows::Win32::UI::WindowsAndMessaging::*;
+        unsafe {
+            let module = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("Msftedit.dll")).unwrap();
+            struct Window(HWND);
+            impl Drop for Window {
+                fn drop(&mut self) { unsafe { let _ = DestroyWindow(self.0); } }
+            }
+            for class in [w!("EDIT"), w!("RICHEDIT50W")] {
+                let plain = Window(CreateWindowExW(WINDOW_EX_STYLE(0), class, w!(""),
+                    WS_POPUP, 0, 0, 100, 30, None, None, None, None).unwrap());
+                assert_eq!(native_edit_access(plain.0), InputAccess::Allowed);
+                SendMessageW(plain.0, 0x00cc, WPARAM('*' as usize), LPARAM(0));
+                assert_eq!(native_edit_access(plain.0), InputAccess::Blocked);
+                SendMessageW(plain.0, 0x00cc, WPARAM(0), LPARAM(0));
+                assert_eq!(native_edit_access(plain.0), InputAccess::Allowed);
+                let password = Window(CreateWindowExW(WINDOW_EX_STYLE(0), class, w!(""),
+                    WS_POPUP | WINDOW_STYLE(ES_PASSWORD as u32), 0, 0, 100, 30,
+                    None, None, None, None).unwrap());
+                assert_eq!(native_edit_access(password.0), InputAccess::Blocked);
+            }
+            let unknown = Window(CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!(""),
+                WS_POPUP, 0, 0, 100, 30, None, None, None, None).unwrap());
+            assert_eq!(native_edit_access(unknown.0), InputAccess::Unknown);
+            assert_eq!(native_edit_access(HWND::default()), InputAccess::Unknown);
+            let _ = FreeLibrary(module);
+        }
+    }
+
+    #[test]
+    fn service_exposes_both_activation_interfaces() {
+        let service: ITfTextInputProcessorEx = Service::new().unwrap().into();
+        let legacy = service.cast::<ITfTextInputProcessor>().unwrap();
+        assert!(legacy.cast::<ITfTextInputProcessorEx>().is_ok());
+        assert!(legacy.cast::<ITfKeyEventSink>().is_ok());
+    }
 
     #[test]
     fn composing_digits_are_routed_to_process_key() {
