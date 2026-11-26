@@ -194,6 +194,7 @@ object Core {
                 }
         val cfg =
             settings(ctx)
+                .put("undo_commit_on_backspace", true)
                 .put("background_sync", true)
                 .put("platform", "android")
                 .put("device_id", id)
@@ -251,7 +252,7 @@ object Core {
         )
 
     fun save(ctx: Context, cfg: JSONObject, done: (Result<Any>) -> Unit) =
-        call(ctx, "configure", cfg, true) { result ->
+        call(ctx, "configure", cfg.put("undo_commit_on_backspace", true), true) { result ->
             if (result.isSuccess) {
                 (result.getOrNull() as? JSONObject)?.optJSONArray("shortcuts")?.let { cfg.put("shortcuts", it) }
                 ctx.getSharedPreferences("vitral", 0)

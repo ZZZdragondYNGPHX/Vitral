@@ -687,11 +687,14 @@ internal class Key(
         c.drawRoundRect(keyRect, r, r, borderPaint)
         borderPaint.shader = null
 
-        // Subtle charging progress bar during a continuous 3-second hold on Backspace
+        // Subtle charging progress bar during a continuous 1-second hold on Backspace
         if (label == "⌫" && isPressed && clearAllPending && !clearAllArmed && pressedAt > 0L) {
             val elapsed = (now - pressedAt).coerceAtLeast(0L)
-            if (elapsed >= 600L) {
-                val frac = ((elapsed - 600f) / (CLEAR_ALL_HOLD_MS - 600f)).coerceIn(0f, 1f)
+            if (elapsed >= CLEAR_ALL_PROGRESS_START_MS) {
+                val frac =
+                    ((elapsed - CLEAR_ALL_PROGRESS_START_MS).toFloat() /
+                        (CLEAR_ALL_HOLD_MS - CLEAR_ALL_PROGRESS_START_MS).toFloat())
+                        .coerceIn(0f, 1f)
                 val barInset = context.dpF(4f)
                 val barH = context.dpF(2.5f)
                 val barW = ((keyRect.width() - barInset * 2f) * frac).coerceAtLeast(0f)
@@ -1025,7 +1028,8 @@ internal class Key(
     }
 
     companion object {
-        private const val CLEAR_ALL_HOLD_MS = 3000L
+        internal const val CLEAR_ALL_HOLD_MS = 1000L
+        private const val CLEAR_ALL_PROGRESS_START_MS = 360L
         private val regularTypeface: Typeface by lazy { Typeface.create("sans-serif", Typeface.NORMAL) }
         private val mediumTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.NORMAL) }
         private val boldTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.BOLD) }
@@ -1217,6 +1221,37 @@ internal class ThumbBiasEstimator {
     }
 }
 
+internal fun resolveAutoCapMode(fieldKind: String, inputType: Int): Int {
+    if (fieldKind != "text" || inputType == android.text.InputType.TYPE_NULL) return 0
+    return when {
+        inputType and android.text.InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS != 0 -> 3
+        inputType and android.text.InputType.TYPE_TEXT_FLAG_CAP_WORDS != 0 -> 2
+        inputType and android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES != 0 -> 1
+        else -> 0
+    }
+}
+
+internal fun shouldAutoCapitalize(
+    autoCapEnabled: Boolean,
+    autoCapMode: Int,
+    beforeCursor: String?,
+    manualLowercaseOverride: Boolean,
+): Boolean {
+    if (!autoCapEnabled || autoCapMode == 0 || manualLowercaseOverride) return false
+    val before = beforeCursor ?: return false
+    return when (autoCapMode) {
+        3 -> true
+        2 -> before.isEmpty() || before.last().isWhitespace()
+        1 ->
+            before.isEmpty() ||
+                before.endsWith("\n") ||
+                before.endsWith(". ") ||
+                before.endsWith("! ") ||
+                before.endsWith("? ")
+        else -> false
+    }
+}
+
 /**
  * 2D Gaussian soft spatial model over all letter keys (horizontal, vertical, diagonal 8-neighborhood).
  * Returns up to 2 spatially nearby alternative lowercase letters ordered by increasing log-penalty.
@@ -1235,8 +1270,8 @@ internal fun computeSpatialTouchHint(
     }
     val adjX = tapX - biasX
     val adjY = tapY - biasY
-    val sigmaX = primary.width * 0.52f
-    val sigmaY = primary.height * 0.58f
+    val sigmaX = primary.width * 0.36f
+    val sigmaY = primary.height * 0.40f
     val dx0 = (adjX - primary.cx) / sigmaX
     val dy0 = (adjY - primary.cy) / sigmaY
     val d0Sq = dx0 * dx0 + dy0 * dy0
@@ -1256,7 +1291,7 @@ internal fun computeSpatialTouchHint(
         val ny = (adjY - cand.cy) / sigmaY
         val dSq = nx * nx + ny * ny
         val penalty = ((dSq - d0Sq).coerceAtLeast(0.15f)) * 0.5f
-        if (penalty > 4.5f) continue
+        if (penalty > 3.0f) continue
         val code = ch.code
         if (penalty < best1Pen) {
             best2Char = best1Char

@@ -187,7 +187,7 @@ struct SyllableDag {
     exact_end: usize,
 }
 
-const SPATIAL_WEIGHT: f64 = 1.0;
+const SPATIAL_WEIGHT: f64 = 2.5;
 const MAX_SPATIAL_EDITS: u8 = 2;
 const BETA_ZERO_SPLIT: f64 = 16.0;
 const INITIAL_PENALTY: f64 = 12.0;
@@ -1069,7 +1069,12 @@ fn decode_from_syllable_dag(
                             full_span_readings
                                 .push((path_reading(&mut readings), cur_zero_pen > 0.0));
                         }
-                        let limit = if cur_syls.len() == 1 { 12 } else { 8 };
+                        let limit = match (spatial_edits > 0, cur_syls.len() == 1) {
+                            (true, true) => 3,
+                            (true, false) => 2,
+                            (false, true) => 12,
+                            (false, false) => 8,
+                        };
                         for (word, weight) in cands.take(limit) {
                             let is_erased =
                                 retention.is_some_and(|r| r.erased_words.contains(word));
@@ -1563,10 +1568,14 @@ fn decode_from_syllable_dag(
     let mut seen_texts = HashSet::new();
     let mut reverse_edges = Vec::new();
     let mut text = String::new();
+    let mut spatial_count = 0;
     while let Some(node) = pq.pop() {
         let step = beams[node.pos][node.state_idx]
             .step
             .expect("nonempty beam path");
+        if step.spatial_edits > 0 && spatial_count >= 2 {
+            continue;
+        }
         if let Some(mut candidate) = beam_candidate(
             paths,
             step,
@@ -1579,6 +1588,7 @@ fn decode_from_syllable_dag(
             if step.start == 0 {
                 candidate.full_span_frecency_bonus = full_span_frecency_bonuses[usize::from(step.edge)];
             }
+            spatial_count += usize::from(candidate.spatial_edits > 0);
             out.push(candidate);
             if out.len() >= top_k {
                 break;
@@ -1732,7 +1742,7 @@ fn decode_from_syllable_dag(
     for end in (1..n).rev() {
         if let Some(step) = beams[end]
             .iter()
-            .find(|st| st.all_cjk)
+            .find(|st| st.all_cjk && st.step.is_some_and(|step| step.spatial_edits == 0))
             .and_then(|st| st.step)
         {
             if let Some(candidate) = beam_candidate(
@@ -1957,7 +1967,7 @@ pub(super) struct ExactWordMatch {
 
 impl ExactWordMatch {
     fn protects_spatial(&self) -> bool {
-        self.personal || self.weight >= HIGH_DICTIONARY_WEIGHT
+        self.personal || self.weight > 0
     }
 
     pub(super) fn allows(&self, level: TypoCorrectionLevel) -> bool {
@@ -1973,9 +1983,9 @@ impl ExactWordMatch {
     pub(super) fn supports(&self, level: TypoCorrectionLevel, quality: u8, weight: u64) -> bool {
         self.weight == 0
             || (weight > 0
+                && quality <= 1
                 && (self.weight < HIGH_DICTIONARY_WEIGHT
                     || (level == TypoCorrectionLevel::Aggressive
-                        && quality <= 1
                         && weight > self.weight)))
     }
 }
@@ -2600,6 +2610,44 @@ fn legal_quanpin(text: &str) -> bool {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn exact_dictionary_words_reject_loose_typo_edits() {
+        for level in [TypoCorrectionLevel::Standard, TypoCorrectionLevel::Aggressive] {
+            let exact = ExactWordMatch { weight: 4965, personal: false };
+            assert!(exact.protects_spatial());
+            for quality in 0..=4 {
+                assert_eq!(exact.supports(level, quality, 100_000), quality <= 1);
+                assert!(ExactWordMatch::default().supports(level, quality, 100_000));
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_aishi_keeps_exact_word_ahead_of_bounded_spatial_corrections() {
+        use crate::eng::SpatialAlt;
+
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        let corpus = RimeDictCorpus::load_or_fallback(Some(&assets));
+        assert_eq!(exact_word_match("aishi", false, &corpus, None, None).weight, 4965);
+        let hints: Vec<_> = b"aishi".iter().copied()
+            .zip([*b"qz", *b"uo", *b"ad", *b"uy", *b"uo"])
+            .map(|(primary, alternatives)| TouchKeyHint::new(
+                primary, alternatives.map(|ch| Some(SpatialAlt { ch, penalty: 1.0 })),
+            ))
+            .collect();
+        for level in [TypoCorrectionLevel::Standard, TypoCorrectionLevel::Aggressive] {
+            let candidates = decode_quanpin_with_touch(
+                "aishi", &corpus, None, None, None, 40, FuzzyPairs::NONE, false, "", level, Some(&hints),
+            );
+            assert_eq!(candidates[0].text, "碍事", "{candidates:?}");
+            assert!(candidates.iter().all(|c| !matches!(c.text.as_str(), "起诉" | "爱啊" | "唉阿姨")), "{candidates:?}");
+            let spatial: Vec<_> = candidates.iter().enumerate().filter(|(_, c)| c.spatial_edits > 0).collect();
+            assert!(!spatial.is_empty(), "{candidates:?}");
+            assert!(spatial.len() <= 2, "{candidates:?}");
+            assert!(spatial.iter().all(|(index, c)| *index > 0 && c.consumed_len == 5 && c.spatial_guarded && c.score < candidates[0].score));
+        }
+    }
 
     #[test]
     fn touch_lattice_limits_edits_per_syllable_and_across_words() {

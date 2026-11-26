@@ -1250,6 +1250,11 @@ impl VitralCore {
                             }
                         };
                         self.save_clipboard(&mut io, ClipboardWrites { current, ..Default::default() });
+                        drop(io);
+                        let InputState { engine, retention, .. } = &mut *st;
+                        let sync_st = self.sync.lock();
+                        let imported = self.imported_lexicon.read();
+                        return engine.refresh_candidates(&sync_st.clipboard, &imported, retention);
                     }
                 } else if (0x20..=0x7e).contains(&keycode) {
                     self.sync.lock().clipboard.hide_for_input();
@@ -3025,6 +3030,35 @@ mod tests {
                 assert_eq!(backspace.undo_commit_chars, 2);
                 assert_eq!(core.input.lock().engine.raw_input, "nihao");
             }
+        }
+    }
+
+    #[test]
+    fn backspace_dismisses_quick_paste_without_undoing_the_previous_commit() {
+        for keycode in [0x08, 0xff08] {
+            let core = VitralCore::init(r#"{"pure_offline":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
+            core.on_ime_open();
+            for ch in "nihao".chars() {
+                core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
+            }
+            let typed = core.candidate_state().unwrap();
+            let index = typed.candidates.iter().position(|item| item.text == "你好").unwrap();
+            assert_eq!(core.select_candidate(index).unwrap().commit_text.as_deref(), Some("你好"));
+
+            core.on_ime_close();
+            core.on_ime_open();
+            core.clipboard_push(serde_json::from_value(serde_json::json!({"content": "快捷粘贴"})).unwrap());
+            assert!(core.candidate_state().unwrap().candidates[0].quick_paste_id.is_some());
+            let backspace = core.process_key(keycode, 0, SwipeDir::None).unwrap();
+            assert_eq!(backspace.undo_commit_chars, 0);
+            assert!(backspace.commit_text.is_none());
+            assert!(backspace.preedit.text.is_empty());
+            assert!(backspace.candidates.iter().all(|item| item.quick_paste_id.is_none()));
+            assert!(core.input.lock().engine.raw_input.is_empty());
+            assert!(core.quick_paste_state().quick_paste.is_none());
+
+            // Dismissal consumes this key while preserving the pending word undo.
+            assert_eq!(core.process_key(keycode, 0, SwipeDir::None).unwrap().undo_commit_chars, 2);
         }
     }
 

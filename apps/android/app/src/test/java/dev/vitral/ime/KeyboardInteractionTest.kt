@@ -217,6 +217,10 @@ class KeyboardInteractionTest {
                 SpatialKeyCenter('b', 525f, 300f, w, h),
             )
         val primaryG = keys.first { it.ch == 'g' }
+        // Clean dead-center tap must not spray bogus neighbor wildcards (even with vertically aligned keys).
+        val withVertical = keys + SpatialKeyCenter('b', primaryG.cx, primaryG.cy + h, w, h)
+        val center = computeSpatialTouchHint(primaryG.cx, primaryG.cy, primaryG, withVertical)
+        assertTrue(center.isEmpty)
         // Tap near top-left corner of 'g' -> vertical/diagonal neighbors 't' and 'f' rank ahead of 'h'.
         val topLeft = computeSpatialTouchHint(432f, 128f, primaryG, keys)
         assertEquals('t'.code, topLeft.alt1Char)
@@ -236,5 +240,29 @@ class KeyboardInteractionTest {
         estimator.observe(0f, Float.POSITIVE_INFINITY, w, h)
         assertEquals(prevX, estimator.biasX)
         assertEquals(prevY, estimator.biasY)
+    }
+
+    @Test
+    fun clearAllHoldDurationIsOneSecond() {
+        assertEquals(1000L, Key.CLEAR_ALL_HOLD_MS)
+        assertEquals(1000L, AeviouKeyboard.CLEAR_ALL_HOLD_MS)
+    }
+
+    @Test
+    fun autoCapDefaultsOffAndNeverTriggersOnRawOrNullContextEditors() {
+        assertEquals(0, resolveAutoCapMode("text", android.text.InputType.TYPE_NULL))
+        assertEquals(0, resolveAutoCapMode("text", android.text.InputType.TYPE_CLASS_TEXT))
+        assertEquals(
+            1,
+            resolveAutoCapMode(
+                "text",
+                android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_CAP_SENTENCES,
+            ),
+        )
+        assertFalse(shouldAutoCapitalize(autoCapEnabled = false, autoCapMode = 1, beforeCursor = "", manualLowercaseOverride = false))
+        assertFalse(shouldAutoCapitalize(autoCapEnabled = true, autoCapMode = 1, beforeCursor = null, manualLowercaseOverride = false))
+        assertFalse(shouldAutoCapitalize(autoCapEnabled = true, autoCapMode = 1, beforeCursor = "", manualLowercaseOverride = true))
+        assertTrue(shouldAutoCapitalize(autoCapEnabled = true, autoCapMode = 1, beforeCursor = "", manualLowercaseOverride = false))
+        assertFalse(shouldAutoCapitalize(autoCapEnabled = true, autoCapMode = 1, beforeCursor = "a", manualLowercaseOverride = false))
     }
 }

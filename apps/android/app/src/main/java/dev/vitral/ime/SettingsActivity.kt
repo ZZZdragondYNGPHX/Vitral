@@ -369,8 +369,11 @@ class SettingsActivity : ComponentActivity() {
                 }
                 mutableStateOf(initial.toSet())
             }
-            var undoCommitOnBackspace by remember {
-                mutableStateOf(config.optBoolean("undo_commit_on_backspace", true))
+            var mobileBackspaceUndoCommit by remember {
+                mutableStateOf(config.optBoolean("mobile_backspace_undo_commit", false))
+            }
+            var mobileAutoCap by remember {
+                mutableStateOf(config.optBoolean("mobile_auto_cap", false))
             }
             var typoLevel by remember { mutableStateOf(config.optString("typo_correction_level", "standard")) }
             var quoteStyle by remember { mutableStateOf(config.optString("quote_style", "curly")) }
@@ -456,7 +459,9 @@ class SettingsActivity : ComponentActivity() {
                     .put("schema", if (flypy) "double_pinyin_flypy" else "rime_ice")
                     .put("fuzzy_pinyin", fuzzyPinyin)
                     .put("fuzzy_pinyin_pairs", JSONArray(fuzzyPairs.toList()))
-                    .put("undo_commit_on_backspace", undoCommitOnBackspace)
+                    .put("undo_commit_on_backspace", true)
+                    .put("mobile_backspace_undo_commit", mobileBackspaceUndoCommit)
+                    .put("mobile_auto_cap", mobileAutoCap)
                     .put("typo_correction_level", typoLevel)
                     .put("quote_style", quoteStyle)
                     .put("auto_micro_space", autoMicroSpace)
@@ -973,13 +978,25 @@ class SettingsActivity : ComponentActivity() {
 
                                         Spacer(Modifier.height(10.dp))
                                         GlassToggleRow(
-                                            "误上屏退格还原拼音",
-                                            "刚选错词后 5 秒内按退格直接撤回并恢复原拼音重选（键盘还支持全拼 u / 双拼 u' 部件拆字）",
-                                            checked = undoCommitOnBackspace,
+                                            "退格键自动还原候选框",
+                                            "关闭时按退格正常删除单字，选词后候选栏提供「↩ 重选」按需还原；开启后选词 5 秒内按退格直接还原原拼音",
+                                            checked = mobileBackspaceUndoCommit,
                                             showDivider = false,
                                             onCheckedChange = {
-                                                undoCommitOnBackspace = it
-                                                persistConfig(if (it) "已开启退格还原拼音" else "已关闭退格还原拼音")
+                                                mobileBackspaceUndoCommit = it
+                                                persistConfig(if (it) "已开启退格自动还原候选框" else "已关闭退格自动还原，保留候选栏重选")
+                                            },
+                                        )
+
+                                        Spacer(Modifier.height(10.dp))
+                                        GlassToggleRow(
+                                            "英文首字母自动大写",
+                                            "关闭时英文输入默认保持小写，仅在手动按 Shift 时切换大写",
+                                            checked = mobileAutoCap,
+                                            showDivider = false,
+                                            onCheckedChange = {
+                                                mobileAutoCap = it
+                                                persistConfig(if (it) "已开启英文首字母自动大写" else "已关闭英文首字母自动大写")
                                             },
                                         )
 

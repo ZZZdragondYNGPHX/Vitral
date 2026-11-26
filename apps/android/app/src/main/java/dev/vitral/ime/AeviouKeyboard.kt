@@ -844,7 +844,7 @@ internal class AeviouKeyboard(
             c.drawText(hudSummary, width * 0.5f, hudTextY, subPaint)
         } else if (pressedAction?.id == "⌫" && (clearAllArmed || clearAllPending)) {
             val elapsed = (SystemClock.uptimeMillis() - actionPressedAt).coerceAtLeast(0L)
-            if (clearAllArmed || elapsed >= 600L) {
+            if (clearAllArmed || elapsed >= CLEAR_ALL_PROGRESS_START_MS) {
                 val hudText =
                     when {
                         clearAllArmed && clearAllSwipeUp -> "松手立即清空输入框全文"
@@ -1119,7 +1119,8 @@ internal class AeviouKeyboard(
     }
 
     companion object {
-        private const val CLEAR_ALL_HOLD_MS = 3000L
+        internal const val CLEAR_ALL_HOLD_MS = 1000L
+        private const val CLEAR_ALL_PROGRESS_START_MS = 360L
         private const val TRAIL_CAPACITY = 48
         private val HEX_COS = FloatArray(6) { i -> cos((PI / 180.0) * (60.0 * i - 30.0)).toFloat() }
         private val HEX_SIN = FloatArray(6) { i -> sin((PI / 180.0) * (60.0 * i - 30.0)).toFloat() }

@@ -4852,6 +4852,35 @@ mod personalization_tests {
     }
 
     #[test]
+    fn android_touch_aishi_ranks_exact_bundled_word_first_across_pages() {
+        let assets = crate::imp::polyphone::default_assets_dir_candidates().unwrap();
+        for level in [TypoCorrectionLevel::Standard, TypoCorrectionLevel::Aggressive] {
+            let (mut engine, clipboard, imported, mut retention) = fixture();
+            engine.config.platform = "android".into();
+            engine.pure_rust.reload_assets(Some(&assets));
+            engine.pure_rust.typo_correction_level = level;
+            for (primary, alternatives) in b"aishi".iter().copied()
+                .zip([*b"qz", *b"uo", *b"ad", *b"uy", *b"uo"])
+            {
+                let hint = TouchKeyHint::new(
+                    primary, alternatives.map(|ch| Some(SpatialAlt { ch, penalty: 1.0 })),
+                );
+                engine.process_touch_key(
+                    u32::from(primary), 0, SwipeDir::None, hint, &clipboard, &imported, &mut retention,
+                ).unwrap();
+            }
+            assert_eq!(engine.current_candidates[0].text, "碍事", "{:?}", engine.current_candidates);
+            loop {
+                assert!(engine.current_candidates.iter().all(|c| !matches!(c.text.as_str(), "起诉" | "爱啊" | "唉阿姨")), "{:?}", engine.current_candidates);
+                if !engine.current_page.has_next {
+                    break;
+                }
+                engine.process_key('=' as u32, 0, SwipeDir::None, &clipboard, &imported, &mut retention).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn touch_keys_respect_exact_word_and_disabled_corrections() {
         let (mut engine, clipboard, imported, mut retention) = fixture();
         engine.pure_rust.typo_correction_level = TypoCorrectionLevel::Aggressive;

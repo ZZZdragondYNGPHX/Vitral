@@ -100,7 +100,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var fieldForceEnglish = false
     private var noPersonalizedLearning = false
     private var fieldKind = "text" // text | number | email | uri | password
+    private var autoCapEnabled = false
     private var autoCapMode = 0 // 0=none, 1=sentences, 2=words, 3=all
+    private var manualLowercaseOverride = false
     private var shiftState = 0 // 0=lower, 1=single, 2=capsLock
     private var lastShiftTapMs = 0L
     private var lastSpaceTapMs = 0L
@@ -113,7 +115,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var lastUndoCommitText = ""
     private var lastUndoCommitSnapshot = ""
     private var lastUndoCommitAtMs = 0L
-    private var undoCommitEnabled = true
+    private var undoCommitExpiryTask: Runnable? = null
+    private var backspaceUndoCommitEnabled = false
     private var lastDeletedText = ""
     private var lastDeletedAtMs = 0L
     private var voiceActive = false
@@ -596,7 +599,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         themePref = cfg.optString("theme", "system")
         quoteStyle = cfg.optString("quote_style", "curly")
         hapticStrength = cfg.optString("mobile_haptic_strength", "medium")
-        undoCommitEnabled = cfg.optBoolean("undo_commit_on_backspace", true)
+        autoCapEnabled = cfg.optBoolean("mobile_auto_cap", false)
+        backspaceUndoCommitEnabled = cfg.optBoolean("mobile_backspace_undo_commit", false)
         sublabelMode =
             when (cfg.optString("mobile_sublabel_mode", "dual")) {
                 "symbols" -> SublabelMode.SYMBOLS
@@ -662,14 +666,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             passwordEditor ||
                 ((info?.imeOptions ?: 0) and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
         numbers = fieldKind == "number"
-        autoCapMode =
-            when {
-                fieldKind != "text" -> 0
-                inputType and InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS != 0 -> 3
-                inputType and InputType.TYPE_TEXT_FLAG_CAP_WORDS != 0 -> 2
-                inputType and InputType.TYPE_TEXT_FLAG_CAP_SENTENCES != 0 -> 1
-                else -> 1
-            }
+        autoCapMode = resolveAutoCapMode(fieldKind, inputType)
+        manualLowercaseOverride = false
         lastCommittedText = ""
         pendingKeyOps = 0
         currentSelStart = info?.initialSelStart ?: -1
@@ -727,6 +725,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         currentSelStart = newSelStart
         currentSelEnd = newSelEnd
         lastComposingStart = candidatesStart
+        val hadUndo = lastUndoCommitText.isNotEmpty()
         if (lastUndoCommitEnd >= 0) {
             if (candidatesStart != -1 || newSelStart != newSelEnd) {
                 clearUndoCommitAnchor()
@@ -739,6 +738,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             } else if (newSelStart != lastUndoCommitEnd) {
                 clearUndoCommitAnchor()
             }
+        }
+        if (hadUndo && lastUndoCommitText.isEmpty()) {
+            candidates()
         }
         if (lastVoiceCommitted.isNotEmpty() || voiceCommitEnd >= 0) {
             if (candidatesStart != -1 || newSelStart != newSelEnd) {
@@ -772,11 +774,27 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun clearUndoCommitAnchor() {
+        undoCommitExpiryTask?.let { main.removeCallbacks(it) }
+        undoCommitExpiryTask = null
         lastUndoCommitEnd = -1
         awaitingUndoCommitCursor = false
         lastUndoCommitText = ""
         lastUndoCommitSnapshot = ""
         lastUndoCommitAtMs = 0L
+    }
+
+    private fun scheduleUndoCommitExpiry() {
+        undoCommitExpiryTask?.let { main.removeCallbacks(it) }
+        val gen = editor
+        val committedAt = lastUndoCommitAtMs
+        val task = Runnable {
+            if (alive && active && editor == gen && lastUndoCommitAtMs == committedAt && lastUndoCommitText.isNotEmpty()) {
+                clearUndoCommitAnchor()
+                candidates()
+            }
+        }
+        undoCommitExpiryTask = task
+        main.postDelayed(task, 4500L)
     }
 
     private fun invalidateSurroundingCache() {
@@ -828,20 +846,21 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun updateAutoCap(redraw: Boolean) {
-        if (!english || fieldKind != "text" || passwordEditor || shiftState == 2 || autoCapMode == 0)
+        if (!english || fieldKind != "text" || passwordEditor || shiftState == 2 || !autoCapEnabled || autoCapMode == 0)
             return
-        val before = readBeforeCursor(currentInputConnection, 4)
-        val shouldCap =
-            when (autoCapMode) {
-                3 -> true
-                2 -> before.isEmpty() || before.last().isWhitespace()
-                else ->
-                    before.isEmpty() ||
-                        before.endsWith("\n") ||
-                        before.endsWith(". ") ||
-                        before.endsWith("! ") ||
-                        before.endsWith("? ")
+        val ic = currentInputConnection
+        val before: String? =
+            if (ic == null) {
+                null
+            } else if (Build.VERSION.SDK_INT >= 31) {
+                ic.getSurroundingText(4, 0, 0)?.let { st ->
+                    val selStart = st.selectionStart.coerceIn(0, st.text.length)
+                    st.text.subSequence(0, selStart).toString()
+                } ?: ic.getTextBeforeCursor(4, 0)?.toString()
+            } else {
+                ic.getTextBeforeCursor(4, 0)?.toString()
             }
+        val shouldCap = shouldAutoCapitalize(autoCapEnabled, autoCapMode, before, manualLowercaseOverride)
         val next = if (shouldCap) 1 else 0
         if (next != shiftState) {
             shiftState = next
@@ -894,6 +913,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         voiceActive = false
         voicePartialText = ""
         clearVoiceCommitAnchor()
+        clearUndoCommitAnchor()
         microphone.cancel()
     }
 
@@ -2607,7 +2627,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 !inlineSuggestionsActive &&
                 shown.length() == 0 &&
                 predictionText.isEmpty() &&
-                lastDeletedText.isEmpty()
+                lastDeletedText.isEmpty() &&
+                lastUndoCommitText.isEmpty()
         if (idleQuickPunc) {
             val sig = "idle:$fieldKind:$english:$isDarkTheme:$font"
             if (idleStripSignature == sig && bar.childCount > 0) return
@@ -2944,6 +2965,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                             invalidateSurroundingCache()
                         }
                         clearVoiceCommitAnchor()
+                    }
+                }
+            )
+        }
+        if (!composing && lastUndoCommitText.isNotEmpty()) {
+            addBarItem(
+                label("↩ 重选", subtle = true) {
+                    currentInputConnection?.let { ic ->
+                        if (!performUndoLastCommit(ic, allowUnsettledCursor = true)) {
+                            clearUndoCommitAnchor()
+                            candidates()
+                        }
                     }
                 }
             )
@@ -4621,12 +4654,14 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     }
                 } else {
                     val now = SystemClock.uptimeMillis()
+                    val previousShift = shiftState
                     shiftState =
                         when {
                             shiftState == 1 && now - lastShiftTapMs <= 340L -> 2
                             shiftState > 0 -> 0
                             else -> 1
                         }
+                    manualLowercaseOverride = previousShift > 0 && shiftState == 0
                     lastShiftTapMs = now
                     refreshKeyboardCase()
                 }
@@ -4674,6 +4709,12 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (lastDeletedText.isNotEmpty() && effectiveLabel != "⌫") {
             lastDeletedText = ""
         }
+        if (lastUndoCommitText.isNotEmpty() && effectiveLabel != "⌫") {
+            clearUndoCommitAnchor()
+        }
+        if (effectiveLabel == "空格" || effectiveLabel == "↵") {
+            manualLowercaseOverride = false
+        }
         if (lastVoiceCommitted.isNotEmpty() || voiceCommitEnd >= 0) {
             clearVoiceCommitAnchor()
         }
@@ -4705,8 +4746,24 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         } else {
             lastSpaceTapMs = 0L
         }
+        val dismissPaste =
+            effectiveLabel == "⌫" &&
+                !composing &&
+                shown.length() > 0 &&
+                shown.getJSONObject(0).has("quick_paste_id")
+        if (dismissPaste) {
+            val remaining = JSONArray()
+            for (i in 0 until shown.length()) {
+                val item = shown.getJSONObject(i)
+                if (!item.has("quick_paste_id")) remaining.put(item)
+            }
+            shown = remaining
+            pasteVisible = false
+            pasteId = ""
+            candidates()
+        }
         // Password / email / URL fields bypass Chinese engine completely for zero leakage
-        if (fieldForceEnglish && !composing) {
+        if (!dismissPaste && fieldForceEnglish && !composing) {
             when (effectiveLabel) {
                 "⌫" -> deleteWithSelectionOrSingle(ic)
                 "↵" ->
@@ -4731,51 +4788,23 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 "↵" -> "Return"
                 else -> effectiveLabel
             }
-        val dismissPaste =
-            effectiveLabel == "⌫" &&
-                !composing &&
-                shown.length() > 0 &&
-                shown.getJSONObject(0).has("quick_paste_id")
         val startedComposing = composing
         val backspace = effectiveLabel == "⌫"
-        var preDeletedUndoText: String? = null
+        val rawEnterCommit = startedComposing && effectiveLabel == "↵"
         // When no earlier keystrokes are in flight and we are idle, decide undo synchronously
         // BEFORE sending BackSpace to core so refusing editors or repeat-delete never desync core.
         if (backspace && !startedComposing && !dismissPaste && pendingKeyOps == 0) {
-            val withinWindow =
-                lastUndoCommitText.isNotEmpty() &&
-                    SystemClock.uptimeMillis() - lastUndoCommitAtMs <= 4500L
-            val atCommitPos =
-                lastUndoCommitEnd >= 0 &&
-                    !awaitingUndoCommitCursor &&
-                    currentSelStart == lastUndoCommitEnd &&
-                    currentSelEnd == lastUndoCommitEnd
-            val snapLen = lastUndoCommitSnapshot.length.coerceAtLeast(lastUndoCommitText.length)
-            val snapshotMatches =
-                lastUndoCommitSnapshot.isNotEmpty() &&
-                    ic.getTextBeforeCursor(snapLen, 0)?.toString() == lastUndoCommitSnapshot
-            val eligibleUndo =
-                undoCommitEnabled &&
-                    !isRepeatDelete &&
-                    withinWindow &&
-                    atCommitPos &&
-                    snapshotMatches &&
-                    ic.getSelectedText(0).isNullOrEmpty()
-            val candidateUndo = lastUndoCommitText
-            clearUndoCommitAnchor()
-            if (eligibleUndo) {
-                if (!ic.deleteSurroundingText(candidateUndo.length, 0)) {
-                    // Editor refused deletion: never wake core undo or penalize learning.
+            if (backspaceUndoCommitEnabled && !isRepeatDelete) {
+                if (performUndoLastCommit(ic, allowUnsettledCursor = false)) {
                     return
                 }
-                invalidateSurroundingCache()
-                lastCommittedText = ""
-                preDeletedUndoText = candidateUndo
-            } else {
-                deleteWithSelectionOrSingle(ic)
-                updateAutoCap(redraw = true)
-                return
+            } else if (lastUndoCommitText.isNotEmpty()) {
+                clearUndoCommitAnchor()
+                candidates()
             }
+            deleteWithSelectionOrSingle(ic)
+            updateAutoCap(redraw = true)
+            return
         }
         val reqEditor = editor
         val generation = inputGeneration
@@ -4788,40 +4817,28 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
         }
         val onResult: (JSONObject) -> Unit = { r ->
-            val undoChars = r.optInt("undo_commit_chars", 0)
-            val undoText = if (!r.isNull("undo_commit_text")) r.optString("undo_commit_text") else ""
             when {
                 dismissPaste -> {
                     applyAction(r)
                     call("quick-paste-state") { updatePaste(it) }
                 }
-                preDeletedUndoText != null -> {
-                    if (undoChars > 0) {
-                        applyAction(r)
-                    } else {
-                        // Core declined undo (e.g. expired right at boundary): restore text and delete 1 char.
-                        ic.commitText(preDeletedUndoText, 1)
-                        invalidateSurroundingCache()
-                        deleteWithSelectionOrSingle(ic)
-                        updateAutoCap(redraw = true)
-                    }
-                }
                 shouldDeleteHostText(composing, startedComposing, isRepeatDelete)
                     && effectiveLabel == "⌫" -> {
-                    deleteWithSelectionOrSingle(ic)
+                    deleteWithSelectionOrSingle(ic, coreAlreadyNotifiedOne = true)
                     updateAutoCap(redraw = true)
                 }
                 !composing && effectiveLabel == "↵" -> {
                     if (!sendDefaultEditorAction(true)) sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
                     updateAutoCap(redraw = true)
                 }
-                else -> applyAction(r)
+                else -> applyAction(r, allowUndoAnchor = !rawEnterCommit)
             }
         }
         val nativeCode = nativeKeycode(code)
         // Non-zero modifier prevents core from triggering undo on queued BackSpace when host
-        // has not pre-verified & deleted the committed text synchronously.
-        val keyModifiers = if (backspace && preDeletedUndoText == null) 1 else 0
+        // has not pre-verified & deleted the committed text synchronously. Keep 0 for dismissPaste
+        // so core's Android quick-paste BackSpace dismissal runs.
+        val keyModifiers = if (backspace && !dismissPaste) 1 else 0
         val touchHint =
             if (::body.isInitialized) {
                 val isChineseLetter = !english && keyModifiers == 0 && nativeCode in 'a'.code..'z'.code
@@ -4850,21 +4867,124 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
-    private fun deleteWithSelectionOrSingle(ic: android.view.inputmethod.InputConnection) {
+    private fun performUndoLastCommit(
+        ic: android.view.inputmethod.InputConnection,
+        allowUnsettledCursor: Boolean,
+    ): Boolean {
+        if (composing || pendingKeyOps > 0 || lastUndoCommitText.isEmpty()) return false
+        val withinWindow = SystemClock.uptimeMillis() - lastUndoCommitAtMs <= 4500L
+        val expectedEnd = lastUndoCommitEnd
+        val wasAwaitingCursor = awaitingUndoCommitCursor
+        val initialSelStart = currentSelStart
+        val initialSelEnd = currentSelEnd
+        val atCommitPos =
+            expectedEnd >= 0 &&
+                ((allowUnsettledCursor && wasAwaitingCursor) ||
+                    (!wasAwaitingCursor &&
+                        currentSelStart == expectedEnd &&
+                        currentSelEnd == expectedEnd))
+        val snapLen = lastUndoCommitSnapshot.length.coerceAtLeast(lastUndoCommitText.length)
+        val expectedSnapshot = lastUndoCommitSnapshot
+        val snapshotMatches =
+            expectedSnapshot.isNotEmpty() &&
+                ic.getTextBeforeCursor(snapLen, 0)?.toString() == expectedSnapshot
+        val eligibleUndo =
+            withinWindow &&
+                atCommitPos &&
+                snapshotMatches &&
+                ic.getSelectedText(0).isNullOrEmpty()
+        val candidateUndo = lastUndoCommitText
+        clearUndoCommitAnchor()
+        if (!eligibleUndo) return false
+        val reqEditor = editor
+        val generation = inputGeneration
+        pendingKeyOps += 1
+        backspaceFlight.onDispatched()
+        val onComplete = {
+            if (editor == reqEditor && generation == inputGeneration) {
+                if (pendingKeyOps > 0) pendingKeyOps -= 1
+                backspaceFlight.onCompleted()
+            }
+        }
+        processKeyDirect(
+            8,
+            modifiers = 0,
+            onComplete = onComplete,
+        ) { r ->
+            val liveIc = currentInputConnection
+            val undoChars = r.optInt("undo_commit_chars", 0)
+            if (undoChars > 0 && liveIc != null) {
+                val stillAtPos =
+                    (currentSelStart == expectedEnd && currentSelEnd == expectedEnd) ||
+                        (allowUnsettledCursor &&
+                            wasAwaitingCursor &&
+                            currentSelStart == initialSelStart &&
+                            currentSelEnd == initialSelEnd)
+                val stillMatches =
+                    stillAtPos &&
+                        liveIc.getSelectedText(0).isNullOrEmpty() &&
+                        liveIc.getTextBeforeCursor(snapLen, 0)?.toString() == expectedSnapshot
+                val nextPre = r.optJSONObject("preedit")?.optString("text").orEmpty()
+                liveIc.beginBatchEdit()
+                val deleted =
+                    stillMatches &&
+                        nextPre.isNotEmpty() &&
+                        liveIc.deleteSurroundingText(candidateUndo.length, 0)
+                if (deleted) {
+                    if (liveIc.setComposingText(nextPre, 1)) {
+                        invalidateSurroundingCache()
+                        lastCommittedText = ""
+                        applyAction(r)
+                        liveIc.endBatchEdit()
+                    } else {
+                        liveIc.commitText(candidateUndo, 1)
+                        invalidateSurroundingCache()
+                        liveIc.endBatchEdit()
+                        processKeyDirect(27) { esc -> applyAction(esc) }
+                    }
+                } else {
+                    liveIc.endBatchEdit()
+                    processKeyDirect(27) { esc -> applyAction(esc) }
+                }
+            } else if (liveIc != null) {
+                if (!allowUnsettledCursor) {
+                    deleteWithSelectionOrSingle(liveIc, coreAlreadyNotifiedOne = true)
+                    updateAutoCap(redraw = true)
+                } else {
+                    candidates()
+                }
+            }
+        }
+        return true
+    }
+
+    private fun deleteWithSelectionOrSingle(
+        ic: android.view.inputmethod.InputConnection,
+        coreAlreadyNotifiedOne: Boolean = false,
+    ) {
         val selected = ic.getSelectedText(0)?.toString().orEmpty()
         if (selected.isNotEmpty()) {
             if (ic.commitText("", 1)) {
                 invalidateSurroundingCache()
                 recordDeletedForUndo(selected)
-                val extra = selected.codePointCount(0, selected.length) - 1
-                if (!passwordEditor && extra > 0) {
-                    Core.call(this, "notify-deleted-chars", json("count" to extra))
+                val count =
+                    selected.codePointCount(0, selected.length) -
+                        if (coreAlreadyNotifiedOne) 1 else 0
+                if (!passwordEditor && count > 0) {
+                    Core.call(this, "notify-deleted-chars", json("count" to count))
                 }
                 if (lastDeletedText.isNotEmpty()) candidates()
+                return
             }
-        } else {
-            ic.deleteSurroundingTextInCodePoints(1, 0)
-            invalidateSurroundingCache()
+        }
+        val mayDeleteChar =
+            !passwordEditor &&
+                !coreAlreadyNotifiedOne &&
+                ic.getTextBeforeCursor(1, 0)?.isNotEmpty() != false
+        sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+        invalidateSurroundingCache()
+        if (mayDeleteChar) {
+            Core.call(this, "notify-deleted-chars", json("count" to 1))
         }
     }
 
@@ -4890,11 +5010,16 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             return
         }
         if (passwordEditor) {
-            ic.deleteSurroundingTextInCodePoints(1, 0)
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
             invalidateSurroundingCache()
             return
         }
-        val before = ic.getTextBeforeCursor(48, 0)?.toString().orEmpty()
+        val before = ic.getTextBeforeCursor(48, 0)?.toString()
+        if (before == null) {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            invalidateSurroundingCache()
+            return
+        }
         val (deleted, matchedLastCommit) = trailingWordDeleteSlice(before, lastCommittedText)
         if (deleted.isEmpty()) return
         if (matchedLastCommit) lastCommittedText = ""
@@ -5128,7 +5253,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
-    private fun applyAction(r: JSONObject) {
+    private fun applyAction(r: JSONObject, allowUndoAnchor: Boolean = true) {
         val ic = currentInputConnection ?: return
         val wasComposing = composing
         val clipboardCommit = r.optBoolean("clipboard_commit", false)
@@ -5142,7 +5267,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             invalidateSurroundingCache()
             if (!passwordEditor) {
                 if (committedOk) lastCommittedText = if (clipboardCommit) "" else committed
-                if (committedOk && !clipboardCommit && wasComposing && baseStart >= 0) {
+                if (allowUndoAnchor && committedOk && !clipboardCommit && wasComposing && baseStart >= 0) {
                     val snapshot = ic.getTextBeforeCursor(40, 0)?.toString().orEmpty()
                     if (snapshot.endsWith(committed)) {
                         lastUndoCommitEnd = baseStart + committed.length
@@ -5150,6 +5275,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         lastUndoCommitText = committed
                         lastUndoCommitSnapshot = snapshot
                         lastUndoCommitAtMs = SystemClock.uptimeMillis()
+                        scheduleUndoCommitExpiry()
                     } else {
                         clearUndoCommitAnchor()
                     }

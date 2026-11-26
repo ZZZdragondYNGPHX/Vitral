@@ -1,7 +1,7 @@
 {
   "name": "vitral-workspace",
   "private": true,
-  "version": "0.4.15",
+  "version": "0.4.16",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
     "tokens:gen": "python3 scripts/gen-tokens.py",
