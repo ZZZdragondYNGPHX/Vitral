@@ -400,7 +400,11 @@ impl KoofrDavClient {
         let transport = HttpTransporter::new(ReqwestTransport::new(client));
         let base_op = Operator::new(builder)
             .map_err(|e| VitralError::Io(format!("OpenDAL WebDAV builder failed: {e}")))?
-            .layer(TimeoutLayer::new().with_timeout(Duration::from_secs(15)));
+            .layer(
+                TimeoutLayer::new()
+                    .with_timeout(Duration::from_secs(20))
+                    .with_io_timeout(Duration::from_secs(20)),
+            );
         let ctx = base_op.base_context().with_http_transport(transport);
         Ok((base_op.with_context(ctx), clean_root))
     }
@@ -574,11 +578,9 @@ impl KoofrDavClient {
                 if entry.metadata().is_dir() {
                     folders.push(path.to_owned());
                 } else {
-                    let len = self
-                        .run_operation("storage", self.op.stat(path))?
-                        .map(|m| m.content_length())
-                        .map_err(|e| VitralError::Io(dav_error_summary(&e.to_string())))?;
-                    total = total.saturating_add(len);
+                    // WebDAV PROPFIND already includes each file's content length.
+                    // Avoid another network round trip for every listed file.
+                    total = total.saturating_add(entry.metadata().content_length());
                 }
             }
         }
@@ -1446,6 +1448,41 @@ mod http_device_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::mpsc;
+
+    #[test]
+    fn storage_uses_listing_sizes_without_per_file_requests() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let cfg = DavConfig {
+            endpoint: format!("http://{}/dav/", server.server_addr()),
+            root: Some("Vitral".into()),
+            ..Default::default()
+        };
+        let worker = std::thread::spawn(move || {
+            for (folder, entries) in [
+                ("lexicon/", vec![("a.enc", Some(12)), ("empty.enc", Some(0)), ("nested/", None)]),
+                ("lexicon/nested/", vec![("b.enc", Some(34))]),
+            ] {
+                let request = server.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+                assert_eq!(request.method().as_str(), "PROPFIND");
+                assert_eq!(request.url(), format!("/dav/Vitral/{folder}"));
+                let mut xml = String::from(r#"<?xml version="1.0"?><d:multistatus xmlns:d="DAV:">"#);
+                for (name, length) in std::iter::once(("", None)).chain(entries) {
+                    let properties = match length {
+                        Some(length) => format!("<d:resourcetype/><d:getcontentlength>{length}</d:getcontentlength>"),
+                        None => "<d:resourcetype><d:collection/></d:resourcetype>".into(),
+                    };
+                    xml.push_str(&format!("<d:response><d:href>/dav/Vitral/{folder}{name}</d:href><d:propstat><d:prop>{properties}<d:getlastmodified>Thu, 01 Jan 2026 00:00:00 GMT</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>"));
+                }
+                xml.push_str("</d:multistatus>");
+                request.respond(tiny_http::Response::from_string(xml).with_status_code(207)).unwrap();
+            }
+        });
+        let client = KoofrDavClient::connect(&OfflineGuard::new(false), &cfg).unwrap();
+        let result = client.directory_bytes("lexicon/");
+        assert!(result.is_ok(), "{result:?}");
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), 46);
+    }
 
     fn current_clipboard_entry() -> ClipboardEntry {
         ClipboardEntry {

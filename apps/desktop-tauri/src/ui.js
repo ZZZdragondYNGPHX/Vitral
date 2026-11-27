@@ -1,6 +1,8 @@
 const $ = s => document.querySelector(s);
 const all = s => [...document.querySelectorAll(s)];
 const invoke = window.__TAURI__?.core.invoke;
+const CLOUD_SETTINGS = new Set(["koofr_endpoint", "koofr_username", "koofr_password", "sync_key"]);
+const CLOUD_ACTIONS = new Set(["sync-now", "sync-status", "storage", "restore-from-koofr"]);
 
 const ACTION_DESCRIPTIONS = {
   toggle_language: "在中文输入与输入法内英文模式间快速切换",
@@ -135,7 +137,7 @@ function readSavedComparable(settings, field) {
     );
   }
   return JSON.stringify(
-    settings[field] != null ? String(settings[field]) : String(el.defaultValue || "")
+    settings[field] != null ? String(settings[field]) : field === "koofr_endpoint" ? "" : String(el.defaultValue || "")
   );
 }
 
@@ -520,9 +522,9 @@ if (fuzzyMaster) {
   });
 }
 
-async function saveAll() {
+async function saveAll(onlyFields = null) {
   if (recordingShortcut) finishShortcut(null);
-  const conflicts = checkShortcutConflicts();
+  const conflicts = !onlyFields || onlyFields.has("shortcuts") ? checkShortcutConflicts() : [];
   if (conflicts.length) {
     setNotice(conflicts[0], "error");
     return;
@@ -532,11 +534,15 @@ async function saveAll() {
     return;
   }
   if (saving) {
+    if (onlyFields) {
+      await saveInFlight;
+      return saveAll(onlyFields);
+    }
     savePending = true;
     return saveInFlight;
   }
   pruneRevertedDirtyFields(saved);
-  if (dirtyFields.size === 0) {
+  if (![...dirtyFields].some(field => !onlyFields || onlyFields.has(field))) {
     if (!busy) setNotice("当前没有未保存的更改", "idle");
     return;
   }
@@ -549,9 +555,10 @@ async function saveAll() {
   saveInFlight = (async () => {
     try {
       do {
+        if (savePending) onlyFields = null;
         savePending = false;
         pruneRevertedDirtyFields(saved);
-        const fieldsToSave = new Set(dirtyFields);
+        const fieldsToSave = new Set([...dirtyFields].filter(field => !onlyFields || onlyFields.has(field)));
         if (fieldsToSave.size === 0) {
           if (!busy) setNotice("设置已保存", "ok");
           break;
@@ -623,7 +630,26 @@ async function saveAll() {
   return saveInFlight;
 }
 
-$("#save").onclick = saveAll;
+$("#save").onclick = () => saveAll();
+
+async function prepareCloudAction() {
+  const endpoint = $("#koofr-endpoint");
+  if (!endpoint.value.trim() || !endpoint.checkValidity()) {
+    endpoint.focus();
+    throw new Error("请填写有效的 WebDAV 地址");
+  }
+  // A displayed default must be persisted before the engine can use it.
+  markDirty("koofr_endpoint");
+  await saveAll(CLOUD_SETTINGS);
+  if ([...dirtyFields].some(field => CLOUD_SETTINGS.has(field))) {
+    throw new Error("同步设置尚未保存成功，请重试");
+  }
+  if (!engineConnected) throw new Error("输入服务尚未连接，请稍后重试");
+  const health = await api("sync-status");
+  renderSyncHealth(health);
+  if (health.pure_offline) throw new Error("纯离线模式已开启，云端同步已暂停");
+  if (!health.cloud_configured) throw new Error("云端同步尚未配置，请填写 WebDAV 地址");
+}
 
 // Ctrl+S / Cmd+S shortcut
 window.addEventListener("keydown", e => {
@@ -1009,6 +1035,14 @@ all("[data-action]").forEach(b => {
     }
 
     run(async () => {
+      if (CLOUD_ACTIONS.has(cmd)) await prepareCloudAction();
+      const cloudProgress = {
+        "sync-now": "正在同步云端数据…",
+        "sync-status": "正在检查云端连接…",
+        storage: "正在统计云端文件用量…",
+        "restore-from-koofr": "正在从云端恢复数据…",
+      };
+      if (cloudProgress[cmd]) setNotice(cloudProgress[cmd], "busy");
       const seqBeforeRestore = editSeq;
       const wasDirtyBeforeRestore = dirty;
       const tokenBeforeRestore =
@@ -1051,8 +1085,10 @@ all("[data-action]").forEach(b => {
       }
       if (cmd === "storage") renderUsage(data);
       if (cmd === "sync-status") {
+        // Status reports cached state; a read-only WebDAV request verifies the connection.
+        await api("cloud-check");
         renderSyncHealth(data);
-        setNotice("已刷新跨端同步链路状态", "ok");
+        setNotice("云端连接正常，已刷新同步状态", "ok");
         return;
       }
       if (cmd === "relay-discover") renderDevices(data || []);
@@ -1097,13 +1133,14 @@ all("[data-action]").forEach(b => {
       if (cmd === "personalization-clear") {
         renderHabitStats(data);
         setNotice("已清空个人习惯记忆（置顶词已保留）", "ok");
-      } else if (cmd === "poll-services") {
-        try {
-          const [usage, health] = await Promise.all([api("storage"), api("sync-status")]);
-          renderUsage(usage);
-          renderSyncHealth(health);
-        } catch {}
-        setNotice("已完成与 Koofr 云端同步", "ok");
+      } else if (cmd === "sync-now") {
+        const health = data;
+        renderSyncHealth(health);
+        if (health.pure_offline || !health.cloud_configured || !health.last_cloud_sync_ms) {
+          throw new Error("云端同步未完成，请检查同步设置后重试");
+        }
+        if (health.last_cloud_error) throw new Error(`云端同步失败：${health.last_cloud_error}`);
+        setNotice("已完成云端同步", "ok");
       } else if (cmd === "restore-from-koofr") {
         if (skippedPreferences && keptUnsavedChanges) {
           setNotice(
@@ -1148,7 +1185,7 @@ function renderSyncHealth(status) {
       ? "未配置 WebDAV"
       : status.last_cloud_error
         ? `异常：${status.last_cloud_error}`
-        : `正常 · ${fmtTs(status.last_cloud_sync_ms)}`;
+        : status.last_cloud_sync_ms ? `已同步 · ${fmtTs(status.last_cloud_sync_ms)}` : "已配置 · 尚未同步";
   const cells = [
     ["局域网通道", lanText],
     ["私有云通道", cloudText],

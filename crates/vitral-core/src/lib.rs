@@ -634,6 +634,23 @@ impl VitralCore {
         Ok(clipboard)
     }
 
+    /// An explicit cloud action must not report a skipped background poll as success.
+    pub fn sync_now(&self) -> Result<SyncHealthStatus, VitralError> {
+        self.offline_guard.require_online("sync-now")?;
+        if self.sync.lock().dav_config.is_none() {
+            return Err(VitralError::InvalidArgument("请先配置 WebDAV 地址".into()));
+        }
+        self.poll_services()?;
+        let status = self.sync_status();
+        if status.pure_offline || !status.cloud_configured || status.last_cloud_sync_ms == 0 {
+            return Err(VitralError::Io("云端同步未完成，请检查同步设置后重试".into()));
+        }
+        if let Some(error) = &status.last_cloud_error {
+            return Err(VitralError::Io(error.clone()));
+        }
+        Ok(status)
+    }
+
     fn flush_dirty_clipboard(&self, include_history: bool) {
         let mut io = self.sync_state_io.lock();
         let writes_history = include_history && io.clipboard_history_dirty;
@@ -991,6 +1008,14 @@ impl VitralCore {
             self.save_clipboard(&mut io, writes);
         }
         result
+    }
+
+    pub fn check_cloud_connection(&self) -> Result<(), VitralError> {
+        self.offline_guard.require_online("cloud-check")?;
+        let cfg = self.sync.lock().dav_config.clone().ok_or_else(|| VitralError::InvalidArgument("请先配置 WebDAV 地址".into()))?;
+        let client = crate::dav::KoofrDavClient::connect(&self.offline_guard, &cfg)?;
+        client.list_dir("")?;
+        Ok(())
     }
 
     pub fn cloud_usage(&self) -> Result<serde_json::Value, VitralError> {
@@ -2674,6 +2699,18 @@ impl VitralCore {
 mod tests {
     use super::*;
     use crate::eng::LangMode;
+
+    #[test]
+    fn explicit_cloud_actions_require_configuration() {
+        let core = VitralCore::init("{}").unwrap();
+        // Background polling remains valid for a local-only installation.
+        assert!(core.poll_services().is_ok());
+        assert!(matches!(core.sync_now(), Err(VitralError::InvalidArgument(_))));
+        assert!(matches!(core.check_cloud_connection(), Err(VitralError::InvalidArgument(_))));
+        core.set_pure_offline(true);
+        assert!(matches!(core.sync_now(), Err(VitralError::PureOfflineViolation(_))));
+        assert!(matches!(core.check_cloud_connection(), Err(VitralError::PureOfflineViolation(_))));
+    }
 
     #[test]
     fn core_init_and_pure_offline_gate_enforced() {

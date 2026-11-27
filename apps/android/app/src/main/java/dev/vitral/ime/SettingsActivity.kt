@@ -320,7 +320,13 @@ class SettingsActivity : ComponentActivity() {
         refreshImeStatus()
 
         setContent {
-            val config = remember { Core.settings(this@SettingsActivity) }
+            val config = remember {
+                Core.settings(this@SettingsActivity).apply {
+                    if (!has("koofr_endpoint") || isNull("koofr_endpoint")) {
+                        put("koofr_endpoint", "https://app.koofr.net/dav/Koofr")
+                    }
+                }
+            }
             var tab by remember { mutableIntStateOf(requestedTab) }
             var modelGroup by remember { mutableStateOf(requestedModelGroup) }
             var modelCap by remember { mutableStateOf(requestedModelCap) }
@@ -496,6 +502,36 @@ class SettingsActivity : ComponentActivity() {
                         textFieldsDirty = false
                         if (!feedback.isNullOrBlank()) showToast(feedback)
                         onSaved?.invoke()
+                    }.onFailure {
+                        busy = false
+                        showToast(it.message.orEmpty())
+                    }
+                }
+            }
+
+            fun persistCloudConfig(onSaved: () -> Unit) {
+                val endpoint = config.optString("koofr_endpoint").trim()
+                val uri = android.net.Uri.parse(endpoint)
+                if (uri.scheme !in listOf("http", "https") || uri.host.isNullOrBlank()) {
+                    showToast("请填写有效的 WebDAV 地址")
+                    return
+                }
+                busy = true
+                val merged = Core.settings(this@SettingsActivity)
+                for (key in listOf("koofr_endpoint", "koofr_username", "koofr_password", "sync_key")) {
+                    if (!config.has(key) || config.isNull(key)) continue
+                    val value = config.optString(key).let {
+                        if (key == "koofr_password") it.trim('\r', '\n') else it.trim()
+                    }
+                    if (key in listOf("koofr_password", "sync_key") && value.isEmpty()) continue
+                    merged.put(key, value)
+                }
+                Core.save(this@SettingsActivity, merged) { result ->
+                    result.onSuccess {
+                        textFieldsDirty = config.keys().asSequence().any { key ->
+                            config.opt(key).toString() != merged.opt(key).toString()
+                        }
+                        onSaved()
                     }.onFailure {
                         busy = false
                         showToast(it.message.orEmpty())
@@ -1410,11 +1446,17 @@ class SettingsActivity : ComponentActivity() {
                                             "Android 10+ 后台复制限制：可将「Vitral 剪贴板同步」添加到下拉快捷磁贴，或通过系统分享菜单直发跨端",
                                             trailing = {
                                                 GlassButton(
-                                                    "刷新",
+                                                    "检查连接",
                                                     style = GlassButtonStyle.Ghost,
+                                                    enabled = !busy && !offline,
                                                     onClick = {
-                                                        refreshClipboard()
-                                                        showToast("已刷新同步链路状态")
+                                                        persistCloudConfig {
+                                                            Core.call(this@SettingsActivity, "cloud-check", background = true) { r ->
+                                                                busy = false
+                                                                refreshClipboard()
+                                                                showToast(r.fold({ "云端连接正常" }, { it.message.orEmpty() }))
+                                                            }
+                                                        }
                                                     },
                                                 )
                                             },
@@ -1437,7 +1479,8 @@ class SettingsActivity : ComponentActivity() {
                                                     st.optBoolean("pure_offline") -> "纯离线阻断"
                                                     !st.optBoolean("cloud_configured") -> "未配置"
                                                     cloudErr.isNotEmpty() -> "异常：$cloudErr"
-                                                    else -> "正常"
+                                                    st.optLong("last_cloud_sync_ms") > 0 -> "已同步"
+                                                    else -> "已配置 · 尚未同步"
                                                 }
                                             Row(
                                                 Modifier.fillMaxWidth(),
@@ -1464,7 +1507,7 @@ class SettingsActivity : ComponentActivity() {
                                             },
                                         )
                                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                                            ConfigField(config, "koofr_endpoint", "WebDAV 端点", "https://app.koofr.net/dav/Koofr") {
+                                            ConfigField(config, "koofr_endpoint", "WebDAV 端点", "输入 WebDAV 地址") {
                                                 textFieldsDirty = true
                                             }
                                             ConfigField(config, "koofr_username", "账户邮箱", "name@example.com") {
@@ -1496,11 +1539,11 @@ class SettingsActivity : ComponentActivity() {
                                                 enabled = !busy && !offline,
                                                 modifier = Modifier.weight(1f),
                                                 onClick = {
-                                                    busy = true
-                                                    persistConfig {
-                                                        Core.call(this@SettingsActivity, "poll-services", background = true) { r ->
+                                                    persistCloudConfig {
+                                                        Core.call(this@SettingsActivity, "sync-now", background = true) { r ->
                                                             busy = false
-                                                            showToast(r.fold({ "已完成 Koofr 同步" }, { it.message.orEmpty() }))
+                                                            r.onSuccess { syncHealth = it as? JSONObject }
+                                                            showToast(r.fold({ "已完成云端同步" }, { it.message.orEmpty() }))
                                                         }
                                                     }
                                                 },
@@ -1510,12 +1553,11 @@ class SettingsActivity : ComponentActivity() {
                                                 style = GlassButtonStyle.Ghost,
                                                 enabled = !busy && !offline,
                                                 onClick = {
-                                                    busy = true
-                                                    persistConfig {
+                                                    persistCloudConfig {
                                                         Core.call(
                                                             this@SettingsActivity,
                                                             "restore-from-koofr",
-                                                            json("config" to config),
+                                                            json("config" to JSONObject()),
                                                             true,
                                                         ) { r ->
                                                             r.onSuccess { value ->
@@ -1546,8 +1588,7 @@ class SettingsActivity : ComponentActivity() {
                                                 style = GlassButtonStyle.Ghost,
                                                 enabled = !busy && !offline,
                                                 onClick = {
-                                                    busy = true
-                                                    persistConfig {
+                                                    persistCloudConfig {
                                                         Core.call(this@SettingsActivity, "storage", background = true) { r ->
                                                             busy = false
                                                             r.onSuccess {

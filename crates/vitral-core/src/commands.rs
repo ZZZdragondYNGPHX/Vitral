@@ -191,7 +191,9 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         }
         "clipboard-state" => to_value(core.clipboard_state())?,
         "sync-status" => to_value(core.sync_status())?,
+        "cloud-check" => { core.check_cloud_connection()?; json!({"connected": true}) },
         "poll-services" => to_value(core.poll_services()?)?,
+        "sync-now" => to_value(core.sync_now()?)?,
         "clipboard-poll" => to_value(core.poll_clipboard()?)?,
         "clipboard-poll-current" => to_value(core.poll_clipboard_current()?)?,
         "clipboard-lan-revision" => json!(core.clipboard_lan_revision()),

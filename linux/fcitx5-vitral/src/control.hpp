@@ -50,9 +50,10 @@ private:
       std::string command(cmd);
       if (command == "panel-state")
         return sd_bus_reply_method_return(msg, "s", self.state_().c_str());
-      const bool fullSync = command == "poll-services" || command == "clipboard-poll";
+      const bool fullSync = command == "poll-services" || command == "sync-now" ||
+                            command == "clipboard-poll";
       const bool asyncNetworkOrHeavy =
-          command == "storage" || command == "relay-send" ||
+          command == "storage" || command == "cloud-check" || command == "relay-send" ||
           command == "relay-poll-inbox" || command == "relay-cleanup-orphans" ||
           command == "relay-discover" || command == "restore-from-koofr" ||
           command == "models-download" || command == "models-refresh-catalog" ||
