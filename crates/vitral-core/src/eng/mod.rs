@@ -755,7 +755,6 @@ impl EngineState {
         #[cfg(all(target_os = "linux", feature = "native-rime"))]
         {
             rime_ffi::probe_linked();
-            opencc_ffi::probe_linked();
         }
         if config.data_dir.trim().is_empty() {
             if let Some(ref sd) = config.state_dir {

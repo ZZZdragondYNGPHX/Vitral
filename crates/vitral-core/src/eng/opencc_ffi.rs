@@ -11,18 +11,54 @@ use std::sync::OnceLock;
 type OpenCcHandle = *mut c_void;
 
 extern "C" {
-    fn opencc_open(config_file_name: *const c_char) -> OpenCcHandle;
-    fn opencc_close(opencc: OpenCcHandle) -> c_int;
-    fn opencc_convert_utf8(
-        opencc: OpenCcHandle,
-        input: *const c_char,
-        length: usize,
-    ) -> *mut c_char;
-    fn opencc_convert_utf8_free(str_ptr: *mut c_char);
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+
+const RTLD_NEXT: *mut c_void = (-1isize) as *mut c_void;
+
+struct OpenCcApi {
+    open: unsafe extern "C" fn(*const c_char) -> OpenCcHandle,
+    close: unsafe extern "C" fn(OpenCcHandle) -> c_int,
+    convert_utf8: unsafe extern "C" fn(OpenCcHandle, *const c_char, usize) -> *mut c_char,
+    convert_utf8_free: unsafe extern "C" fn(*mut c_char),
+}
+
+static OPENCC_API: OnceLock<Result<OpenCcApi, String>> = OnceLock::new();
+
+fn load_api() -> Result<OpenCcApi, String> {
+    crate::eng::rime_ffi::probe_linked();
+    let resolve = |name: &CStr| {
+        let symbol = unsafe { dlsym(RTLD_NEXT, name.as_ptr()) };
+        if symbol.is_null() {
+            Err(format!("dlsym failed for {}", name.to_string_lossy()))
+        } else {
+            Ok(symbol)
+        }
+    };
+    // OpenCC's C ABI defines these function signatures.
+    unsafe {
+        Ok(OpenCcApi {
+            open: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(*const c_char) -> OpenCcHandle,
+            >(resolve(c"opencc_open")?),
+            close: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(OpenCcHandle) -> c_int>(
+                resolve(c"opencc_close")?,
+            ),
+            convert_utf8: std::mem::transmute::<
+                *mut c_void,
+                unsafe extern "C" fn(OpenCcHandle, *const c_char, usize) -> *mut c_char,
+            >(resolve(c"opencc_convert_utf8")?),
+            convert_utf8_free: std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_char)>(
+                resolve(c"opencc_convert_utf8_free")?,
+            ),
+        })
+    }
 }
 
 struct OpenCcInstance {
     handle: OpenCcHandle,
+    api: &'static OpenCcApi,
 }
 
 // OpenCC conversion instances are documented thread-safe in `/usr/include/opencc/opencc.h`
@@ -34,18 +70,13 @@ impl Drop for OpenCcInstance {
     fn drop(&mut self) {
         if !self.handle.is_null() && (self.handle as usize) != usize::MAX {
             unsafe {
-                opencc_close(self.handle);
+                (self.api.close)(self.handle);
             }
         }
     }
 }
 
 static OPENCC_POOL: OnceLock<Mutex<HashMap<(PathBuf, u8), OpenCcInstance>>> = OnceLock::new();
-
-/// Reference `opencc_open` so GNU ld keeps `DT_NEEDED` on `libopencc.so` in downstream binaries.
-pub fn probe_linked() {
-    std::hint::black_box(opencc_open as *const ());
-}
 
 fn config_filename_for_mode(mode: OpenCcMode) -> Option<&'static str> {
     match mode {
@@ -85,6 +116,10 @@ pub fn convert_text(
         )));
     }
 
+    let api = OPENCC_API
+        .get_or_init(load_api)
+        .as_ref()
+        .map_err(|err| VitralError::Internal(err.clone()))?;
     let pool = OPENCC_POOL.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = pool.lock();
     let key = (opencc_dir.to_path_buf(), mode_key(mode));
@@ -92,28 +127,30 @@ pub fn convert_text(
     if !guard.contains_key(&key) {
         let c_path = CString::new(cfg_path.to_string_lossy().as_bytes())
             .map_err(|_| VitralError::InvalidArgument("NUL byte in OpenCC path".into()))?;
-        let handle = unsafe { opencc_open(c_path.as_ptr()) };
+        let handle = unsafe { (api.open)(c_path.as_ptr()) };
         if handle.is_null() || (handle as usize) == usize::MAX {
             return Err(VitralError::Internal(format!(
                 "opencc_open failed for {}",
                 cfg_path.display()
             )));
         }
-        guard.insert(key.clone(), OpenCcInstance { handle });
+        guard.insert(key.clone(), OpenCcInstance { handle, api });
     }
 
     let inst = guard.get(&key).expect("inserted above");
     let c_in = CString::new(input.as_bytes())
         .map_err(|_| VitralError::InvalidArgument("NUL byte in OpenCC input".into()))?;
-    let out_ptr = unsafe { opencc_convert_utf8(inst.handle, c_in.as_ptr(), input.len()) };
+    let out_ptr = unsafe { (inst.api.convert_utf8)(inst.handle, c_in.as_ptr(), input.len()) };
     if out_ptr.is_null() {
-        return Err(VitralError::Internal("opencc_convert_utf8 returned NULL".into()));
+        return Err(VitralError::Internal(
+            "opencc_convert_utf8 returned NULL".into(),
+        ));
     }
     let converted = unsafe { CStr::from_ptr(out_ptr) }
         .to_string_lossy()
         .into_owned();
     unsafe {
-        opencc_convert_utf8_free(out_ptr);
+        (inst.api.convert_utf8_free)(out_ptr);
     }
     Ok(converted)
 }

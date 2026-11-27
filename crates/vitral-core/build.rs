@@ -19,11 +19,10 @@ fn main() {
     }
 
     let probed = Command::new("pkg-config")
-        .args(["--libs", "rime", "opencc"])
+        .args(["--libs", "rime"])
         .output();
 
     let mut emitted_rime = false;
-    let mut emitted_opencc = false;
 
     if let Ok(out) = probed {
         if out.status.success() {
@@ -38,8 +37,6 @@ fn main() {
                         println!("cargo:rustc-link-lib={lib}");
                         if lib == "rime" {
                             emitted_rime = true;
-                        } else if lib == "opencc" {
-                            emitted_opencc = true;
                         }
                     }
                 }
@@ -50,7 +47,5 @@ fn main() {
     if !emitted_rime {
         println!("cargo:rustc-link-lib=rime");
     }
-    if !emitted_opencc {
-        println!("cargo:rustc-link-lib=opencc");
-    }
+    println!("cargo:rustc-link-lib=dl");
 }

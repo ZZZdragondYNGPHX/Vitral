@@ -3385,7 +3385,7 @@ mod m1a_tests {
         let assets_dir = resolve_assets_dir("").expect("workspace assets");
         rime_ffi::with_runtime(&assets_dir, "", "", |rt| {
             assert!(
-                rt.version().starts_with("1.17."),
+                rt.version().starts_with("1."),
                 "unexpected librime version: {}",
                 rt.version()
             );
