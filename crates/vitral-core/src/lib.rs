@@ -3006,9 +3006,28 @@ mod tests {
     }
 
     #[test]
+    fn init_defaults_to_no_backspace_recovery() {
+        for platform in ["linux", "windows", "android"] {
+            let core = VitralCore::init(&serde_json::json!({
+                "pure_offline": true, "platform": platform, "schema": "rime_ice"
+            }).to_string()).unwrap();
+            for ch in "nihao".chars() {
+                core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
+            }
+            let typed = core.candidate_state().unwrap();
+            let index = typed.candidates.iter().position(|item| item.text == "你好").unwrap();
+            assert_eq!(core.select_candidate(index).unwrap().commit_text.as_deref(), Some("你好"));
+            let action = core.process_key(8, 0, SwipeDir::None).unwrap();
+            assert_eq!(action.undo_commit_chars, 0);
+            assert!(action.undo_commit_text.is_none());
+            assert!(action.preedit.text.is_empty());
+        }
+    }
+
+    #[test]
     fn reset_commit_context_command_ends_backspace_recovery() {
         for reset in [false, true] {
-            let core = VitralCore::init(r#"{"pure_offline":true,"schema":"rime_ice"}"#).unwrap();
+            let core = VitralCore::init(r#"{"pure_offline":true,"undo_commit_on_backspace":true,"schema":"rime_ice"}"#).unwrap();
             for ch in "nihao".chars() {
                 core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
             }
@@ -3036,7 +3055,7 @@ mod tests {
     #[test]
     fn backspace_dismisses_quick_paste_without_undoing_the_previous_commit() {
         for keycode in [0x08, 0xff08] {
-            let core = VitralCore::init(r#"{"pure_offline":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
+            let core = VitralCore::init(r#"{"pure_offline":true,"undo_commit_on_backspace":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
             core.on_ime_open();
             for ch in "nihao".chars() {
                 core.process_key(ch as u32, 0, SwipeDir::None).unwrap();
@@ -3064,7 +3083,7 @@ mod tests {
 
     #[test]
     fn quick_paste_ends_backspace_recovery_for_the_previous_candidate() {
-        let core = VitralCore::init(r#"{"pure_offline":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
+        let core = VitralCore::init(r#"{"pure_offline":true,"undo_commit_on_backspace":true,"platform":"android","schema":"rime_ice"}"#).unwrap();
         core.on_ime_open();
         for ch in "nihao".chars() {
             core.process_key(ch as u32, 0, SwipeDir::None).unwrap();

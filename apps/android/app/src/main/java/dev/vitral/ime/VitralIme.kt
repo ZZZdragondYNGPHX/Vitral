@@ -117,8 +117,24 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var lastUndoCommitAtMs = 0L
     private var undoCommitExpiryTask: Runnable? = null
     private var backspaceUndoCommitEnabled = false
-    private var lastDeletedText = ""
+    private var lastDeletedBefore = ""
+    private var lastDeletedAfter = ""
+    private var holdDeletedBefore = ""
+    private var holdDeletedAfter = ""
     private var lastDeletedAtMs = 0L
+    private var batchDeleteStep = 0
+
+    private val hasDeletedUndo: Boolean
+        get() = lastDeletedBefore.isNotEmpty() || lastDeletedAfter.isNotEmpty()
+
+    private fun clearDeletedUndoState() {
+        lastDeletedBefore = ""
+        lastDeletedAfter = ""
+        holdDeletedBefore = ""
+        holdDeletedAfter = ""
+        lastDeletedAtMs = 0L
+        batchDeleteStep = 0
+    }
     private var voiceActive = false
     private var voicePartialText = ""
     private var lastVoiceCommitted = ""
@@ -674,7 +690,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         currentSelEnd = info?.initialSelEnd ?: -1
         lastComposingStart = -1
         clearUndoCommitAnchor()
-        lastDeletedText = ""
+        clearDeletedUndoState()
         voiceActive = false
         voicePartialText = ""
         clearVoiceCommitAnchor()
@@ -762,8 +778,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (moved) invalidateSurroundingCache()
         if (moved && !composing) {
             if (predictionText.isNotEmpty()) cancelPrediction()
-            if (lastDeletedText.isNotEmpty() && SystemClock.uptimeMillis() - lastDeletedAtMs > 400L) {
-                lastDeletedText = ""
+            if (hasDeletedUndo && SystemClock.uptimeMillis() - lastDeletedAtMs > 400L) {
+                clearDeletedUndoState()
                 candidates()
             }
             updateAutoCap(redraw = true)
@@ -869,6 +885,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     override fun onFinishInputView(finishingInput: Boolean) {
+        if (::body.isInitialized) body.cancelAllTouches()
+        aeviouView?.cancelActiveTouches()
         invalidateEditor()
         Core.call(this, "on-ime-close")
         Core.call(this, "llm-unload", auxiliary = true)
@@ -2306,6 +2324,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun switch(next: String) {
+        if (::body.isInitialized) body.cancelAllTouches()
+        aeviouView?.cancelActiveTouches()
         inputGeneration++
         pendingKeyOps = 0
         clearUndoCommitAnchor()
@@ -2627,7 +2647,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 !inlineSuggestionsActive &&
                 shown.length() == 0 &&
                 predictionText.isEmpty() &&
-                lastDeletedText.isEmpty() &&
+                !hasDeletedUndo &&
                 lastUndoCommitText.isEmpty()
         if (idleQuickPunc) {
             val sig = "idle:$fieldKind:$english:$isDarkTheme:$font"
@@ -2909,7 +2929,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                             }
                             invalidateSurroundingCache()
                             if (deletedWithoutRestore) {
-                                lastDeletedText = voiced
+                                lastDeletedBefore = voiced
+                                lastDeletedAfter = ""
+                                holdDeletedBefore = ""
+                                holdDeletedAfter = ""
                                 lastDeletedAtMs = SystemClock.uptimeMillis()
                                 clearVoiceCommitAnchor()
                                 message("编辑器拒绝替换，可点击「撤销删除」恢复原转写")
@@ -2981,13 +3004,33 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 }
             )
         }
-        if (!composing && lastDeletedText.isNotEmpty()) {
-            val undo = lastDeletedText
+        if (!composing && hasDeletedUndo) {
+            val undoBefore = lastDeletedBefore
+            val undoAfter = lastDeletedAfter
             addBarItem(
                 label("↩ 撤销删除", highlight = true) {
-                    currentInputConnection?.commitText(undo, 1)
+                    currentInputConnection?.let { ic ->
+                        ic.beginBatchEdit()
+                        try {
+                            ic.commitText(undoBefore + undoAfter, 1)
+                            if (undoAfter.isNotEmpty()) {
+                                val extracted =
+                                    ic.getExtractedText(
+                                        android.view.inputmethod.ExtractedTextRequest(),
+                                        0,
+                                    )
+                                if (extracted != null && extracted.startOffset >= 0 && extracted.selectionEnd >= 0) {
+                                    val cursor = extracted.startOffset + extracted.selectionEnd
+                                    val target = (cursor - undoAfter.length).coerceAtLeast(0)
+                                    ic.setSelection(target, target)
+                                }
+                            }
+                        } finally {
+                            ic.endBatchEdit()
+                        }
+                    }
                     invalidateSurroundingCache()
-                    lastDeletedText = ""
+                    clearDeletedUndoState()
                     candidates()
                 }
             )
@@ -3077,7 +3120,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 !inlineSuggestionsActive &&
                 shown.length() == 0 &&
                 predictionText.isEmpty() &&
-                lastDeletedText.isEmpty()
+                !hasDeletedUndo
         ) {
             val basePunc =
                 when {
@@ -3708,6 +3751,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun onShortcutEditorKey(label: String) {
+        if (label == "⌫-hold-begin") return
         val duration =
             if (label.length == 1 && label[0].isLetter()) T.Ergonomics.hapticLetterTickMs
             else T.Ergonomics.hapticActionThudMs
@@ -4550,7 +4594,9 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             } else {
                 syl
             }
-        if (lastDeletedText.isNotEmpty()) lastDeletedText = ""
+        if (hasDeletedUndo || holdDeletedBefore.isNotEmpty() || holdDeletedAfter.isNotEmpty() || batchDeleteStep != 0) {
+            clearDeletedUndoState()
+        }
         lastSpaceTapMs =
             if (english && fieldKind == "text" && !passwordEditor && effective.endsWith(" "))
                 SystemClock.uptimeMillis()
@@ -4603,6 +4649,13 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun key(rawLabel: String) {
+        if (mode != "keys" && rawLabel != "cancel-voice") return
+        if (rawLabel == "⌫-hold-begin") {
+            batchDeleteStep = 0
+            holdDeletedBefore = ""
+            holdDeletedAfter = ""
+            return
+        }
         val isRepeatDelete = rawLabel == "⌫-repeat"
         if (backspaceFlight.shouldDrop(isRepeatDelete)) return
         val label = if (isRepeatDelete) "⌫" else rawLabel
@@ -4610,6 +4663,25 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         inlineRequest++
         val ic = currentInputConnection ?: return
         vibrateKey(label.length == 1 && label[0].isLetter())
+        val isBackspaceKey =
+            label == "⌫" ||
+                label == "delete-word" ||
+                label == "⌫-batch" ||
+                label == "delete-before-cursor" ||
+                label == "delete-after-cursor" ||
+                label == "clear-all"
+        if (!isBackspaceKey && label != "cancel-voice") {
+            if (
+                hasDeletedUndo ||
+                    holdDeletedBefore.isNotEmpty() ||
+                    holdDeletedAfter.isNotEmpty() ||
+                    batchDeleteStep != 0
+            ) {
+                val hadUndo = hasDeletedUndo
+                clearDeletedUndoState()
+                if (hadUndo) candidates()
+            }
+        }
         when (label) {
             "123" -> {
                 numbers = true
@@ -4690,6 +4762,18 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 deleteWordSafely(ic)
                 return
             }
+            "⌫-batch" -> {
+                deleteBatchSafely(ic)
+                return
+            }
+            "delete-before-cursor" -> {
+                deleteBeforeCursor(ic)
+                return
+            }
+            "delete-after-cursor" -> {
+                deleteAfterCursor(ic)
+                return
+            }
             "clear-all" -> {
                 clearAllInputText(ic)
                 return
@@ -4706,9 +4790,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             } else {
                 label
             }
-        if (lastDeletedText.isNotEmpty() && effectiveLabel != "⌫") {
-            lastDeletedText = ""
-        }
         if (lastUndoCommitText.isNotEmpty() && effectiveLabel != "⌫") {
             clearUndoCommitAnchor()
         }
@@ -4765,7 +4846,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         // Password / email / URL fields bypass Chinese engine completely for zero leakage
         if (!dismissPaste && fieldForceEnglish && !composing) {
             when (effectiveLabel) {
-                "⌫" -> deleteWithSelectionOrSingle(ic)
+                "⌫" -> deleteWithSelectionOrSingle(ic, isRepeatDelete = isRepeatDelete)
                 "↵" ->
                     if (!sendDefaultEditorAction(true)) sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
                     else Unit
@@ -4802,7 +4883,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 clearUndoCommitAnchor()
                 candidates()
             }
-            deleteWithSelectionOrSingle(ic)
+            deleteWithSelectionOrSingle(ic, isRepeatDelete = isRepeatDelete)
             updateAutoCap(redraw = true)
             return
         }
@@ -4824,7 +4905,11 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 }
                 shouldDeleteHostText(composing, startedComposing, isRepeatDelete)
                     && effectiveLabel == "⌫" -> {
-                    deleteWithSelectionOrSingle(ic, coreAlreadyNotifiedOne = true)
+                    deleteWithSelectionOrSingle(
+                        ic,
+                        coreAlreadyNotifiedOne = true,
+                        isRepeatDelete = isRepeatDelete,
+                    )
                     updateAutoCap(redraw = true)
                 }
                 !composing && effectiveLabel == "↵" -> {
@@ -4862,7 +4947,10 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun recordDeletedForUndo(text: String) {
         if (!passwordEditor && text.isNotEmpty()) {
-            lastDeletedText = text
+            lastDeletedBefore = text
+            lastDeletedAfter = ""
+            holdDeletedBefore = ""
+            holdDeletedAfter = ""
             lastDeletedAtMs = SystemClock.uptimeMillis()
         }
     }
@@ -4961,20 +5049,62 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private fun deleteWithSelectionOrSingle(
         ic: android.view.inputmethod.InputConnection,
         coreAlreadyNotifiedOne: Boolean = false,
+        isRepeatDelete: Boolean = false,
     ) {
         val selected = ic.getSelectedText(0)?.toString().orEmpty()
         if (selected.isNotEmpty()) {
             if (ic.commitText("", 1)) {
                 invalidateSurroundingCache()
+                val prevHoldBefore = holdDeletedBefore
+                val prevHoldAfter = holdDeletedAfter
                 recordDeletedForUndo(selected)
+                if (isRepeatDelete && !passwordEditor) {
+                    holdDeletedBefore = selected + prevHoldBefore
+                    holdDeletedAfter = prevHoldAfter
+                }
                 val count =
                     selected.codePointCount(0, selected.length) -
                         if (coreAlreadyNotifiedOne) 1 else 0
                 if (!passwordEditor && count > 0) {
                     Core.call(this, "notify-deleted-chars", json("count" to count))
                 }
-                if (lastDeletedText.isNotEmpty()) candidates()
+                if (hasDeletedUndo) candidates()
                 return
+            }
+        } else if (isRepeatDelete && !passwordEditor) {
+            var win = 64
+            var beforeStr = ic.getTextBeforeCursor(win, 0)?.toString()
+            if (beforeStr != null) {
+                if (beforeStr.isEmpty()) return
+                while (beforeStr != null && beforeStr.length >= win && win < 65_536) {
+                    val firstIdx = if (Character.isLowSurrogate(beforeStr[0])) 1 else 0
+                    if (firstIdx >= beforeStr.length) break
+                    val firstCp = beforeStr.codePointAt(firstIdx)
+                    if (firstCp !in 0x1F1E6..0x1F1FF) break
+                    win *= 4
+                    beforeStr = ic.getTextBeforeCursor(win, 0)?.toString()
+                }
+                if (beforeStr != null) {
+                    if (beforeStr.isEmpty()) return
+                    if (beforeStr.length > 1 && Character.isLowSurrogate(beforeStr[0])) {
+                        beforeStr = beforeStr.substring(1)
+                    }
+                    val bi = android.icu.text.BreakIterator.getCharacterInstance()
+                    bi.setText(beforeStr)
+                    val lastStart = bi.preceding(beforeStr.length).coerceAtLeast(0)
+                    val slice = beforeStr.substring(lastStart)
+                    if (ic.deleteSurroundingText(slice.length, 0)) {
+                        invalidateSurroundingCache()
+                        holdDeletedBefore = slice + holdDeletedBefore
+                        val notifyCount =
+                            slice.codePointCount(0, slice.length) -
+                                if (coreAlreadyNotifiedOne) 1 else 0
+                        if (notifyCount > 0) {
+                            Core.call(this, "notify-deleted-chars", json("count" to notifyCount))
+                        }
+                        return
+                    }
+                }
             }
         }
         val mayDeleteChar =
@@ -5005,7 +5135,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                         json("count" to selected.codePointCount(0, selected.length)),
                     )
                 }
-                if (lastDeletedText.isNotEmpty()) candidates()
+                if (hasDeletedUndo) candidates()
             }
             return
         }
@@ -5035,56 +5165,312 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         }
     }
 
-    private fun clearAllInputText(ic: android.view.inputmethod.InputConnection) {
-        ic.finishComposingText()
-        val captured =
-            if (!passwordEditor) {
-                val full =
-                    ic.getExtractedText(android.view.inputmethod.ExtractedTextRequest(), 0)
-                        ?.text
-                        ?.toString()
-                if (!full.isNullOrEmpty()) {
-                    full
-                } else {
-                    val before = ic.getTextBeforeCursor(100_000, 0)?.toString().orEmpty()
-                    val selected = ic.getSelectedText(0)?.toString().orEmpty()
-                    val after = ic.getTextAfterCursor(100_000, 0)?.toString().orEmpty()
-                    before + selected + after
+    private fun deleteBatchSafely(ic: android.view.inputmethod.InputConnection) {
+        if (composing) return
+        if (lastUndoCommitText.isNotEmpty()) clearUndoCommitAnchor()
+        if (lastVoiceCommitted.isNotEmpty() || voiceCommitEnd >= 0) clearVoiceCommitAnchor()
+        lastCommittedText = ""
+        val step = batchDeleteStep
+        val selected = ic.getSelectedText(0)?.toString().orEmpty()
+        if (selected.isNotEmpty()) {
+            if (ic.commitText("", 1)) {
+                invalidateSurroundingCache()
+                batchDeleteStep = step + 1
+                if (!passwordEditor) {
+                    holdDeletedBefore = selected + holdDeletedBefore
+                    lastDeletedBefore = holdDeletedBefore
+                    lastDeletedAfter = holdDeletedAfter
+                    lastDeletedAtMs = SystemClock.uptimeMillis()
+                    Core.call(
+                        this,
+                        "notify-deleted-chars",
+                        json("count" to selected.codePointCount(0, selected.length)),
+                    )
                 }
+                candidates()
+                updateAutoCap(redraw = true)
+            }
+            return
+        }
+        if (passwordEditor) {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            invalidateSurroundingCache()
+            batchDeleteStep = step + 1
+            return
+        }
+        val before = ic.getTextBeforeCursor(4096, 0)?.toString()
+        if (before == null) {
+            sendDownUpKeyEvents(KeyEvent.KEYCODE_DEL)
+            invalidateSurroundingCache()
+            return
+        }
+        val deleted = trailingBatchDeleteSlice(before, step)
+        if (deleted.isEmpty()) {
+            if (!passwordEditor && (holdDeletedBefore.isNotEmpty() || holdDeletedAfter.isNotEmpty())) {
+                lastDeletedBefore = holdDeletedBefore
+                lastDeletedAfter = holdDeletedAfter
+                lastDeletedAtMs = SystemClock.uptimeMillis()
+                candidates()
+            }
+            return
+        }
+        if (ic.deleteSurroundingText(deleted.length, 0)) {
+            invalidateSurroundingCache()
+            batchDeleteStep = step + 1
+            holdDeletedBefore = deleted + holdDeletedBefore
+            lastDeletedBefore = holdDeletedBefore
+            lastDeletedAfter = holdDeletedAfter
+            lastDeletedAtMs = SystemClock.uptimeMillis()
+            Core.call(
+                this,
+                "notify-deleted-chars",
+                json("count" to deleted.codePointCount(0, deleted.length)),
+            )
+            candidates()
+            updateAutoCap(redraw = true)
+        }
+    }
+
+    private fun deleteSideTextInChunks(
+        ic: android.view.inputmethod.InputConnection,
+        before: Boolean,
+        capture: Boolean,
+    ): Pair<String, Int> {
+        val chunkSize = 65_536
+        val maxIterations = 4096
+        val beforeChunks = if (capture && before) ArrayList<String>() else null
+        val afterBuilder = if (capture && !before) StringBuilder() else null
+        var deletedCodePoints = 0
+        var rawChunk =
+            (if (before) ic.getTextBeforeCursor(chunkSize, 0) else ic.getTextAfterCursor(chunkSize, 0))
+                ?.toString()
+                .orEmpty()
+        var guard = 0
+        while (rawChunk.isNotEmpty() && guard < maxIterations) {
+            guard++
+            val chunk =
+                if (before && rawChunk.length == chunkSize && rawChunk.length > 1 && Character.isLowSurrogate(rawChunk[0])) {
+                    rawChunk.substring(1)
+                } else if (!before && rawChunk.length == chunkSize && rawChunk.length > 1 && Character.isHighSurrogate(rawChunk.last())) {
+                    rawChunk.substring(0, rawChunk.length - 1)
+                } else {
+                    rawChunk
+                }
+            val ok =
+                if (before) ic.deleteSurroundingText(chunk.length, 0)
+                else ic.deleteSurroundingText(0, chunk.length)
+            if (!ok) break
+            beforeChunks?.add(chunk)
+            afterBuilder?.append(chunk)
+            deletedCodePoints += chunk.codePointCount(0, chunk.length)
+            rawChunk =
+                (if (before) ic.getTextBeforeCursor(chunkSize, 0) else ic.getTextAfterCursor(chunkSize, 0))
+                    ?.toString()
+                    .orEmpty()
+        }
+        val captured =
+            when {
+                beforeChunks != null -> {
+                    val sb = StringBuilder()
+                    for (i in beforeChunks.lastIndex downTo 0) {
+                        sb.append(beforeChunks[i])
+                    }
+                    sb.toString()
+                }
+                afterBuilder != null -> afterBuilder.toString()
+                else -> ""
+            }
+        return captured to deletedCodePoints
+    }
+
+    private fun deleteBeforeCursor(ic: android.view.inputmethod.InputConnection) {
+        ic.finishComposingText()
+        ic.beginBatchEdit()
+        var deletedCount = 0
+        val selected = ic.getSelectedText(0)?.toString().orEmpty()
+        val deletedSelected =
+            if (selected.isNotEmpty() && ic.commitText("", 1)) {
+                deletedCount += selected.codePointCount(0, selected.length)
+                selected
             } else {
                 ""
             }
+        val (capturedBefore, beforeCodePoints) =
+            deleteSideTextInChunks(ic, before = true, capture = !passwordEditor)
+        deletedCount += beforeCodePoints
+        ic.endBatchEdit()
 
-        if (ic.performContextMenuAction(android.R.id.selectAll)) {
-            ic.commitText("", 1)
+        val captured = if (passwordEditor) "" else capturedBefore + deletedSelected
+        lastCommittedText = ""
+        predictionText = ""
+        predictionCandidates = emptyList()
+        predictionContextAfter = ""
+        clearUndoCommitAnchor()
+        clearVoiceCommitAnchor()
+        invalidateSurroundingCache()
+        if (!passwordEditor && deletedCount > 0) {
+            Core.call(this, "notify-deleted-chars", json("count" to deletedCount))
         }
-        val remBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
-        val remAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
-        if (remBefore > 0 || remAfter > 0) {
-            ic.beginBatchEdit()
-            ic.setSelection(0, remBefore + remAfter)
-            ic.commitText("", 1)
-            val stillBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
-            val stillAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
-            if (stillBefore > 0 || stillAfter > 0) {
-                ic.deleteSurroundingText(stillBefore, stillAfter)
+        val applyUndo = {
+            if (!passwordEditor) {
+                if (captured.isNotEmpty()) {
+                    holdDeletedBefore = captured + holdDeletedBefore
+                }
+                if (holdDeletedBefore.isNotEmpty() || holdDeletedAfter.isNotEmpty()) {
+                    lastDeletedBefore = holdDeletedBefore
+                    lastDeletedAfter = holdDeletedAfter
+                    lastDeletedAtMs = SystemClock.uptimeMillis()
+                }
             }
+            batchDeleteStep = 0
+        }
+        if (composing) {
+            processKeyDirect(27) {
+                applyAction(it)
+                applyUndo()
+                candidates()
+            }
+        } else {
+            applyUndo()
+            candidates()
+        }
+        updateAutoCap(redraw = true)
+    }
+
+    private fun deleteAfterCursor(ic: android.view.inputmethod.InputConnection) {
+        ic.finishComposingText()
+        ic.beginBatchEdit()
+        var deletedCount = 0
+        val selected = ic.getSelectedText(0)?.toString().orEmpty()
+        val deletedSelected =
+            if (selected.isNotEmpty() && ic.commitText("", 1)) {
+                deletedCount += selected.codePointCount(0, selected.length)
+                selected
+            } else {
+                ""
+            }
+        val (capturedAfter, afterCodePoints) =
+            deleteSideTextInChunks(ic, before = false, capture = !passwordEditor)
+        deletedCount += afterCodePoints
+        ic.endBatchEdit()
+
+        val captured = if (passwordEditor) "" else deletedSelected + capturedAfter
+        lastCommittedText = ""
+        predictionText = ""
+        predictionCandidates = emptyList()
+        predictionContextAfter = ""
+        clearUndoCommitAnchor()
+        clearVoiceCommitAnchor()
+        invalidateSurroundingCache()
+        if (!passwordEditor && deletedCount > 0) {
+            Core.call(this, "notify-deleted-chars", json("count" to deletedCount))
+        }
+        val applyUndo = {
+            if (!passwordEditor) {
+                if (captured.isNotEmpty()) {
+                    holdDeletedAfter = holdDeletedAfter + captured
+                }
+                if (holdDeletedBefore.isNotEmpty() || holdDeletedAfter.isNotEmpty()) {
+                    lastDeletedBefore = holdDeletedBefore
+                    lastDeletedAfter = holdDeletedAfter
+                    lastDeletedAtMs = SystemClock.uptimeMillis()
+                }
+            }
+            batchDeleteStep = 0
+        }
+        if (composing) {
+            processKeyDirect(27) {
+                applyAction(it)
+                applyUndo()
+                candidates()
+            }
+        } else {
+            applyUndo()
+            candidates()
+        }
+        updateAutoCap(redraw = true)
+    }
+
+    private fun clearAllInputText(ic: android.view.inputmethod.InputConnection) {
+        ic.finishComposingText()
+        var undoBefore = ""
+        var undoAfter = ""
+        var deletedCount = 0
+
+        if (passwordEditor) {
+            if (ic.performContextMenuAction(android.R.id.selectAll)) {
+                ic.commitText("", 1)
+            }
+            val remBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
+            val remAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
+            if (remBefore > 0 || remAfter > 0) {
+                ic.beginBatchEdit()
+                ic.setSelection(0, remBefore + remAfter)
+                ic.commitText("", 1)
+                val stillBefore = ic.getTextBeforeCursor(100_000, 0)?.length ?: 0
+                val stillAfter = ic.getTextAfterCursor(100_000, 0)?.length ?: 0
+                if (stillBefore > 0 || stillAfter > 0) {
+                    ic.deleteSurroundingText(stillBefore, stillAfter)
+                }
+                ic.endBatchEdit()
+            }
+        } else {
+            ic.beginBatchEdit()
+            val selected = ic.getSelectedText(0)?.toString().orEmpty()
+            val deletedSelected =
+                if (selected.isNotEmpty() && ic.commitText("", 1)) {
+                    deletedCount += selected.codePointCount(0, selected.length)
+                    selected
+                } else {
+                    ""
+                }
+            val (capturedBefore, beforeCodePoints) =
+                deleteSideTextInChunks(ic, before = true, capture = true)
+            deletedCount += beforeCodePoints
+            val (capturedAfter, afterCodePoints) =
+                deleteSideTextInChunks(ic, before = false, capture = true)
+            deletedCount += afterCodePoints
             ic.endBatchEdit()
+
+            val hasResidual =
+                ic.getTextBeforeCursor(1, 0)?.isNotEmpty() != false ||
+                    ic.getTextAfterCursor(1, 0)?.isNotEmpty() != false ||
+                    ic.getSelectedText(0)?.isNotEmpty() == true
+            if (hasResidual && ic.performContextMenuAction(android.R.id.selectAll)) {
+                ic.commitText("", 1)
+            }
+            undoBefore = capturedBefore + holdDeletedBefore
+            undoAfter = deletedSelected + holdDeletedAfter + capturedAfter
         }
 
         lastCommittedText = ""
         predictionText = ""
         predictionCandidates = emptyList()
         predictionContextAfter = ""
+        clearUndoCommitAnchor()
+        clearVoiceCommitAnchor()
         invalidateSurroundingCache()
+        if (!passwordEditor && deletedCount > 0) {
+            Core.call(this, "notify-deleted-chars", json("count" to deletedCount))
+        }
+        val applyUndo = {
+            if (!passwordEditor && (undoBefore.isNotEmpty() || undoAfter.isNotEmpty())) {
+                lastDeletedBefore = undoBefore
+                lastDeletedAfter = undoAfter
+                lastDeletedAtMs = SystemClock.uptimeMillis()
+            }
+            holdDeletedBefore = ""
+            holdDeletedAfter = ""
+            batchDeleteStep = 0
+        }
         if (composing) {
             processKeyDirect(27) {
                 applyAction(it)
-                recordDeletedForUndo(captured)
+                applyUndo()
                 candidates()
             }
         } else {
-            recordDeletedForUndo(captured)
+            applyUndo()
             candidates()
         }
         updateAutoCap(redraw = true)

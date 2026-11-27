@@ -2230,7 +2230,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vitral-cli"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "libc",
  "serde_json",
@@ -2240,7 +2240,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-core"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "bytes",
  "chacha20poly1305",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-ffi"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -2284,7 +2284,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-jni"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "android_logger",
  "jni 0.21.1",
@@ -2297,7 +2297,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-tokens"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "serde",
  "serde_json",
@@ -2306,7 +2306,7 @@ dependencies = [
 
 [[package]]
 name = "vitral-tsf"
-version = "0.4.18"
+version = "0.4.19"
 dependencies = [
  "cc",
  "serde_json",

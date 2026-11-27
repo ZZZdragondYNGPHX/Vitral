@@ -546,7 +546,10 @@ fn copying_text_keeps_typing_candidates_unchanged() {
 fn offline_candidate_quality() {
     let assets = required_assets();
     let scratch = Scratch::new();
-    let mut keyboard = Keyboard::new(&assets);
+    let mut keyboard = Keyboard::with_config(&assets, EngineConfig {
+        undo_commit_on_backspace: true,
+        ..EngineConfig::default()
+    });
     let chat = paired_queries(&mut keyboard, CHAT);
     let boundaries = paired_queries(&mut keyboard, BOUNDARIES);
     let technical = paired_queries(&mut keyboard, TECHNICAL);
@@ -862,7 +865,10 @@ fn retention_remains_stable_through_1000_input_rounds() {
     const ROUNDS: usize = 1000;
     const CAPACITY: usize = 4096;
     let assets = required_assets();
-    let mut keyboard = Keyboard::new(&assets);
+    let mut keyboard = Keyboard::with_config(&assets, EngineConfig {
+        undo_commit_on_backspace: true,
+        ..EngineConfig::default()
+    });
     let mut mistakes = 0;
     let mut recovered = 0;
     let mut checked_after_mistake = 0;

@@ -207,11 +207,13 @@ fn public_settings(mut cfg: Value, token: &str) -> Value {
         "ai_prefer_local",
         "auto_english_for_dev_apps",
         "disable_paired_punct_in_ide",
-        "undo_commit_on_backspace",
     ] {
         if cfg.get(key).is_none_or(Value::is_null) {
             cfg[key] = json!(true);
         }
+    }
+    if cfg.get("undo_commit_on_backspace").is_none_or(Value::is_null) {
+        cfg["undo_commit_on_backspace"] = json!(false);
     }
     if cfg.get("auto_micro_space").is_none_or(Value::is_null) {
         cfg["auto_micro_space"] = json!(false);

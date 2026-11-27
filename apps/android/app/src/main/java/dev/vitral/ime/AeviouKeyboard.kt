@@ -191,8 +191,10 @@ internal class AeviouKeyboard(
         touches.values.forEach { it.deleteHold.allowsDelete(composing) }
         if (pressedAction?.id == "⌫" && !backspaceHold.allowsDelete(composing)) {
             removeCallbacks(repeatDelete)
-            removeCallbacks(armClearAll)
-            clearAllPending = false
+            removeCallbacks(armBatchDelete)
+            removeCallbacks(batchDelete)
+            batchHoldPending = false
+            backspaceGesture.reset()
             invalidate()
         }
     }
@@ -210,6 +212,16 @@ internal class AeviouKeyboard(
     private val touches = linkedMapOf<Int, Touch>()
     private var gesturePointerId: Int? = null
     private var backspaceHold = BackspaceHold()
+    private val backspaceGesture =
+        BackspaceHoldGesture(
+            swipeUpEnterPx = ctx.dpF(20f),
+            swipeUpExitPx = ctx.dpF(14f),
+            swipeDownEnterPx = ctx.dpF(18f),
+            swipeDownExitPx = ctx.dpF(12f),
+            sampleStepPx = ctx.dpF(4f),
+            rotateSpanPx = ctx.dpF(12f),
+            clearAllSpanPx = ctx.dpF(16f),
+        )
     private var hexRadius = 0f
     private var sliding = false
     private var armedSlide = false
@@ -217,11 +229,11 @@ internal class AeviouKeyboard(
     private var pressedAction: HexCell? = null
     private var actionDownX = 0f
     private var actionDownY = 0f
+    private var actionLastX = 0f
+    private var actionLastY = 0f
     private var actionPressedAt = 0L
     private var repeatingDelete = false
-    private var clearAllPending = false
-    private var clearAllArmed = false
-    private var clearAllSwipeUp = false
+    private var batchHoldPending = false
     private val stepStack = ArrayList<String>()
     private val centerHistory = ArrayList<PointF>()
     private var activeCenter = PointF()
@@ -289,7 +301,7 @@ internal class AeviouKeyboard(
     private val repeatDelete =
         object : Runnable {
             override fun run() {
-                if (pressedAction?.id != "⌫" || clearAllArmed) return
+                if (pressedAction?.id != "⌫" || backspaceGesture.isActive) return
                 repeatingDelete = true
                 if (!backspaceHold.allowsDelete(isComposing())) return
                 onActionKey("⌫-repeat")
@@ -297,12 +309,30 @@ internal class AeviouKeyboard(
             }
         }
 
-    private val armClearAll = Runnable {
-        if (pressedAction?.id == "⌫" && clearAllPending) {
-            clearAllPending = false
-            clearAllArmed = true
+    private val batchDelete =
+        object : Runnable {
+            override fun run() {
+                if (pressedAction?.id != "⌫" || backspaceGesture.intent != BackspaceHoldIntent.BATCH) return
+                if (!backspaceHold.allowsDelete(isComposing())) return
+                onActionKey("⌫-batch")
+                postDelayed(this, BATCH_DELETE_INTERVAL_MS)
+            }
+        }
+
+    private val armBatchDelete = Runnable {
+        if (pressedAction?.id == "⌫" && batchHoldPending) {
+            batchHoldPending = false
             removeCallbacks(repeatDelete)
+            if (!backspaceHold.allowsDelete(isComposing())) {
+                invalidate()
+                return@Runnable
+            }
+            backspaceGesture.begin(actionLastX, actionLastY)
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            onActionKey("⌫-batch")
+            if (pressedAction?.id == "⌫" && backspaceGesture.intent == BackspaceHoldIntent.BATCH) {
+                postDelayed(batchDelete, BATCH_DELETE_INTERVAL_MS)
+            }
             invalidate()
         }
     }
@@ -618,12 +648,16 @@ internal class AeviouKeyboard(
                 }
             buildHexPath(cell.cx, cell.cy, r * scaleFactor, hexPath)
             val isPressedAct = pressedAction == cell || (cell.id == "⇧" && shiftState > 0)
-            val isClearAllCell = cell.id == "⌫" && clearAllArmed
+            val holdIntent = if (cell.id == "⌫") backspaceGesture.intent else BackspaceHoldIntent.INACTIVE
+            val isHoldCell = holdIntent != BackspaceHoldIntent.INACTIVE
             val dim = sliding && !cell.isAction
             val topCol =
                 when {
-                    isClearAllCell && clearAllSwipeUp -> 0xFFEF4444.toInt()
-                    isClearAllCell -> if (dark) 0x55EF4444 else 0x38EF4444
+                    holdIntent == BackspaceHoldIntent.CLEAR_ALL -> 0xFFEF4444.toInt()
+                    holdIntent == BackspaceHoldIntent.ROTATING -> if (dark) 0x55EF4444 else 0x38EF4444
+                    holdIntent == BackspaceHoldIntent.DELETE_BEFORE ||
+                        holdIntent == BackspaceHoldIntent.DELETE_AFTER -> 0xFFF59E0B.toInt()
+                    holdIntent == BackspaceHoldIntent.BATCH -> if (dark) 0x48F59E0B else 0x30F59E0B
                     cell.isAccent -> if (dark) 0xFF19B5FA.toInt() else 0xFF0A93D9.toInt()
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xCC0369A1.toInt() else 0xF5BAE6FD.toInt()
                     isPressedAct || isCtxGlow -> (if (dark) T.Dark.accentSoftArgb else T.Light.accentSoftArgb).toInt()
@@ -634,8 +668,11 @@ internal class AeviouKeyboard(
                 }
             val botCol =
                 when {
-                    isClearAllCell && clearAllSwipeUp -> 0xFFDC2626.toInt()
-                    isClearAllCell -> if (dark) 0x38DC2626 else 0x24DC2626
+                    holdIntent == BackspaceHoldIntent.CLEAR_ALL -> 0xFFDC2626.toInt()
+                    holdIntent == BackspaceHoldIntent.ROTATING -> if (dark) 0x38DC2626 else 0x24DC2626
+                    holdIntent == BackspaceHoldIntent.DELETE_BEFORE ||
+                        holdIntent == BackspaceHoldIntent.DELETE_AFTER -> 0xFFD97706.toInt()
+                    holdIntent == BackspaceHoldIntent.BATCH -> if (dark) 0x30D97706 else 0x20D97706
                     cell.isAccent -> accentSolid
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xCC075985.toInt() else 0xF0E0F2FE.toInt()
                     isCtxGlow -> if (dark) 0x330EA5E9 else 0x260284C7
@@ -664,7 +701,9 @@ internal class AeviouKeyboard(
 
             borderPaint.color =
                 when {
-                    isClearAllCell -> 0xFFEF4444.toInt()
+                    holdIntent == BackspaceHoldIntent.CLEAR_ALL || holdIntent == BackspaceHoldIntent.ROTATING ->
+                        0xFFEF4444.toInt()
+                    isHoldCell -> 0xFFF59E0B.toInt()
                     cell.isAccent -> 0x55FFFFFF
                     isCtxGlow && ctxHit.third == 0 -> if (dark) 0xFF38BDF8.toInt() else 0xFF0284C7.toInt()
                     isCtxGlow || isPressedAct -> accentSolid
@@ -672,14 +711,19 @@ internal class AeviouKeyboard(
                     dark -> 0x26FFFFFF
                     else -> 0x220F172A
                 }
-            borderPaint.strokeWidth = context.dpF(if (isClearAllCell || (isCtxGlow && ctxHit.third == 0)) 2.0f else if (isCtxGlow) 1.5f else 1.1f)
+            borderPaint.strokeWidth = context.dpF(if (isHoldCell || (isCtxGlow && ctxHit.third == 0)) 2.0f else if (isCtxGlow) 1.5f else 1.1f)
             c.drawPath(hexPath, borderPaint)
             borderPaint.strokeWidth = context.dpF(1.1f)
 
             textPaint.color =
                 when {
-                    isClearAllCell && clearAllSwipeUp -> 0xFFFFFFFF.toInt()
-                    isClearAllCell -> if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
+                    holdIntent == BackspaceHoldIntent.CLEAR_ALL ||
+                        holdIntent == BackspaceHoldIntent.DELETE_BEFORE ||
+                        holdIntent == BackspaceHoldIntent.DELETE_AFTER -> 0xFFFFFFFF.toInt()
+                    holdIntent == BackspaceHoldIntent.ROTATING ->
+                        if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
+                    holdIntent == BackspaceHoldIntent.BATCH ->
+                        if (dark) 0xFFFDE68A.toInt() else 0xFFB45309.toInt()
                     cell.isAccent -> 0xFFFFFFFF.toInt()
                     isCtxGlow && ctxHit.third == 0 && dark -> 0xFFFFFFFF.toInt()
                     isCtxGlow || isPressedAct -> accentText
@@ -693,10 +737,13 @@ internal class AeviouKeyboard(
                     else -> 255
                 }
             val displayCellLabel =
-                when {
-                    isClearAllCell && clearAllSwipeUp -> "松手清空"
-                    isClearAllCell -> "↑ 清空"
-                    else -> cell.label
+                when (holdIntent) {
+                    BackspaceHoldIntent.CLEAR_ALL -> "松手清空"
+                    BackspaceHoldIntent.ROTATING -> "↻ 画圈"
+                    BackspaceHoldIntent.DELETE_BEFORE -> "↑ 删前文"
+                    BackspaceHoldIntent.DELETE_AFTER -> "↓ 删下文"
+                    BackspaceHoldIntent.BATCH -> "批量删"
+                    BackspaceHoldIntent.INACTIVE -> cell.label
                 }
             textPaint.textSize =
                 context.dpF(
@@ -842,16 +889,20 @@ internal class AeviouKeyboard(
             subPaint.alpha = 255
             val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
             c.drawText(hudSummary, width * 0.5f, hudTextY, subPaint)
-        } else if (pressedAction?.id == "⌫" && (clearAllArmed || clearAllPending)) {
+        } else if (pressedAction?.id == "⌫" && (backspaceGesture.isActive || batchHoldPending)) {
+            val holdIntent = backspaceGesture.intent
             val elapsed = (SystemClock.uptimeMillis() - actionPressedAt).coerceAtLeast(0L)
-            if (clearAllArmed || elapsed >= CLEAR_ALL_PROGRESS_START_MS) {
+            if (backspaceGesture.isActive || elapsed >= CLEAR_ALL_PROGRESS_START_MS) {
                 val hudText =
-                    when {
-                        clearAllArmed && clearAllSwipeUp -> "松手立即清空输入框全文"
-                        clearAllArmed -> "↑ 向上滑动清空输入框全文"
-                        else -> {
+                    when (holdIntent) {
+                        BackspaceHoldIntent.CLEAR_ALL -> "松手立即清空输入框全文"
+                        BackspaceHoldIntent.ROTATING -> "继续画圈解锁清空全文"
+                        BackspaceHoldIntent.DELETE_BEFORE -> "松手删除光标前全部内容"
+                        BackspaceHoldIntent.DELETE_AFTER -> "松手删除光标后全部内容"
+                        BackspaceHoldIntent.BATCH -> "按住逐句删 · ↑前文 ↓下文 ↻画圈清空"
+                        BackspaceHoldIntent.INACTIVE -> {
                             val remain = ((CLEAR_ALL_HOLD_MS - elapsed) / 1000f).coerceAtLeast(0.1f)
-                            String.format(java.util.Locale.US, "继续按住 %.1fs 后上滑清空全文", remain)
+                            String.format(java.util.Locale.US, "继续按住 %.1fs 进入批量删除", remain)
                         }
                     }
                 subPaint.textSize = context.dpF(11f)
@@ -860,25 +911,37 @@ internal class AeviouKeyboard(
                 val hudL = (width - hudW) * 0.5f
                 val hudT = context.dpF(3f)
                 fillPaint.color =
-                    when {
-                        clearAllArmed && clearAllSwipeUp -> 0xFFDC2626.toInt()
-                        clearAllArmed -> if (dark) 0xEB450A0A.toInt() else 0xF5FEF2F2.toInt()
-                        else -> if (dark) 0xEB0F172A.toInt() else 0xF5FFFFFF.toInt()
+                    when (holdIntent) {
+                        BackspaceHoldIntent.CLEAR_ALL -> 0xFFDC2626.toInt()
+                        BackspaceHoldIntent.ROTATING -> if (dark) 0xEB450A0A.toInt() else 0xF5FEF2F2.toInt()
+                        BackspaceHoldIntent.DELETE_BEFORE, BackspaceHoldIntent.DELETE_AFTER -> 0xFFD97706.toInt()
+                        BackspaceHoldIntent.BATCH -> if (dark) 0xEB451A03.toInt() else 0xF5FFFBEB.toInt()
+                        BackspaceHoldIntent.INACTIVE -> if (dark) 0xEB0F172A.toInt() else 0xF5FFFFFF.toInt()
                     }
                 c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, fillPaint)
-                borderPaint.color = if (clearAllArmed) 0xFFEF4444.toInt() else 0x88EF4444.toInt()
+                borderPaint.color =
+                    when (holdIntent) {
+                        BackspaceHoldIntent.CLEAR_ALL, BackspaceHoldIntent.ROTATING -> 0xFFEF4444.toInt()
+                        BackspaceHoldIntent.DELETE_BEFORE,
+                        BackspaceHoldIntent.DELETE_AFTER,
+                        BackspaceHoldIntent.BATCH -> 0xFFF59E0B.toInt()
+                        BackspaceHoldIntent.INACTIVE -> 0x88F59E0B.toInt()
+                    }
                 c.drawRoundRect(hudL, hudT, hudL + hudW, hudT + hudH, hudH * 0.5f, hudH * 0.5f, borderPaint)
                 subPaint.color =
-                    when {
-                        clearAllArmed && clearAllSwipeUp -> 0xFFFFFFFF.toInt()
-                        clearAllArmed -> if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
-                        else -> if (dark) 0xFFFCA5A5.toInt() else 0xFFB91C1C.toInt()
+                    when (holdIntent) {
+                        BackspaceHoldIntent.CLEAR_ALL,
+                        BackspaceHoldIntent.DELETE_BEFORE,
+                        BackspaceHoldIntent.DELETE_AFTER -> 0xFFFFFFFF.toInt()
+                        BackspaceHoldIntent.ROTATING -> if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt()
+                        BackspaceHoldIntent.BATCH,
+                        BackspaceHoldIntent.INACTIVE -> if (dark) 0xFFFDE68A.toInt() else 0xFFB45309.toInt()
                     }
                 subPaint.alpha = 255
                 val hudTextY = hudT + hudH * 0.5f - (subPaint.descent() + subPaint.ascent()) * 0.5f
                 c.drawText(hudText, width * 0.5f, hudTextY, subPaint)
             }
-            if (!clearAllArmed && elapsed < CLEAR_ALL_HOLD_MS) {
+            if (!backspaceGesture.isActive && elapsed < CLEAR_ALL_HOLD_MS) {
                 postInvalidateOnAnimation()
             }
         }
@@ -911,23 +974,26 @@ internal class AeviouKeyboard(
         val x = touch.x
         val y = touch.y
         removeCallbacks(repeatDelete)
-        removeCallbacks(armClearAll)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
         repeatingDelete = false
-        clearAllPending = false
-        clearAllArmed = false
-        clearAllSwipeUp = false
+        batchHoldPending = false
+        backspaceGesture.reset()
         if (hit.isAction) {
             pressedAction = hit
             actionDownX = x
             actionDownY = y
+            actionLastX = x
+            actionLastY = y
             actionPressedAt = touch.time
             sliding = false
             armedSlide = false
             if (hit.id == "⌫") {
+                onActionKey("⌫-hold-begin")
                 backspaceHold = touch.deleteHold
-                clearAllPending = !backspaceHold.startedComposing
+                batchHoldPending = !backspaceHold.startedComposing
                 postDelayed(repeatDelete, 360L)
-                if (clearAllPending) postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
+                if (batchHoldPending) postDelayed(armBatchDelete, CLEAR_ALL_HOLD_MS)
             }
         } else {
             pressedAction = null
@@ -947,17 +1013,34 @@ internal class AeviouKeyboard(
         invalidate()
     }
 
+    private fun moveBackspaceGesture(e: MotionEvent, pointerIndex: Int) {
+        actionLastX = e.getX(pointerIndex)
+        actionLastY = e.getY(pointerIndex)
+        val prevIntent = backspaceGesture.intent
+        for (h in 0 until e.historySize) {
+            backspaceGesture.update(e.getHistoricalX(pointerIndex, h), e.getHistoricalY(pointerIndex, h))
+        }
+        val nextIntent = backspaceGesture.update(actionLastX, actionLastY)
+        if (prevIntent != BackspaceHoldIntent.CLEAR_ALL && nextIntent == BackspaceHoldIntent.CLEAR_ALL) {
+            performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+        }
+        if (prevIntent == BackspaceHoldIntent.BATCH && nextIntent != BackspaceHoldIntent.BATCH) {
+            removeCallbacks(batchDelete)
+        } else if (prevIntent != BackspaceHoldIntent.BATCH && nextIntent == BackspaceHoldIntent.BATCH) {
+            removeCallbacks(batchDelete)
+            postDelayed(batchDelete, BATCH_DELETE_INTERVAL_MS)
+        }
+        invalidate()
+    }
+
     private fun moveTouch(x: Float, y: Float) {
         if (pressedAction?.id == "⌫") {
-            if (!clearAllArmed && hypot(x - actionDownX, y - actionDownY) > context.dpF(14f)) {
+            actionLastX = x
+            actionLastY = y
+            if (!backspaceGesture.isActive && hypot(x - actionDownX, y - actionDownY) > context.dpF(14f)) {
                 removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
-                clearAllPending = false
-            }
-            if (clearAllArmed) {
-                clearAllSwipeUp =
-                    if (clearAllSwipeUp) actionDownY - y >= context.dpF(16f)
-                    else actionDownY - y >= context.dpF(24f)
+                removeCallbacks(armBatchDelete)
+                batchHoldPending = false
             }
             invalidate()
             return
@@ -996,25 +1079,61 @@ internal class AeviouKeyboard(
         invalidate()
     }
 
-    private fun finishTouch(x: Float, y: Float) {
+    fun cancelActiveTouches() {
         removeCallbacks(repeatDelete)
-        removeCallbacks(armClearAll)
-        val act = pressedAction
-        val didRepeat = repeatingDelete
-        val didClearAllArmed = clearAllArmed
-        val didClearAllSwipeUp = clearAllSwipeUp
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
+        touches.clear()
+        gesturePointerId = null
         pressedAction = null
         repeatingDelete = false
-        clearAllPending = false
-        clearAllArmed = false
-        clearAllSwipeUp = false
+        batchHoldPending = false
+        backspaceGesture.reset()
+        backspaceHold.begin(composing = false)
+        sliding = false
+        armedSlide = false
+        petals = emptyList()
+        clearTrail()
+        cachedSlidePrefix = ""
+        cachedCenterHint = ""
+        cachedHudSummary = ""
+        stepStack.clear()
+        centerHistory.clear()
+        invalidate()
+    }
+
+    private fun finishTouch(x: Float, y: Float) {
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
+        val act = pressedAction
+        if (act?.id == "⌫" && backspaceGesture.isActive) {
+            val prevIntent = backspaceGesture.intent
+            val nextIntent = backspaceGesture.update(x, y)
+            if (prevIntent != BackspaceHoldIntent.CLEAR_ALL && nextIntent == BackspaceHoldIntent.CLEAR_ALL) {
+                performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+            }
+        }
+        val didRepeat = repeatingDelete
+        val holdIntent = backspaceGesture.intent
+        pressedAction = null
+        repeatingDelete = false
+        batchHoldPending = false
+        backspaceGesture.reset()
         if (act != null) {
             when {
-                didClearAllArmed && didClearAllSwipeUp -> {
-                    performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                holdIntent == BackspaceHoldIntent.CLEAR_ALL -> {
                     onActionKey("clear-all")
                 }
-                didClearAllArmed || didRepeat -> Unit
+                holdIntent == BackspaceHoldIntent.DELETE_BEFORE -> {
+                    performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    onActionKey("delete-before-cursor")
+                }
+                holdIntent == BackspaceHoldIntent.DELETE_AFTER -> {
+                    performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    onActionKey("delete-after-cursor")
+                }
+                holdIntent != BackspaceHoldIntent.INACTIVE || didRepeat -> Unit
                 act.id == "⌫" && !backspaceHold.allowsDelete(isComposing()) -> Unit
                 act.id == "⌫" && x - actionDownX < -context.dpF(20f) -> onActionKey("delete-word")
                 hitCell(x, y) == act -> onActionKey(act.id)
@@ -1063,8 +1182,15 @@ internal class AeviouKeyboard(
                     if (index < 0) continue
                     val x = e.getX(index)
                     val y = e.getY(index)
-                    if (id == gesturePointerId) moveTouch(x, y)
-                    else if (hypot(x - touch.x, y - touch.y) > context.dpF(14f)) touch.moved = true
+                    if (id == gesturePointerId) {
+                        if (pressedAction?.id == "⌫" && backspaceGesture.isActive) {
+                            moveBackspaceGesture(e, index)
+                        } else {
+                            moveTouch(x, y)
+                        }
+                    } else if (hypot(x - touch.x, y - touch.y) > context.dpF(14f)) {
+                        touch.moved = true
+                    }
                 }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> {
@@ -1090,23 +1216,7 @@ internal class AeviouKeyboard(
                 }
             }
             MotionEvent.ACTION_CANCEL -> {
-                removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
-                touches.clear()
-                gesturePointerId = null
-                pressedAction = null
-                repeatingDelete = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
-                sliding = false
-                petals = emptyList()
-                clearTrail()
-                cachedSlidePrefix = ""
-                cachedCenterHint = ""
-                cachedHudSummary = ""
-                stepStack.clear()
-                invalidate()
+                cancelActiveTouches()
             }
         }
         return true
@@ -1114,12 +1224,15 @@ internal class AeviouKeyboard(
 
     override fun onDetachedFromWindow() {
         removeCallbacks(repeatDelete)
-        removeCallbacks(armClearAll)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
+        batchHoldPending = false
+        backspaceGesture.reset()
         super.onDetachedFromWindow()
     }
 
     companion object {
-        internal const val CLEAR_ALL_HOLD_MS = 1000L
+        internal const val CLEAR_ALL_HOLD_MS = HOLD_BATCH_MS
         private const val CLEAR_ALL_PROGRESS_START_MS = 360L
         private const val TRAIL_CAPACITY = 48
         private val HEX_COS = FloatArray(6) { i -> cos((PI / 180.0) * (60.0 * i - 30.0)).toFloat() }

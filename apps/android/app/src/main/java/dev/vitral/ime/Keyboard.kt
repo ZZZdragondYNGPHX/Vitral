@@ -20,6 +20,9 @@ import android.view.View
 import android.widget.LinearLayout
 import dev.vitral.ime.theme.VitralTokens as T
 import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.hypot
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
 
@@ -140,6 +143,287 @@ internal fun trailingWordDeleteSlice(before: String, lastCommitted: String): Pai
     val cpCount = before.codePointCount(0, before.length).coerceAtMost(4)
     val start = before.offsetByCodePoints(before.length, -cpCount)
     return before.substring(start) to false
+}
+
+internal const val HOLD_BATCH_MS = 1000L
+internal const val BATCH_DELETE_INTERVAL_MS = 300L
+private const val BATCH_DELETE_MAX_CODE_POINTS = 400
+
+internal enum class BackspaceHoldIntent {
+    INACTIVE,
+    BATCH,
+    DELETE_BEFORE,
+    DELETE_AFTER,
+    ROTATING,
+    CLEAR_ALL,
+}
+
+/**
+ * Pure state machine for the 1-second Backspace hold gestures:
+ * - Hold in place: BATCH (periodic sentence/paragraph deletion)
+ * - Swipe up: DELETE_BEFORE (delete all text before cursor on release)
+ * - Swipe down: DELETE_AFTER (delete all text after cursor on release)
+ * - Draw a circle (CW/CCW, off-center friendly via tangential turning angle): ROTATING -> CLEAR_ALL
+ */
+internal class BackspaceHoldGesture(
+    private val swipeUpEnterPx: Float,
+    private val swipeUpExitPx: Float,
+    private val swipeDownEnterPx: Float,
+    private val swipeDownExitPx: Float,
+    private val sampleStepPx: Float,
+    private val rotateSpanPx: Float,
+    private val clearAllSpanPx: Float,
+) {
+    var intent: BackspaceHoldIntent = BackspaceHoldIntent.INACTIVE
+        private set
+
+    val isActive: Boolean
+        get() = intent != BackspaceHoldIntent.INACTIVE
+
+    private var anchorX = 0f
+    private var anchorY = 0f
+    private var lastSampleX = 0f
+    private var lastSampleY = 0f
+    private var hasPrevDir = false
+    private var prevDx = 0f
+    private var prevDy = 0f
+    private var cumulativeAngle = 0f
+    private var minX = 0f
+    private var maxX = 0f
+    private var minY = 0f
+    private var maxY = 0f
+    private val sampleX = FloatArray(MAX_SAMPLES)
+    private val sampleY = FloatArray(MAX_SAMPLES)
+    private var sampleCount = 0
+
+    private fun appendSample(x: Float, y: Float) {
+        if (sampleCount >= MAX_SAMPLES) {
+            System.arraycopy(sampleX, 1, sampleX, 0, MAX_SAMPLES - 1)
+            System.arraycopy(sampleY, 1, sampleY, 0, MAX_SAMPLES - 1)
+            sampleCount = MAX_SAMPLES - 1
+        }
+        sampleX[sampleCount] = x
+        sampleY[sampleCount] = y
+        sampleCount += 1
+    }
+
+    private fun hasClosedLoop(): Boolean {
+        if (sampleCount < CLEAR_ALL_MIN_SAMPLES) return false
+        val m = sampleCount - 1
+        val endX = sampleX[m]
+        val endY = sampleY[m]
+        var sMinX = endX
+        var sMaxX = endX
+        var sMinY = endY
+        var sMaxY = endY
+        var sumX = endX
+        var sumY = endY
+        for (s in m - 1 downTo 0) {
+            val xs = sampleX[s]
+            val ys = sampleY[s]
+            if (xs < sMinX) sMinX = xs
+            if (xs > sMaxX) sMaxX = xs
+            if (ys < sMinY) sMinY = ys
+            if (ys > sMaxY) sMaxY = ys
+            sumX += xs
+            sumY += ys
+            val count = m - s + 1
+            if (count < CLEAR_ALL_MIN_SAMPLES) continue
+            val loopSpanX = sMaxX - sMinX
+            val loopSpanY = sMaxY - sMinY
+            if (loopSpanX < clearAllSpanPx || loopSpanY < clearAllSpanPx) continue
+            val minSpan = min(loopSpanX, loopSpanY)
+            val closeLimit = max(sampleStepPx * 2.5f, 0.35f * minSpan)
+            if (hypot(endX - xs, endY - ys) > closeLimit) continue
+            val cx = sumX / count
+            val cy = sumY / count
+            val minRadius = 0.18f * minSpan
+            var prevRx = xs - cx
+            var prevRy = ys - cy
+            if (hypot(prevRx, prevRy) < minRadius) continue
+            var insideOk = true
+            var winding = 0f
+            for (j in s + 1..m) {
+                val rx = sampleX[j] - cx
+                val ry = sampleY[j] - cy
+                if (hypot(rx, ry) < minRadius) {
+                    insideOk = false
+                    break
+                }
+                val cross = prevRx * ry - prevRy * rx
+                val dot = prevRx * rx + prevRy * ry
+                winding += atan2(cross, dot)
+                prevRx = rx
+                prevRy = ry
+            }
+            if (insideOk && abs(winding) >= CLEAR_ALL_WINDING_RAD) {
+                return true
+            }
+        }
+        return false
+    }
+
+    fun begin(anchorX: Float, anchorY: Float) {
+        this.anchorX = anchorX
+        this.anchorY = anchorY
+        lastSampleX = anchorX
+        lastSampleY = anchorY
+        hasPrevDir = false
+        prevDx = 0f
+        prevDy = 0f
+        cumulativeAngle = 0f
+        minX = anchorX
+        maxX = anchorX
+        minY = anchorY
+        maxY = anchorY
+        sampleX[0] = anchorX
+        sampleY[0] = anchorY
+        sampleCount = 1
+        intent = BackspaceHoldIntent.BATCH
+    }
+
+    fun reset() {
+        intent = BackspaceHoldIntent.INACTIVE
+        hasPrevDir = false
+        prevDx = 0f
+        prevDy = 0f
+        cumulativeAngle = 0f
+        sampleCount = 0
+    }
+
+    fun update(x: Float, y: Float): BackspaceHoldIntent {
+        if (intent == BackspaceHoldIntent.INACTIVE || intent == BackspaceHoldIntent.CLEAR_ALL) {
+            return intent
+        }
+        val dx = x - lastSampleX
+        val dy = y - lastSampleY
+        var sampleAdded = false
+        if (hypot(dx, dy) >= sampleStepPx) {
+            if (hasPrevDir) {
+                val cross = prevDx * dy - prevDy * dx
+                val dot = prevDx * dx + prevDy * dy
+                val deltaPsi = atan2(cross, dot)
+                if (abs(deltaPsi) > SHARP_REVERSAL_RAD) {
+                    cumulativeAngle = 0f
+                    minX = min(lastSampleX, x)
+                    maxX = max(lastSampleX, x)
+                    minY = min(lastSampleY, y)
+                    maxY = max(lastSampleY, y)
+                    sampleX[0] = lastSampleX
+                    sampleY[0] = lastSampleY
+                    sampleX[1] = x
+                    sampleY[1] = y
+                    sampleCount = 2
+                } else {
+                    cumulativeAngle += deltaPsi
+                    minX = min(minX, x)
+                    maxX = max(maxX, x)
+                    minY = min(minY, y)
+                    maxY = max(maxY, y)
+                    appendSample(x, y)
+                }
+            } else {
+                minX = min(minX, x)
+                maxX = max(maxX, x)
+                minY = min(minY, y)
+                maxY = max(maxY, y)
+                appendSample(x, y)
+            }
+            prevDx = dx
+            prevDy = dy
+            hasPrevDir = true
+            lastSampleX = x
+            lastSampleY = y
+            sampleAdded = true
+        }
+
+        val spanX = maxX - minX
+        val spanY = maxY - minY
+        val absAngle = abs(cumulativeAngle)
+        if (sampleAdded && hasClosedLoop()) {
+            intent = BackspaceHoldIntent.CLEAR_ALL
+            return intent
+        }
+        val rotateThreshold =
+            if (intent == BackspaceHoldIntent.ROTATING) ROTATING_EXIT_ANGLE_RAD else ROTATING_ENTER_ANGLE_RAD
+        if (absAngle >= rotateThreshold && spanX >= rotateSpanPx && spanY >= rotateSpanPx) {
+            intent = BackspaceHoldIntent.ROTATING
+            return intent
+        }
+
+        val upDist = anchorY - y
+        val downDist = y - anchorY
+        intent =
+            when (intent) {
+                BackspaceHoldIntent.DELETE_BEFORE ->
+                    when {
+                        upDist >= swipeUpExitPx -> BackspaceHoldIntent.DELETE_BEFORE
+                        downDist >= swipeDownEnterPx -> BackspaceHoldIntent.DELETE_AFTER
+                        else -> BackspaceHoldIntent.BATCH
+                    }
+                BackspaceHoldIntent.DELETE_AFTER ->
+                    when {
+                        downDist >= swipeDownExitPx -> BackspaceHoldIntent.DELETE_AFTER
+                        upDist >= swipeUpEnterPx -> BackspaceHoldIntent.DELETE_BEFORE
+                        else -> BackspaceHoldIntent.BATCH
+                    }
+                else ->
+                    when {
+                        upDist >= swipeUpEnterPx -> BackspaceHoldIntent.DELETE_BEFORE
+                        downDist >= swipeDownEnterPx -> BackspaceHoldIntent.DELETE_AFTER
+                        else -> BackspaceHoldIntent.BATCH
+                    }
+            }
+        return intent
+    }
+
+    companion object {
+        internal const val SHARP_REVERSAL_RAD = 2.1f
+        internal const val ROTATING_ENTER_ANGLE_RAD = 2.1f
+        internal const val ROTATING_EXIT_ANGLE_RAD = 1.6f
+        internal const val CLEAR_ALL_WINDING_RAD = 5.75f
+        private const val CLEAR_ALL_MIN_SAMPLES = 8
+        private const val MAX_SAMPLES = 256
+    }
+}
+
+private fun isSentenceEndPunctuation(ch: Char): Boolean =
+    ch == '。' || ch == '！' || ch == '？' || ch == '；' ||
+        ch == '.' || ch == '!' || ch == '?' || ch == ';'
+
+/**
+ * Computes the trailing slice to delete on one batch-delete tick.
+ * 0-based `batchStep`: ticks 0..2 delete by sentence (`。！？；.!?;` or `\n`);
+ * tick 3 (4th jump) onward upgrades to deleting whole paragraphs (`\n`).
+ * Always caps at 400 code points without splitting UTF-16 surrogate pairs.
+ */
+internal fun trailingBatchDeleteSlice(before: String, batchStep: Int): String {
+    if (before.isEmpty()) return ""
+    val paragraphMode = batchStep >= 3
+    var i = before.length
+    while (i > 0 && before[i - 1].isWhitespace()) {
+        i--
+    }
+    if (!paragraphMode) {
+        while (i > 0 && isSentenceEndPunctuation(before[i - 1])) {
+            i--
+        }
+    }
+    while (i > 0) {
+        val ch = before[i - 1]
+        if (ch == '\n' || (!paragraphMode && isSentenceEndPunctuation(ch))) {
+            break
+        }
+        i--
+    }
+    val cpCount = before.codePointCount(i, before.length)
+    val start =
+        if (cpCount > BATCH_DELETE_MAX_CODE_POINTS) {
+            before.offsetByCodePoints(before.length, -BATCH_DELETE_MAX_CODE_POINTS)
+        } else {
+            i
+        }
+    return before.substring(start)
 }
 
 internal data class PreeditDisplay(
@@ -284,6 +568,16 @@ internal class Key(
     private var cachedGlowCy = Float.NaN
     private var cachedGlowRadius = Float.NaN
     private val backspaceHold = BackspaceHold()
+    private val backspaceGesture =
+        BackspaceHoldGesture(
+            swipeUpEnterPx = ctx.dpF(20f),
+            swipeUpExitPx = ctx.dpF(14f),
+            swipeDownEnterPx = ctx.dpF(18f),
+            swipeDownExitPx = ctx.dpF(12f),
+            sampleStepPx = ctx.dpF(4f),
+            rotateSpanPx = ctx.dpF(12f),
+            clearAllSpanPx = ctx.dpF(16f),
+        )
     private var downX = 0f
     private var downY = 0f
     private var lastX = 0f
@@ -293,9 +587,7 @@ internal class Key(
     private var spaceAnchorX = 0f
     private var recording = false
     private var repeatingDelete = false
-    private var clearAllPending = false
-    private var clearAllArmed = false
-    private var clearAllSwipeUp = false
+    private var batchHoldPending = false
     private var pressedAt = 0L
     private var releasedAt = 0L
 
@@ -310,7 +602,7 @@ internal class Key(
     private val repeatDelete =
         object : Runnable {
             override fun run() {
-                if (!isPressed || clearAllArmed) return
+                if (!isPressed || backspaceGesture.isActive) return
                 repeatingDelete = true
                 if (!backspaceHold.allowsDelete(isComposing())) return
                 action("⌫-repeat")
@@ -318,12 +610,30 @@ internal class Key(
             }
         }
 
-    private val armClearAll = Runnable {
-        if (isPressed && clearAllPending && label == "⌫") {
-            clearAllPending = false
-            clearAllArmed = true
+    private val batchDelete =
+        object : Runnable {
+            override fun run() {
+                if (!isPressed || backspaceGesture.intent != BackspaceHoldIntent.BATCH) return
+                if (!backspaceHold.allowsDelete(isComposing())) return
+                action("⌫-batch")
+                postDelayed(this, BATCH_DELETE_INTERVAL_MS)
+            }
+        }
+
+    private val armBatchDelete = Runnable {
+        if (isPressed && batchHoldPending && label == "⌫") {
+            batchHoldPending = false
             removeCallbacks(repeatDelete)
+            if (!backspaceHold.allowsDelete(isComposing())) {
+                invalidate()
+                return@Runnable
+            }
+            backspaceGesture.begin(lastX, lastY)
             performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+            action("⌫-batch")
+            if (isPressed && backspaceGesture.intent == BackspaceHoldIntent.BATCH) {
+                postDelayed(batchDelete, BATCH_DELETE_INTERVAL_MS)
+            }
             invalidate()
         }
     }
@@ -348,31 +658,53 @@ internal class Key(
             !recording &&
             !spaceScrubbing &&
             !repeatingDelete &&
-            !clearAllArmed &&
+            !backspaceGesture.isActive &&
             x in -context.dpF(8f)..(width + context.dpF(8f)) &&
             y in -context.dpF(8f)..(height + context.dpF(8f))
 
     internal fun commitRollover() {
         removeCallbacks(startVoice)
         removeCallbacks(repeatDelete)
-        removeCallbacks(armClearAll)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
         isPressed = false
         releasedAt = SystemClock.uptimeMillis()
         swipeUpActive = false
         repeatingDelete = false
         spaceScrubbing = false
-        clearAllPending = false
-        clearAllArmed = false
-        clearAllSwipeUp = false
+        batchHoldPending = false
+        backspaceGesture.reset()
         performClick()
+        invalidate()
+    }
+
+    internal fun cancelActiveHold() {
+        removeCallbacks(startVoice)
+        removeCallbacks(repeatDelete)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
+        val wasRecording = recording
+        isPressed = false
+        swipeUpActive = false
+        repeatingDelete = false
+        spaceScrubbing = false
+        batchHoldPending = false
+        recording = false
+        backspaceGesture.reset()
+        backspaceHold.begin(composing = false)
+        if (wasRecording) {
+            action("cancel-voice")
+        }
         invalidate()
     }
 
     fun onCompositionChanged(composing: Boolean) {
         if (label == "⌫" && isPressed && !backspaceHold.allowsDelete(composing)) {
             removeCallbacks(repeatDelete)
-            removeCallbacks(armClearAll)
-            clearAllPending = false
+            removeCallbacks(armBatchDelete)
+            removeCallbacks(batchDelete)
+            batchHoldPending = false
+            backspaceGesture.reset()
             invalidate()
         }
     }
@@ -546,19 +878,27 @@ internal class Key(
         }
 
         val shiftActive = label == "⇧" && shiftState > 0
-        val clearAllActive = label == "⌫" && clearAllArmed
+        val holdIntent = if (label == "⌫") backspaceGesture.intent else BackspaceHoldIntent.INACTIVE
 
         // Vertical liquid-glass keycap fill (gentle top-to-bottom luminance instead of flat box)
         val topFill: Int
         val bottomFill: Int
         when {
-            clearAllActive && clearAllSwipeUp -> {
+            holdIntent == BackspaceHoldIntent.CLEAR_ALL -> {
                 topFill = 0xFFEF4444.toInt()
                 bottomFill = 0xFFDC2626.toInt()
             }
-            clearAllActive -> {
+            holdIntent == BackspaceHoldIntent.ROTATING -> {
                 topFill = if (dark) 0x55EF4444 else 0x38EF4444
                 bottomFill = if (dark) 0x38DC2626 else 0x24DC2626
+            }
+            holdIntent == BackspaceHoldIntent.DELETE_BEFORE || holdIntent == BackspaceHoldIntent.DELETE_AFTER -> {
+                topFill = 0xFFF59E0B.toInt()
+                bottomFill = 0xFFD97706.toInt()
+            }
+            holdIntent == BackspaceHoldIntent.BATCH -> {
+                topFill = if (dark) 0x48F59E0B else 0x30F59E0B
+                bottomFill = if (dark) 0x30D97706 else 0x20D97706
             }
             role == KeyRole.ACCENT -> {
                 topFill = if (dark) 0xFF19B5FA.toInt() else 0xFF0A93D9.toInt()
@@ -646,7 +986,9 @@ internal class Key(
         // Ultra-delicate glass border (never a harsh wireframe box!) + luminous top specular edge
         val borderTopColor =
             when {
-                clearAllActive -> 0xFFEF4444.toInt()
+                holdIntent == BackspaceHoldIntent.CLEAR_ALL || holdIntent == BackspaceHoldIntent.ROTATING ->
+                    0xFFEF4444.toInt()
+                holdIntent != BackspaceHoldIntent.INACTIVE -> 0xFFF59E0B.toInt()
                 glowStrength > 0.2f -> (if (dark) T.Dark.accentTextArgb else T.Light.accentPrimaryArgb).toInt()
                 shiftActive -> (if (dark) 0x557DD3FC else 0x440284C7)
                 role == KeyRole.ACCENT -> 0x55FFFFFF
@@ -655,7 +997,9 @@ internal class Key(
             }
         val borderBottomColor =
             when {
-                clearAllActive -> 0xCCDC2626.toInt()
+                holdIntent == BackspaceHoldIntent.CLEAR_ALL || holdIntent == BackspaceHoldIntent.ROTATING ->
+                    0xCCDC2626.toInt()
+                holdIntent != BackspaceHoldIntent.INACTIVE -> 0xCCD97706.toInt()
                 glowStrength > 0.2f -> (if (dark) 0x4438BDF8 else 0x440284C7)
                 role == KeyRole.ACCENT -> 0x18FFFFFF
                 dark -> 0x0AFFFFFF
@@ -688,7 +1032,7 @@ internal class Key(
         borderPaint.shader = null
 
         // Subtle charging progress bar during a continuous 1-second hold on Backspace
-        if (label == "⌫" && isPressed && clearAllPending && !clearAllArmed && pressedAt > 0L) {
+        if (label == "⌫" && isPressed && batchHoldPending && !backspaceGesture.isActive && pressedAt > 0L) {
             val elapsed = (now - pressedAt).coerceAtLeast(0L)
             if (elapsed >= CLEAR_ALL_PROGRESS_START_MS) {
                 val frac =
@@ -700,7 +1044,7 @@ internal class Key(
                 val barW = ((keyRect.width() - barInset * 2f) * frac).coerceAtLeast(0f)
                 paint.shader = null
                 paint.style = Paint.Style.FILL
-                paint.color = if (dark) 0xDDF87171.toInt() else 0xDDEF4444.toInt()
+                paint.color = if (dark) 0xDDFBBF24.toInt() else 0xDDD97706.toInt()
                 c.drawRoundRect(
                     keyRect.left + barInset,
                     keyRect.top + context.dpF(2.5f),
@@ -768,8 +1112,8 @@ internal class Key(
         when (label) {
             "⇧" -> drawShiftGlyph(c, cx, cy, primaryText)
             "⌫" -> {
-                when {
-                    clearAllArmed && clearAllSwipeUp ->
+                when (holdIntent) {
+                    BackspaceHoldIntent.CLEAR_ALL ->
                         drawCenteredText(
                             c,
                             "松手清空",
@@ -780,18 +1124,51 @@ internal class Key(
                             Paint.Align.CENTER,
                             bold = true,
                         )
-                    clearAllArmed ->
+                    BackspaceHoldIntent.ROTATING ->
                         drawCenteredText(
                             c,
-                            "↑ 清空",
+                            "↻ 画圈",
                             cx,
                             cy,
-                            11.5f.coerceAtMost(maxTextDp),
+                            11.0f.coerceAtMost(maxTextDp),
                             if (dark) 0xFFFCA5A5.toInt() else 0xFFDC2626.toInt(),
                             Paint.Align.CENTER,
                             bold = true,
                         )
-                    else -> drawBackspaceGlyph(c, cx, cy, primaryText)
+                    BackspaceHoldIntent.DELETE_BEFORE ->
+                        drawCenteredText(
+                            c,
+                            "↑ 删前文",
+                            cx,
+                            cy,
+                            10.5f.coerceAtMost(maxTextDp),
+                            0xFFFFFFFF.toInt(),
+                            Paint.Align.CENTER,
+                            bold = true,
+                        )
+                    BackspaceHoldIntent.DELETE_AFTER ->
+                        drawCenteredText(
+                            c,
+                            "↓ 删下文",
+                            cx,
+                            cy,
+                            10.5f.coerceAtMost(maxTextDp),
+                            0xFFFFFFFF.toInt(),
+                            Paint.Align.CENTER,
+                            bold = true,
+                        )
+                    BackspaceHoldIntent.BATCH ->
+                        drawCenteredText(
+                            c,
+                            "批量删",
+                            cx,
+                            cy,
+                            11.0f.coerceAtMost(maxTextDp),
+                            if (dark) 0xFFFDE68A.toInt() else 0xFFB45309.toInt(),
+                            Paint.Align.CENTER,
+                            bold = true,
+                        )
+                    BackspaceHoldIntent.INACTIVE -> drawBackspaceGlyph(c, cx, cy, primaryText)
                 }
             }
             "↵" -> {
@@ -903,6 +1280,10 @@ internal class Key(
     override fun onTouchEvent(e: MotionEvent): Boolean {
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
+                removeCallbacks(startVoice)
+                removeCallbacks(repeatDelete)
+                removeCallbacks(armBatchDelete)
+                removeCallbacks(batchDelete)
                 downX = e.x
                 downY = e.y
                 lastX = e.x
@@ -911,9 +1292,8 @@ internal class Key(
                 spaceScrubbing = false
                 swipeUpActive = false
                 repeatingDelete = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
+                batchHoldPending = false
+                backspaceGesture.reset()
                 pressedAt = e.eventTime
                 releasedAt = 0L
                 isPressed = true
@@ -921,25 +1301,37 @@ internal class Key(
                     postDelayed(startVoice, T.Ergonomics.spacebarVoiceHoldThresholdMs.toLong())
                 }
                 if (label == "⌫") {
+                    action("⌫-hold-begin")
                     backspaceHold.begin(isComposing())
-                    clearAllPending = !backspaceHold.startedComposing
+                    batchHoldPending = !backspaceHold.startedComposing
                     postDelayed(repeatDelete, 360L)
-                    if (clearAllPending) postDelayed(armClearAll, CLEAR_ALL_HOLD_MS)
+                    if (batchHoldPending) postDelayed(armBatchDelete, CLEAR_ALL_HOLD_MS)
                 }
             }
             MotionEvent.ACTION_MOVE -> {
                 lastX = e.x
                 lastY = e.y
-                if (!clearAllArmed && (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14))) {
+                if (!backspaceGesture.isActive && (abs(e.x - downX) > context.dp(14) || abs(e.y - downY) > context.dp(14))) {
                     removeCallbacks(startVoice)
                     removeCallbacks(repeatDelete)
-                    removeCallbacks(armClearAll)
-                    clearAllPending = false
+                    removeCallbacks(armBatchDelete)
+                    batchHoldPending = false
                 }
-                if (label == "⌫" && clearAllArmed) {
-                    clearAllSwipeUp =
-                        if (clearAllSwipeUp) downY - e.y >= context.dp(16)
-                        else downY - e.y >= context.dp(24)
+                if (label == "⌫" && backspaceGesture.isActive) {
+                    val prevIntent = backspaceGesture.intent
+                    for (h in 0 until e.historySize) {
+                        backspaceGesture.update(e.getHistoricalX(h), e.getHistoricalY(h))
+                    }
+                    val nextIntent = backspaceGesture.update(e.x, e.y)
+                    if (prevIntent != BackspaceHoldIntent.CLEAR_ALL && nextIntent == BackspaceHoldIntent.CLEAR_ALL) {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    }
+                    if (prevIntent == BackspaceHoldIntent.BATCH && nextIntent != BackspaceHoldIntent.BATCH) {
+                        removeCallbacks(batchDelete)
+                    } else if (prevIntent != BackspaceHoldIntent.BATCH && nextIntent == BackspaceHoldIntent.BATCH) {
+                        removeCallbacks(batchDelete)
+                        postDelayed(batchDelete, BATCH_DELETE_INTERVAL_MS)
+                    }
                 }
                 if (label == "空格" && !recording && canScrubSpace()) {
                     val step = context.dpF(14f)
@@ -958,35 +1350,51 @@ internal class Key(
                         }
                     }
                 }
-                swipeUpActive = !spaceScrubbing && !clearAllArmed && upper.isNotEmpty() && downY - e.y > context.dp(16)
+                swipeUpActive = !spaceScrubbing && !backspaceGesture.isActive && upper.isNotEmpty() && downY - e.y > context.dp(16)
             }
             MotionEvent.ACTION_UP -> {
                 removeCallbacks(startVoice)
                 removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
+                removeCallbacks(armBatchDelete)
+                removeCallbacks(batchDelete)
+                if (label == "⌫" && backspaceGesture.isActive) {
+                    val prevIntent = backspaceGesture.intent
+                    for (h in 0 until e.historySize) {
+                        backspaceGesture.update(e.getHistoricalX(h), e.getHistoricalY(h))
+                    }
+                    val nextIntent = backspaceGesture.update(e.x, e.y)
+                    if (prevIntent != BackspaceHoldIntent.CLEAR_ALL && nextIntent == BackspaceHoldIntent.CLEAR_ALL) {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    }
+                }
                 isPressed = false
                 releasedAt = SystemClock.uptimeMillis()
                 val didSwipeUp = swipeUpActive
                 val didRepeat = repeatingDelete
                 val didScrub = spaceScrubbing
-                val didClearAllArmed = clearAllArmed
-                val didClearAllSwipeUp = clearAllSwipeUp
+                val holdIntent = backspaceGesture.intent
                 swipeUpActive = false
                 repeatingDelete = false
                 spaceScrubbing = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
+                batchHoldPending = false
+                backspaceGesture.reset()
                 when {
                     recording -> {
                         recording = false
                         voice?.invoke(false)
                     }
-                    didClearAllArmed && didClearAllSwipeUp -> {
-                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                    holdIntent == BackspaceHoldIntent.CLEAR_ALL -> {
                         action("clear-all")
                     }
-                    didClearAllArmed -> Unit
+                    holdIntent == BackspaceHoldIntent.DELETE_BEFORE -> {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                        action("delete-before-cursor")
+                    }
+                    holdIntent == BackspaceHoldIntent.DELETE_AFTER -> {
+                        performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+                        action("delete-after-cursor")
+                    }
+                    holdIntent != BackspaceHoldIntent.INACTIVE -> Unit
                     didRepeat || didScrub -> Unit
                     label == "⌫" && !backspaceHold.allowsDelete(isComposing()) -> Unit
                     label == "⌫" && e.x - downX < -context.dp(20) -> action("delete-word")
@@ -999,15 +1407,15 @@ internal class Key(
             MotionEvent.ACTION_CANCEL -> {
                 removeCallbacks(startVoice)
                 removeCallbacks(repeatDelete)
-                removeCallbacks(armClearAll)
+                removeCallbacks(armBatchDelete)
+                removeCallbacks(batchDelete)
                 isPressed = false
                 releasedAt = SystemClock.uptimeMillis()
                 swipeUpActive = false
                 repeatingDelete = false
                 spaceScrubbing = false
-                clearAllPending = false
-                clearAllArmed = false
-                clearAllSwipeUp = false
+                batchHoldPending = false
+                backspaceGesture.reset()
                 if (recording) {
                     recording = false
                     action("cancel-voice")
@@ -1023,12 +1431,15 @@ internal class Key(
     override fun onDetachedFromWindow() {
         removeCallbacks(startVoice)
         removeCallbacks(repeatDelete)
-        removeCallbacks(armClearAll)
+        removeCallbacks(armBatchDelete)
+        removeCallbacks(batchDelete)
+        batchHoldPending = false
+        backspaceGesture.reset()
         super.onDetachedFromWindow()
     }
 
     companion object {
-        internal const val CLEAR_ALL_HOLD_MS = 1000L
+        internal const val CLEAR_ALL_HOLD_MS = HOLD_BATCH_MS
         private const val CLEAR_ALL_PROGRESS_START_MS = 360L
         private val regularTypeface: Typeface by lazy { Typeface.create("sans-serif", Typeface.NORMAL) }
         private val mediumTypeface: Typeface by lazy { Typeface.create("sans-serif-medium", Typeface.NORMAL) }
@@ -1405,17 +1816,42 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
         pointerIndex: Int,
     ) {
         val row = key.parent as? View ?: return
-        val localX = source.getX(pointerIndex) - row.left - key.left
-        val localY = source.getY(pointerIndex) - row.top - key.top
+        val offsetX = (row.left + key.left).toFloat()
+        val offsetY = (row.top + key.top).toFloat()
+        val localX = source.getX(pointerIndex) - offsetX
+        val localY = source.getY(pointerIndex) - offsetY
         val synthetic =
-            MotionEvent.obtain(
-                source.downTime,
-                source.eventTime,
-                action,
-                localX,
-                localY,
-                0,
-            )
+            if (action == MotionEvent.ACTION_MOVE && source.historySize > 0) {
+                MotionEvent.obtain(
+                    source.downTime,
+                    source.getHistoricalEventTime(0),
+                    action,
+                    source.getHistoricalX(pointerIndex, 0) - offsetX,
+                    source.getHistoricalY(pointerIndex, 0) - offsetY,
+                    0,
+                ).apply {
+                    for (h in 1 until source.historySize) {
+                        addBatch(
+                            source.getHistoricalEventTime(h),
+                            source.getHistoricalX(pointerIndex, h) - offsetX,
+                            source.getHistoricalY(pointerIndex, h) - offsetY,
+                            0f,
+                            0f,
+                            0,
+                        )
+                    }
+                    addBatch(source.eventTime, localX, localY, 0f, 0f, 0)
+                }
+            } else {
+                MotionEvent.obtain(
+                    source.downTime,
+                    source.eventTime,
+                    action,
+                    localX,
+                    localY,
+                    0,
+                )
+            }
         try {
             key.onTouchEvent(synthetic)
         } finally {
@@ -1426,6 +1862,20 @@ internal class KeyboardTouchHost(ctx: Context) : LinearLayout(ctx) {
     fun resetActiveTouches() {
         activePointers.clear()
         pointerSamples.clear()
+    }
+
+    fun cancelAllTouches() {
+        for (rowIdx in 0 until childCount) {
+            val child = getChildAt(rowIdx)
+            if (child is Key) {
+                child.cancelActiveHold()
+            } else if (child is LinearLayout) {
+                for (i in 0 until child.childCount) {
+                    (child.getChildAt(i) as? Key)?.cancelActiveHold()
+                }
+            }
+        }
+        resetActiveTouches()
     }
 
     private fun computeSampleForTouch(hostX: Float, hostY: Float, target: Key): PendingTouchSample? {

@@ -82,9 +82,13 @@ internal fun applyOptimisticClearUnpinned(
 
 internal fun applyShortcutEditorKey(current: String, key: String): String =
     when (key) {
+        "⌫-hold-begin" -> current
         "⌫" -> if (current.isEmpty()) "" else current.dropLast(1)
         "清空",
         "delete-word",
+        "⌫-batch",
+        "delete-before-cursor",
+        "delete-after-cursor",
         "clear-all" -> ""
         else -> {
             val ch = key.singleOrNull()?.lowercaseChar()

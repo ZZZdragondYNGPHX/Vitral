@@ -216,7 +216,7 @@ pub struct EngineConfig {
     pub fuzzy_pinyin: bool,
     #[serde(default)]
     pub fuzzy_pinyin_pairs: Vec<String>,
-    #[serde(default = "default_enabled")]
+    #[serde(default)]
     pub undo_commit_on_backspace: bool,
     #[serde(default = "default_typo_correction_level")]
     pub typo_correction_level: String,
@@ -441,7 +441,7 @@ impl Default for EngineConfig {
             adaptive_learning: true,
             fuzzy_pinyin: false,
             fuzzy_pinyin_pairs: Vec::new(),
-            undo_commit_on_backspace: true,
+            undo_commit_on_backspace: false,
             typo_correction_level: default_typo_correction_level(),
             syllable_split: false,
             auto_english_for_dev_apps: true,
@@ -4909,6 +4909,7 @@ mod personalization_tests {
     #[test]
     fn touch_hints_follow_cursor_edits_partial_selection_escape_and_undo() {
         let (mut engine, clipboard, imported, mut retention) = fixture();
+        engine.config.undo_commit_on_backspace = true;
         let s_to_a = touch_hint(b's', b'a');
         let o_to_i = touch_hint(b'o', b'i');
         let empty = TouchKeyHint::default();
@@ -7043,12 +7044,27 @@ mod personalization_tests {
     }
 
     #[test]
+    fn default_config_does_not_restore_committed_candidate() {
+        assert!(!EngineConfig::default().undo_commit_on_backspace);
+        let config: EngineConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.undo_commit_on_backspace);
+        let (mut e, clip, imp, mut r) = fixture();
+        offer(&mut e, "你好", "nihao");
+        e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
+        let action = e.process_key(8, 0, SwipeDir::None, &clip, &imp, &mut r).unwrap();
+        assert_eq!(action.undo_commit_chars, 0);
+        assert!(action.undo_commit_text.is_none());
+        assert!(action.preedit.text.is_empty());
+    }
+
+    #[test]
     fn undo_candidate_commit_restores_quanpin_and_xiaohe_once() {
         for (schema, code) in [
             (SchemaKind::RimeIce, "nihao"),
             (SchemaKind::DoublePinyinFlypy, "nihc"),
         ] {
             let (mut e, clip, imp, mut r) = fixture();
+            e.config.undo_commit_on_backspace = true;
             e.set_schema(schema);
             e.config.auto_micro_space = true;
             e.last_committed_char = Some('1');
@@ -7083,6 +7099,7 @@ mod personalization_tests {
             (0x0d, None, true),
         ] {
             let (mut e, clip, imp, mut r) = fixture();
+            e.config.undo_commit_on_backspace = true;
             e.set_schema(SchemaKind::RimeIce);
             offer(&mut e, "前", "qian");
             e.select_candidate_action(0, &clip, &imp, &mut r).unwrap();
@@ -7174,6 +7191,7 @@ mod personalization_tests {
     #[test]
     fn undo_candidate_commit_replays_native_rime_input() {
         let (mut e, clip, imp, mut r) = fixture();
+        e.config.undo_commit_on_backspace = true;
         e.resolved_assets_dir = resolve_assets_dir("");
         for (schema, code) in [
             (SchemaKind::RimeIce, "nihao"),
@@ -7197,6 +7215,7 @@ mod personalization_tests {
     #[test]
     fn undo_candidate_commit_excludes_clipboard_and_punctuation() {
         let (mut e, mut clip, imp, mut r) = fixture();
+        e.config.undo_commit_on_backspace = true;
         let state = clip.push(crate::clip::ClipboardPayload {
             id: None,
             content: "剪贴板".into(),
