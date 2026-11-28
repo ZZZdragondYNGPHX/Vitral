@@ -320,10 +320,6 @@ function applyFields(settings, skipFields = null) {
   saved = settings;
   clipboardCapacity = Number(settings.clipboard_ring_capacity || 50);
 
-  const linuxEnglish = $("[name=linux_english_mode]");
-  linuxEnglish.disabled = typeof settings.linux_english_mode !== "boolean";
-  $("#linux-language").hidden = linuxEnglish.disabled;
-
   for (const el of all("main [name]")) {
     if (skipFields?.has(el.name)) continue;
     if (el.type === "password") {
@@ -2520,7 +2516,6 @@ if (invoke) {
     theme: "system",
     clipboard_ring_capacity: 50,
     pure_offline: false,
-    linux_english_mode: true,
     shortcut_actions: [
       { id: "toggle_language", label: "切换中英文" },
       { id: "settings", label: "打开设置" },

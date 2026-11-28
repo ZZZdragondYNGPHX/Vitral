@@ -1051,7 +1051,6 @@ private:
         lang_->style()->unpolish(lang_);
         lang_->style()->polish(lang_);
       }
-      lang_->setVisible(state["english_mode_enabled"].toBool(true));
       reposition();
       if (!isVisible())
         show();

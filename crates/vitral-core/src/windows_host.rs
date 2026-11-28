@@ -19,6 +19,7 @@ use windows_sys::Win32::{
     Security::{Authorization::*, *},
     Storage::FileSystem::*,
     System::{Pipes::*, RemoteDesktop::ProcessIdToSessionId, Threading::*, IO::*},
+    UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
 };
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 fn wide(s: &str) -> Vec<u16> {
@@ -39,6 +40,99 @@ fn sid_string(sid: PSID) -> io::Result<String> {
         Ok(result)
     }
 }
+fn token_information(token: HANDLE, kind: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
+    unsafe {
+        let mut len = 0;
+        GetTokenInformation(token, kind, null_mut(), 0, &mut len);
+        if len == 0 { return Err(io::Error::last_os_error()); }
+        let mut data = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
+        if GetTokenInformation(token, kind, data.as_mut_ptr().cast(), len, &mut len) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(data)
+    }
+}
+
+// AppContainer/low-integrity hosts receive only the focused input protocol.
+// Never expose settings, stored profiles, clipboard history or file operations.
+fn restricted_input_command(editor: &str, pid: u32, cmd: &str) -> bool {
+    editor.strip_prefix(&format!("{pid}-")).is_some_and(|suffix| !suffix.is_empty())
+        && matches!(cmd, "on-ime-open" | "on-ime-close" | "on-app-focus"
+            | "process-key" | "candidate-state" | "select-candidate" | "pin-candidate" | "erase-candidate"
+            | "shortcuts-state" | "shortcut-key" | "profile-state"
+            | "predict-request" | "predict-poll" | "predict-cancel"
+            | "predict-accept" | "predict-dismiss"
+            | "hw-begin" | "hw-clear" | "hw-push-stroke" | "hw-confirm" | "hw-override-slot")
+}
+
+struct PipeCaller {
+    pid: u32,
+    restricted: bool,
+    app_id: String,
+    _process: OwnedHandle,
+}
+impl PipeCaller {
+    fn read(pipe: &File) -> io::Result<Self> {
+        unsafe {
+            let mut pid = 0;
+            if GetNamedPipeClientProcessId(pipe.as_raw_handle(), &mut pid) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if process.is_null() { return Err(io::Error::last_os_error()); }
+            let process = OwnedHandle::from_raw_handle(process);
+            let mut path = vec![0u16; 32768];
+            let mut len = path.len() as u32;
+            if QueryFullProcessImageNameW(process.as_raw_handle(), 0, path.as_mut_ptr(), &mut len) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Query the pipe's effective token, including a caller's impersonation.
+            // Revert before running any engine operation or touching user files.
+            if ImpersonateNamedPipeClient(pipe.as_raw_handle()) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut token = null_mut();
+            let opened = OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token);
+            let error = io::Error::last_os_error();
+            if RevertToSelf() == 0 { std::process::abort(); }
+            if opened == 0 { return Err(error); }
+            let token = OwnedHandle::from_raw_handle(token);
+            let user = token_information(token.as_raw_handle(), TokenUser)?;
+            let sid = sid_string((*(user.as_ptr().cast::<TOKEN_USER>())).User.Sid)?;
+            let mut session = 0;
+            let mut own_session = 0;
+            if ProcessIdToSessionId(pid, &mut session) == 0
+                || ProcessIdToSessionId(GetCurrentProcessId(), &mut own_session) == 0
+                || session != own_session || sid != identity()?.0 {
+                return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unexpected input client"));
+            }
+            let container = token_information(token.as_raw_handle(), TokenIsAppContainer)?;
+            let integrity = token_information(token.as_raw_handle(), TokenIntegrityLevel)?;
+            let label = (*(integrity.as_ptr().cast::<TOKEN_MANDATORY_LABEL>())).Label.Sid;
+            let count = *GetSidSubAuthorityCount(label);
+            let level = *GetSidSubAuthority(label, u32::from(count - 1));
+            Ok(Self {
+                pid,
+                restricted: *(container.as_ptr().cast::<u32>()) != 0
+                    || level < 0x2000 // SECURITY_MANDATORY_MEDIUM_RID
+                    || IsTokenRestricted(token.as_raw_handle()) != 0,
+                app_id: String::from_utf16_lossy(&path[..len as usize]),
+                _process: process,
+            })
+        }
+    }
+    fn has_focus(&self) -> bool {
+        let mut pid = 0;
+        unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut pid); }
+        pid == self.pid
+    }
+}
+
+fn input_pipe_acl(sid: &str) -> String {
+    // No FILE_CREATE_PIPE_INSTANCE permission for packages. The user owns the
+    // pipe; low-integrity input clients must still pass the protocol checks.
+    format!("O:{sid}D:P(A;;GA;;;{sid})(A;;0x12019b;;;AC)S:(ML;;NW;;;LW)")
+}
 fn identity() -> io::Result<&'static (String, Vec<u16>)> {
     static ID: OnceLock<(String, Vec<u16>)> = OnceLock::new();
     if let Some(id) = ID.get() {
@@ -50,19 +144,7 @@ fn identity() -> io::Result<&'static (String, Vec<u16>)> {
             return Err(io::Error::last_os_error());
         }
         let token = std::os::windows::io::OwnedHandle::from_raw_handle(token);
-        let mut len = 0;
-        GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut len);
-        let mut buf = vec![0usize; (len as usize).div_ceil(size_of::<usize>())];
-        if GetTokenInformation(
-            token.as_raw_handle(),
-            TokenUser,
-            buf.as_mut_ptr().cast(),
-            len,
-            &mut len,
-        ) == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+        let buf = token_information(token.as_raw_handle(), TokenUser)?;
         let sid = sid_string((*(buf.as_ptr().cast::<TOKEN_USER>())).User.Sid)?;
         let mut session = 0;
         if ProcessIdToSessionId(GetCurrentProcessId(), &mut session) == 0 {
@@ -79,7 +161,7 @@ pub fn settings_path() -> io::Result<PathBuf> {
 }
 fn instance(first: bool) -> io::Result<File> {
     let (sid, path) = identity()?;
-    let acl = wide(&format!("O:{sid}D:P(A;;GA;;;{sid})"));
+    let acl = wide(&input_pipe_acl(sid));
     unsafe {
         let mut sd = null_mut();
         if ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -127,6 +209,7 @@ fn connect() -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
+        .access_mode(FILE_GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_CREATE_PIPE_INSTANCE))
         .custom_flags(FILE_FLAG_OVERLAPPED)
         .security_qos_flags(SECURITY_IDENTIFICATION)
         .open(name)?;
@@ -614,8 +697,23 @@ pub fn serve() -> Result<()> {
         let core = core.clone();
         let owner = active.clone();
         std::thread::spawn(move || {
-            while let Ok((id, cmd, args)) = read_frame::<(String, String, Value)>(&mut client) {
+            let mut caller = None;
+            while let Ok((id, cmd, mut args)) = read_frame::<(String, String, Value)>(&mut client) {
                 let result = (|| -> Result<Value> {
+                    if !args.is_object() { return Err("command arguments must be an object".into()); }
+                    if caller.is_none() { caller = Some(PipeCaller::read(&client)?); }
+                    let caller = caller.as_ref().unwrap();
+                    if caller.restricted {
+                        if !restricted_input_command(&id, caller.pid, &cmd) {
+                            return Err("command is not available to a sandboxed input client".into());
+                        }
+                        if cmd != "on-ime-close" && !caller.has_focus() {
+                            return Err("input client is not focused".into());
+                        }
+                        if matches!(cmd.as_str(), "on-ime-open" | "on-app-focus" | "predict-request") {
+                            args["app_id"] = json!(caller.app_id);
+                        }
+                    }
                     if id.is_empty() {
                         return commands::execute(&core, &cmd, &args);
                     }
@@ -627,8 +725,12 @@ pub fn serve() -> Result<()> {
 
                             *active = id;
                         }
-                        let focus = core.on_app_focus(args["app_id"].as_str().unwrap_or(""))?;
-                        let mut opened = serde_json::to_value(core.on_ime_open())?;
+                        let focus = core.on_app_focus_with_learning_flag(
+                            args["app_id"].as_str().unwrap_or(""),
+                            args["no_personalized_learning"].as_bool().unwrap_or(false),
+                        )?;
+                        let mut opened = if caller.restricted { json!({}) }
+                            else { serde_json::to_value(core.on_ime_open())? };
                         opened["lang_mode"] = serde_json::to_value(focus.lang_mode)?;
                         return Ok(opened);
                     } else if *active != id {
@@ -636,6 +738,11 @@ pub fn serve() -> Result<()> {
                     }
                     if cmd == "on-ime-close" {
                         active.clear();
+                    }
+                    if caller.restricted && cmd == "profile-state" {
+                        let state = core.profile_state();
+                        return Ok(json!({"prediction_enabled": state["prediction_enabled"],
+                            "prediction_delay_ms": state["prediction_delay_ms"]}));
                     }
                     if cmd == "clipboard-push" {
                         let payload = serde_json::from_value(json!({"content":args["payload"]}))?;
@@ -658,6 +765,76 @@ pub fn serve() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandboxed_clients_are_limited_to_their_input_session() {
+        for command in ["on-ime-open", "process-key", "shortcut-key", "candidate-state", "on-ime-close"] {
+            assert!(restricted_input_command("42-0", 42, command));
+            assert!(!restricted_input_command("", 42, command));
+            assert!(!restricted_input_command("43-0", 42, command));
+            assert!(!restricted_input_command("42-", 42, command));
+        }
+        for command in ["configure", "profile-update", "profile-clear", "models-delete",
+            "models-refresh-catalog", "clipboard-push", "clipboard-consume", "storage", "sync-now"] {
+            assert!(!restricted_input_command("42-0", 42, command));
+        }
+    }
+
+    #[test]
+    fn package_pipe_permissions_exclude_creating_server_instances() {
+        let access = FILE_GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_CREATE_PIPE_INSTANCE);
+        assert_eq!(access & FILE_CREATE_PIPE_INSTANCE, 0);
+        assert_eq!(access, 0x12019b);
+        // Windows refuses adding a package SID via CreateRestrictedToken.
+        // Exercise the same ACE rights with the supported restricted-code SID.
+        let sid = &identity().unwrap().0;
+        let sddl = wide(&input_pipe_acl(sid).replace(";;;AC)", ";;;RC)"));
+        unsafe {
+            let mut descriptor = null_mut();
+            assert_ne!(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(), 1, &mut descriptor, null_mut()), 0);
+            let attributes = SECURITY_ATTRIBUTES { nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: descriptor, bInheritHandle: 0 };
+            let name = wide(&format!(r"\\.\pipe\Vitral.acl-test.{}", std::process::id()));
+            let handle = CreateNamedPipeW(name.as_ptr(), PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_REJECT_REMOTE_CLIENTS, 1, 1024, 1024, 1000, &attributes);
+            LocalFree(descriptor);
+            assert_ne!(handle, INVALID_HANDLE_VALUE, "{}", io::Error::last_os_error());
+            let pipe = File::from_raw_handle(handle);
+            // Inspect the actual object after Windows maps generic rights and
+            // supplies its owner/group, rather than an incomplete standalone SD.
+            assert_eq!(GetSecurityInfo(pipe.as_raw_handle(), SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                null_mut(), null_mut(), null_mut(), null_mut(), &mut descriptor), 0);
+            let mut token = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token), 0);
+            let token = OwnedHandle::from_raw_handle(token);
+            let mut package_sid = [0u32; 17];
+            let mut sid_size = size_of_val(&package_sid) as u32;
+            assert_ne!(CreateWellKnownSid(WinRestrictedCodeSid, null_mut(), package_sid.as_mut_ptr().cast(), &mut sid_size), 0);
+            let package = SID_AND_ATTRIBUTES { Sid: package_sid.as_mut_ptr().cast(), Attributes: 0 };
+            let mut restricted = null_mut();
+            assert_ne!(CreateRestrictedToken(token.as_raw_handle(), 0, 0, std::ptr::null(),
+                0, std::ptr::null(), 1, &package, &mut restricted), 0, "{}", io::Error::last_os_error());
+            let restricted = OwnedHandle::from_raw_handle(restricted);
+            let mut impersonation = null_mut();
+            assert_ne!(DuplicateToken(restricted.as_raw_handle(), SecurityImpersonation, &mut impersonation), 0);
+            let impersonation = OwnedHandle::from_raw_handle(impersonation);
+            for (desired, expected) in [(access, true), (FILE_CREATE_PIPE_INSTANCE, false)] {
+                let mut privileges = [0usize; 128];
+                let mut len = size_of_val(&privileges) as u32;
+                let mut granted = 0;
+                let mut allowed = 0;
+                let mapping = GENERIC_MAPPING { GenericRead: FILE_GENERIC_READ,
+                    GenericWrite: FILE_GENERIC_WRITE, GenericExecute: FILE_GENERIC_EXECUTE,
+                    GenericAll: FILE_ALL_ACCESS };
+                assert_ne!(AccessCheck(descriptor, impersonation.as_raw_handle(), desired, &mapping,
+                    privileges.as_mut_ptr().cast(), &mut len, &mut granted, &mut allowed), 0, "{}", io::Error::last_os_error());
+                assert_eq!(allowed != 0, expected);
+            }
+            LocalFree(descriptor);
+        }
+    }
 
     #[test]
     fn expired_deadline_does_not_connect_or_launch_the_engine() {

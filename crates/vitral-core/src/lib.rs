@@ -951,7 +951,6 @@ impl VitralCore {
             active.frecency_half_life_sec = cfg.frecency_half_life_sec;
             active.model_catalog_url = cfg.model_catalog_url.clone();
             active.shortcuts = cfg.shortcuts;
-            active.linux_english_mode = cfg.linux_english_mode;
             let adaptive_changed = active.adaptive_learning != cfg.adaptive_learning;
             active.adaptive_learning = cfg.adaptive_learning;
             active.fuzzy_pinyin = cfg.fuzzy_pinyin;
@@ -1235,7 +1234,7 @@ impl VitralCore {
         let _tier1_io = self.tier1_io.lock();
         let mut st = self.input.lock();
         let normalized = shortcuts::normalize_key(key).map_err(VitralError::InvalidArgument)?;
-        let action = st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == normalized && st.engine.config.shortcut_enabled(b.action)).map(|b| b.action);
+        let action = st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == normalized).map(|b| b.action);
         let result = action.map(|a| Self::run_function(&mut st.engine, a));
         if action == Some(shortcuts::ShortcutAction::ToggleLanguage) { self.save_local("app-languages.json", &st.engine.app_lang_memory); }
         Ok(result)
@@ -9736,7 +9735,30 @@ mod p1_privacy_tests {
     }
 
     #[test]
+    fn language_defaults_and_legacy_settings_never_lock_switching() {
+        use crate::eng::LangMode;
+        let core = core(&json!({
+            "schema":"rime_ice", "pure_offline":true,
+            "linux_english_mode":false,
+            "default_english_apps":["SearchHost.exe"],
+        }));
+        let search = r"C:\Windows\SystemApps\SearchHost.exe";
+        assert_eq!(core.on_app_focus(search).unwrap().lang_mode, LangMode::En);
+        assert_eq!(core.shortcut_key("Shift").unwrap().unwrap().lang_mode, LangMode::Zh);
+        for ch in "nihao".chars() {
+            core.process_key(u32::from(ch), 0, SwipeDir::None).unwrap();
+        }
+        assert!(core.select_candidate(0).unwrap().commit_text.is_some());
+        core.on_app_focus("editor").unwrap();
+        assert_eq!(core.on_app_focus(search).unwrap().lang_mode, LangMode::Zh);
+        assert_eq!(core.shortcut_key("Shift").unwrap().unwrap().lang_mode, LangMode::En);
+        assert_eq!(core.on_app_focus(search).unwrap().lang_mode, LangMode::En);
+        assert!(serde_json::to_value(&core.input.lock().engine.config).unwrap().get("linux_english_mode").is_none());
+    }
+
+    #[test]
     fn host_no_learning_flag_blocks_predictions_hints_and_learning() {
+        use crate::eng::LangMode;
         let core = core(&json!({"schema":"rime_ice","pure_offline":true}));
         core.input.lock().retention.context_bigrams.insert(
             "你好".into(), [("世界".into(), 4.0)].into(),
@@ -9755,6 +9777,8 @@ mod p1_privacy_tests {
         assert!(core.input.lock().engine.raw_input.is_empty());
         assert_eq!(execute("predict-request", request.clone())["status"], "skipped");
         assert!(core.context_next_hints("你好", Some("世界")).is_empty());
+        assert_eq!(core.shortcut_key("Shift").unwrap().unwrap().lang_mode, LangMode::En);
+        assert_eq!(core.shortcut_key("Shift").unwrap().unwrap().lang_mode, LangMode::Zh);
         let seq = core.input.lock().retention.crdt_seq;
         for ch in "nihao".chars() {
             core.process_key(u32::from(ch), 0, SwipeDir::None).unwrap();

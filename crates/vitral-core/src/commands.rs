@@ -134,7 +134,7 @@ pub fn execute(core: &VitralCore, cmd: &str, v: &Value) -> Result<Value> {
         "shortcut-match" => {
             let key = crate::shortcuts::normalize_key(string(v, "key")?)?;
             let st = core.input.lock();
-            to_value(st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == key && st.engine.config.shortcut_enabled(b.action)).map(|b| b.action))?
+            to_value(st.engine.config.shortcuts.iter().find(|b| !b.key.is_empty() && b.key == key).map(|b| b.action))?
         }
         "shortcut-key" => to_value(core.shortcut_key(string(v, "key")?)?)?,
         "set-syllable-split" => to_value(core.set_syllable_split(arg(v, "enabled")?)?)?,

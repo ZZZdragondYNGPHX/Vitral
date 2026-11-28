@@ -152,7 +152,6 @@ public:
     predictionDelay_ =
         std::clamp(cfg.value("prediction_delay_ms").toInt(380), 150, 2000);
     predictionEnabled_ = cfg.value("prediction_enabled").toBool(true);
-    internalEnglish_ = cfg.value("linux_english_mode").toBool(true);
     setPanelTheme(cfg);
     const auto data =
         QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation) +
@@ -201,8 +200,6 @@ public:
               return;
             }
             if (cmd == "toggle-language") {
-              if (!internalEnglish_)
-                return;
               auto action = unpack(vitral_process_key(core_, 0, 1u << 30,
                                                       VITRAL_SWIPE_DIR_NONE));
               english_ = action["lang_mode"].toString() == "en";
@@ -241,7 +238,6 @@ public:
                          {"active", active_.load()},
                          {"editor", editor_.load()},
                          {"english", english_.load()},
-                         {"english_mode_enabled", internalEnglish_.load()},
                          {"theme", panelTheme_.load() == 1   ? "light"
                                    : panelTheme_.load() == 2 ? "dark"
                                                              : "system"},
@@ -316,10 +312,6 @@ public:
     auto focus = command("on-app-focus",
                          {{"app_id", appId}, {"no_personalized_learning", sensitive}});
     english_ = focus["lang_mode"].toString() == "en";
-    if (!internalEnglish_ && english_) {
-      unpack(vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
-      english_ = false;
-    }
   }
 
   void activate(const InputMethodEntry &, InputContextEvent &event) override {
@@ -726,9 +718,7 @@ private:
   bool runShortcut(InputContext *ic, const QString &key) {
     for (const auto &item : shortcuts_) {
       auto binding = item.toObject();
-      if (binding["key"].toString() != key ||
-          (!internalEnglish_ &&
-           binding["action"].toString() == "toggle_language"))
+      if (binding["key"].toString() != key)
         continue;
       auto action = command("shortcut-key", {{"key", key}});
       if (action.isEmpty())
@@ -803,20 +793,8 @@ private:
     predictionDelay_ = std::clamp(settings["prediction_delay_ms"].toInt(380), 150, 2000);
     predictionEnabled_ = settings["prediction_enabled"].toBool(true);
     cancelPrediction(instance_->lastFocusedInputContext());
-    internalEnglish_ = settings["linux_english_mode"].toBool(true);
     shortcuts_ = command("shortcuts-state")["bindings"].toArray();
     shiftHeld_ = false;
-    auto *ic = instance_->lastFocusedInputContext();
-    if (!internalEnglish_ && english_) {
-      auto action =
-          unpack(vitral_process_key(core_, 0, 1u << 30, VITRAL_SWIPE_DIR_NONE));
-      english_ = false;
-      if (active_ && ic && ic->hasFocus() &&
-          instance_->inputMethod(ic) == "vitral") {
-        render(ic, action);
-        ic->updateUserInterface(UserInterfaceComponent::StatusArea);
-      }
-    }
     auto *ui = instance_->addonManager().addon("classicui");
     if (!ui || !ui->getConfig())
       return;
@@ -936,7 +914,6 @@ private:
   bool composing_ = false, hasPrev_ = false, hasNext_ = false;
   qint64 panelPid_ = 0;
   std::atomic<bool> english_{false}, active_{false}, lastFocusSensitive_{false};
-  std::atomic<bool> internalEnglish_{true};
   std::atomic<int> activity_{0}, editor_{0}, panelTheme_{0};
   bool shiftHeld_ = false;
   QJsonArray shortcuts_;

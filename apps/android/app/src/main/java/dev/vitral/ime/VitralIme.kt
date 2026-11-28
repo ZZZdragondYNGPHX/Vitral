@@ -97,7 +97,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     private var shortcutClearBtn: TextView? = null
     private var inlineRequest = 0
     private var english = false
-    private var fieldForceEnglish = false
     private var noPersonalizedLearning = false
     private var fieldKind = "text" // text | number | email | uri | password
     private var autoCapEnabled = false
@@ -677,7 +676,6 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                     variation == InputType.TYPE_TEXT_VARIATION_URI -> "uri"
                 else -> "text"
             }
-        fieldForceEnglish = passwordEditor
         noPersonalizedLearning =
             passwordEditor ||
                 ((info?.imeOptions ?: 0) and EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING) != 0
@@ -706,7 +704,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
                 "no_personalized_learning" to noPersonalizedLearning,
             ),
         ) {
-            english = fieldForceEnglish || it.optString("lang_mode") == "en"
+            english = it.optString("lang_mode") == "en"
+            manualLangOverride = manualLangOverride || it.optBoolean("remembered", false)
             if (!flypy && aeviouExperimental) {
                 detectedAeviouEnv = detectAeviouEnvFromContext()
                 syncAutoAeviouEnv(triggerLangSync = true, forceRender = false)
@@ -4601,7 +4600,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             if (english && fieldKind == "text" && !passwordEditor && effective.endsWith(" "))
                 SystemClock.uptimeMillis()
             else 0L
-        if (fieldForceEnglish && !composing) {
+        if (passwordEditor && english && !composing) {
             ic.commitText(effective, 1)
             invalidateSurroundingCache()
             updateAutoCap(redraw = true)
@@ -4721,6 +4720,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             }
             "⇧" -> {
                 if (!english) {
+                    manualLangOverride = true
                     processKeyDirect(0, MOD_LANG_TOGGLE) {
                         applyAction(it)
                     }
@@ -4843,8 +4843,8 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
             pasteId = ""
             candidates()
         }
-        // Password / email / URL fields bypass Chinese engine completely for zero leakage
-        if (!dismissPaste && fieldForceEnglish && !composing) {
+        // Direct English input stays local; Chinese uses the non-learning engine session.
+        if (!dismissPaste && passwordEditor && english && !composing) {
             when (effectiveLabel) {
                 "⌫" -> deleteWithSelectionOrSingle(ic, isRepeatDelete = isRepeatDelete)
                 "↵" ->
@@ -5477,7 +5477,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun detectAeviouEnvFromContext(): AeviouEnv {
-        if (fieldForceEnglish) return AeviouEnv.PURE_EN
+        if (passwordEditor) return if (english) AeviouEnv.PURE_EN else AeviouEnv.PURE_ZH
         val ic = currentInputConnection
         val before = readBeforeCursor(ic, 48)
         val after = readAfterCursor(ic)
@@ -5514,7 +5514,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
     }
 
     private fun effectiveAeviouEnv(): AeviouEnv {
-        if (fieldForceEnglish || english) return AeviouEnv.PURE_EN
+        if (english) return AeviouEnv.PURE_EN
         return if (detectedAeviouEnv == AeviouEnv.PURE_ZH) AeviouEnv.PURE_ZH else AeviouEnv.MIXED
     }
 
@@ -5527,7 +5527,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         detectedAeviouEnv = next
         if (!manualLangOverride) {
             val wantEnglish = next == AeviouEnv.PURE_EN
-            if (triggerLangSync && wantEnglish != english && !fieldForceEnglish) {
+            if (triggerLangSync && wantEnglish != english) {
                 processKeyDirect(0, MOD_LANG_TOGGLE) {
                     applyAction(it)
                 }
@@ -5641,6 +5641,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
 
     private fun applyAction(r: JSONObject, allowUndoAnchor: Boolean = true) {
         val ic = currentInputConnection ?: return
+        if (r.optString("function_action") == "toggle_language") manualLangOverride = true
         val wasComposing = composing
         val clipboardCommit = r.optBoolean("clipboard_commit", false)
         val committed = if (!r.isNull("commit_text")) r.getString("commit_text") else ""
@@ -5701,7 +5702,7 @@ class VitralIme : InputMethodService(), ClipboardManager.OnPrimaryClipChangedLis
         if (composing || clipboardCommit) cancelPrediction()
         else if (committed.isNotEmpty() && !passwordEditor) schedulePrediction("live")
         val previousEnglish = english
-        english = fieldForceEnglish || r.optString("lang_mode") == "en"
+        english = r.optString("lang_mode") == "en"
         if (!english && shiftState != 0) shiftState = 0
         else if (english && !composing) updateAutoCap(redraw = false)
         hasPreviousPage = r.optJSONObject("page")?.optBoolean("has_prev") ?: false

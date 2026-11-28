@@ -267,9 +267,7 @@ fn public_settings(mut cfg: Value, token: &str) -> Value {
     cfg["shortcut_defaults"] = json!(shortcuts::defaults());
     cfg["shortcut_actions"] = json!(shortcuts::ShortcutAction::ALL.map(|action| json!({"id":action,"label":action.label()})));
     cfg["launch_page"] = json!(if std::env::args().any(|a| a == "--clipboard") { "library" } else { "input" });
-    if cfg!(target_os = "linux") {
-        cfg["linux_english_mode"] = json!(cfg["linux_english_mode"].as_bool().unwrap_or(true));
-    } else if let Some(fields) = cfg.as_object_mut() {
+    if let Some(fields) = cfg.as_object_mut() {
         fields.remove("linux_english_mode");
     }
     for key in ["ai_api_key", "koofr_password", "sync_key"] {
@@ -524,11 +522,6 @@ async fn save_settings(
                         Some("off" | "conservative" | "standard" | "aggressive")
                     ) {
                         return Err("拼写纠错强度应为关闭、保守、标准或积极".into());
-                    }
-                }
-                "linux_english_mode" if cfg!(target_os = "linux") => {
-                    if !value.is_boolean() {
-                        return Err("输入法内英文模式应为开启或关闭".into());
                     }
                 }
                 "prediction_delay_ms" if !(150..=2000).contains(&value.as_u64().unwrap_or(0)) => {

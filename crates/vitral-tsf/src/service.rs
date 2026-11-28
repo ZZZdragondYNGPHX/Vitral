@@ -209,6 +209,7 @@ struct Editor {
     ipc_failed: Cell<bool>,
     ipc_backoff_until: Cell<Option<Instant>>,
     needs_refocus: Cell<bool>,
+    no_learning: Cell<bool>,
     prediction_timer: Cell<usize>,
     prediction_polls: Cell<u32>,
     prediction_trigger: Cell<bool>,
@@ -446,21 +447,27 @@ impl Editor {
         }
         self.reset_local();
     }
-    fn protect_input(&self, ctx: Option<&ITfContext>, composing_ok: bool) -> bool {
+    fn protect_input(&self, ctx: Option<&ITfContext>) -> bool {
         let access = self.input_access(ctx);
-        let composing = composing_ok && self.composition.borrow().as_ref().is_some_and(
-            |(owner, _)| ctx == Some(owner),
-        );
-        if access.permits_key(composing) {
+        if access.permits_key() {
             return true;
         }
-        if access == InputAccess::Blocked {
-            self.clear_input(None);
-        } else {
-            self.shift_held.set(false);
-            self.cancel_prediction(false);
-        }
+        self.clear_input(None);
         false
+    }
+    fn sync_input_privacy(&self, access: InputAccess) -> Result<()> {
+        let private = access != InputAccess::Allowed;
+        if private != self.no_learning.get() {
+            self.cancel_prediction(false);
+            self.commit_end.take();
+            self.view.borrow_mut().context_before.clear();
+            self.call("on-app-focus", json!({
+                "app_id": std::env::current_exe().unwrap_or_default(),
+                "no_personalized_learning": private,
+            }))?;
+            self.no_learning.set(private);
+        }
+        Ok(())
     }
     fn arm_prediction(self: &Rc<Self>, delay: u32) {
         let timer = unsafe { SetTimer(None, 0, delay, Some(prediction_tick)) };
@@ -477,7 +484,7 @@ impl Editor {
         anchor: Option<(ITfContext, ITfRange)>,
     ) {
         self.cancel_prediction(false);
-        if !self.view.borrow().active
+        if self.no_learning.get() || !self.view.borrow().active
             || self.composition.borrow().is_some()
             || self.view.borrow().mode != 0
             || self.view.borrow().context_before.trim().is_empty()
@@ -505,7 +512,11 @@ impl Editor {
         self.arm_prediction(delay);
     }
     fn poll_prediction(self: &Rc<Self>) {
-        if self.bypass_keys() || !self.protect_input(self.current_context().as_ref(), false) {
+        if self.input_access(self.current_context().as_ref()) != InputAccess::Allowed {
+            self.cancel_prediction(false);
+            return;
+        }
+        if self.bypass_keys() || !self.protect_input(self.current_context().as_ref()) {
             return;
         }
         if !self.view.borrow().active
@@ -560,7 +571,10 @@ impl Editor {
     }
     fn on_ime_open(&self) -> Result<Value> {
         let app = std::env::current_exe().unwrap_or_default();
-        self.call("on-ime-open", json!({"app_id":app}))
+        let private = self.input_access(self.current_context().as_ref()) != InputAccess::Allowed;
+        let result = self.call("on-ime-open", json!({"app_id":app,"no_personalized_learning":private}))?;
+        self.no_learning.set(private);
+        Ok(result)
     }
     fn on_ime_close(&self) {
         let _ = self.call("on-ime-close", json!({}));
@@ -570,7 +584,7 @@ impl Editor {
             return;
         }
         if open {
-            if self.bypass_keys() || !self.protect_input(self.current_context().as_ref(), true) {
+            if self.bypass_keys() || !self.protect_input(self.current_context().as_ref()) {
                 return;
             }
             self.commit_end.take();
@@ -645,12 +659,15 @@ fn shortcut_bindings(state: &Value) -> Vec<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputAccess {
     Allowed,
+    Sensitive,
     Blocked,
     Unknown,
 }
 impl InputAccess {
-    fn permits_key(self, composing: bool) -> bool {
-        self == Self::Allowed || (self == Self::Unknown && composing)
+    fn permits_key(self) -> bool {
+        // InputScope describes purpose/privacy, not whether Chinese is allowed.
+        // Some shell/XAML hosts do not expose it at all.
+        self != Self::Blocked
     }
 }
 fn input_disabled(ctx: &ITfContext) -> bool {
@@ -672,14 +689,14 @@ fn input_disabled(ctx: &ITfContext) -> bool {
 }
 fn classify_scopes(scopes: &[InputScope]) -> InputAccess {
     if scopes.iter().any(|s| matches!(*s, IS_PASSWORD | IS_NUMERIC_PIN | IS_ALPHANUMERIC_PIN)) {
-        InputAccess::Blocked
+        InputAccess::Sensitive
     } else {
         InputAccess::Allowed
     }
 }
 // Some native RichEdit hosts expose no InputScope attribute and return E_FAIL.
 // Only fall back for a verified native editor belonging to this TSF view;
-// unknown hosts and password controls remain excluded.
+// unknown hosts and password controls use non-learning input instead.
 fn native_edit_access(hwnd: HWND) -> InputAccess {
     const EM_GETPASSWORDCHAR: u32 = 0x00d2;
     unsafe {
@@ -693,7 +710,7 @@ fn native_edit_access(hwnd: HWND) -> InputAccess {
         }
         if GetWindowLongW(hwnd, GWL_STYLE) & ES_PASSWORD != 0 ||
             SendMessageW(hwnd, EM_GETPASSWORDCHAR, WPARAM(0), LPARAM(0)).0 != 0 {
-            InputAccess::Blocked
+            InputAccess::Sensitive
         } else {
             InputAccess::Allowed
         }
@@ -730,7 +747,8 @@ fn read_input_scope(ctx: &ITfContext, ec: u32) -> Result<InputAccess> {
             Err(error) if matches!(error.code(), E_FAIL | E_NOTIMPL) => {
                 let access = native_scope_fallback(ctx);
                 trace_failure("scope-native-fallback", HRESULT(match access {
-                    InputAccess::Allowed => 1, InputAccess::Blocked => 0, InputAccess::Unknown => -1,
+                    InputAccess::Allowed => 1, InputAccess::Sensitive => 2,
+                    InputAccess::Blocked => 0, InputAccess::Unknown => -1,
                 }));
                 return Ok(access);
             }
@@ -882,6 +900,7 @@ impl Service {
                 prediction_polls: Cell::new(0),
                 prediction_trigger: Cell::new(false),
                 language_bar: RefCell::new(None),
+                no_learning: Cell::new(true),
             }),
             _live: Live::new(),
         })
@@ -1242,7 +1261,7 @@ impl ITfKeyEventSink_Impl for Service_Impl {
     }
     fn OnTestKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
         trace_failure("test-key-down", S_OK);
-        if self.editor.bypass_keys() || !self.editor.protect_input(ctx, true) {
+        if self.editor.bypass_keys() || !self.editor.protect_input(ctx) {
             return Ok(false.into());
         }
         if !matches!(w.0 as u32, 0x10 | 0xa0 | 0xa1) {
@@ -1269,7 +1288,7 @@ impl ITfKeyEventSink_Impl for Service_Impl {
         Ok((ctx.is_some() && (action.is_some() || shift_shortcut) && !self.editor.ipc_failed.get()).into())
     }
     fn OnKeyDown(&self, ctx: Option<&ITfContext>, w: WPARAM, l: LPARAM) -> Result<BOOL> {
-        if self.editor.bypass_keys() || !self.editor.protect_input(ctx, true) {
+        if self.editor.bypass_keys() || !self.editor.protect_input(ctx) {
             return Ok(false.into());
         }
         self.editor.focus(true);
@@ -1311,7 +1330,7 @@ impl ITfKeyEventSink_Impl for Service_Impl {
             && self.editor.shift_held.replace(false)
             && Self::shortcut_name(w.0 as u32).is_some()
         {
-            if !self.editor.protect_input(ctx, true) {
+            if !self.editor.protect_input(ctx) {
                 return Ok(false.into());
             }
             if self.editor.refresh_shortcuts().is_err() {
@@ -1450,10 +1469,11 @@ impl ITfEditSession_Impl for Edit_Impl {
         } else {
             read_input_scope(&self.ctx, ec).unwrap_or(InputAccess::Unknown)
         };
-        if access != InputAccess::Allowed {
+        if !access.permits_key() {
             ed.clear_input(Some((&self.ctx, ec)));
             return Ok(());
         }
+        ed.sync_input_privacy(access)?;
         let a = &self.action;
         if a.cmd == "shortcut-repeat" {
             self.handled.set(true);
@@ -1658,6 +1678,7 @@ impl ITfEditSession_Impl for Edit_Impl {
                 sel?;
                 let clipboard_commit = r["clipboard_commit"].as_bool().unwrap_or(false);
                 if a.anchor_commit
+                    && !ed.no_learning.get()
                     && !clipboard_commit
                     && commit.is_some()
                     && pre.is_empty()
@@ -1671,6 +1692,7 @@ impl ITfEditSession_Impl for Edit_Impl {
                     }
                 }
                 if commit.is_some()
+                    && !ed.no_learning.get()
                     && !clipboard_commit
                     && a.cmd != "prediction-accept"
                     && ed.composition.borrow().is_none()
@@ -1695,7 +1717,7 @@ impl ITfEditSession_Impl for Edit_Impl {
             ed.cancel_prediction(false);
         }
         let mut v = ed.view.borrow_mut();
-        if let Some(text) = commit {
+        if let Some(text) = commit.filter(|_| !ed.no_learning.get()) {
             v.context_before.push_str(text);
             v.context_before = v
                 .context_before
@@ -1793,7 +1815,7 @@ unsafe extern "C" fn panel_event(
     let ed = &service.editor;
     let Some(ctx) = ed.current_context() else { return };
     ed.ipc_failed.set(false);
-    if !ed.protect_input(Some(&ctx), true) {
+    if !ed.protect_input(Some(&ctx)) {
         return;
     }
     if ed.needs_refocus.get() {
@@ -1891,7 +1913,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_scope_fallback_rejects_password_and_unknown_controls() {
+    fn native_scope_fallback_classifies_privacy_without_locking_language() {
         use windows::Win32::UI::WindowsAndMessaging::*;
         unsafe {
             let module = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("Msftedit.dll")).unwrap();
@@ -1904,19 +1926,31 @@ mod tests {
                     WS_POPUP, 0, 0, 100, 30, None, None, None, None).unwrap());
                 assert_eq!(native_edit_access(plain.0), InputAccess::Allowed);
                 SendMessageW(plain.0, 0x00cc, WPARAM('*' as usize), LPARAM(0));
-                assert_eq!(native_edit_access(plain.0), InputAccess::Blocked);
+                assert_eq!(native_edit_access(plain.0), InputAccess::Sensitive);
                 SendMessageW(plain.0, 0x00cc, WPARAM(0), LPARAM(0));
                 assert_eq!(native_edit_access(plain.0), InputAccess::Allowed);
                 let password = Window(CreateWindowExW(WINDOW_EX_STYLE(0), class, w!(""),
                     WS_POPUP | WINDOW_STYLE(ES_PASSWORD as u32), 0, 0, 100, 30,
                     None, None, None, None).unwrap());
-                assert_eq!(native_edit_access(password.0), InputAccess::Blocked);
+                assert_eq!(native_edit_access(password.0), InputAccess::Sensitive);
             }
             let unknown = Window(CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!(""),
                 WS_POPUP, 0, 0, 100, 30, None, None, None, None).unwrap());
             assert_eq!(native_edit_access(unknown.0), InputAccess::Unknown);
             assert_eq!(native_edit_access(HWND::default()), InputAccess::Unknown);
             let _ = FreeLibrary(module);
+        }
+    }
+
+    #[test]
+    fn exported_factory_supports_comless_activation() {
+        unsafe {
+            let mut factory = ptr::null_mut();
+            DllGetClassObject(&CLASS, &IClassFactory::IID, &mut factory).ok().unwrap();
+            let factory = IClassFactory::from_raw(factory);
+            let service: ITfTextInputProcessorEx = factory.CreateInstance(None).unwrap();
+            assert!(service.cast::<ITfKeyEventSink>().is_ok());
+            assert!(service.cast::<ITfTextInputProcessor>().is_ok());
         }
     }
 
@@ -2004,15 +2038,17 @@ mod tests {
     }
 
     #[test]
-    fn protected_scopes_always_pass_keys_through() {
+    fn input_scopes_do_not_lock_language() {
         for scope in [IS_PASSWORD, IS_NUMERIC_PIN, IS_ALPHANUMERIC_PIN] {
             let access = classify_scopes(&[IS_DEFAULT, scope]);
-            assert_eq!(access, InputAccess::Blocked);
-            assert!(!access.permits_key(false));
-            assert!(!access.permits_key(true));
+            assert_eq!(access, InputAccess::Sensitive);
+            assert!(access.permits_key());
         }
-        assert!(classify_scopes(&[IS_DEFAULT]).permits_key(false));
-        assert!(!InputAccess::Unknown.permits_key(false));
-        assert!(InputAccess::Unknown.permits_key(true));
+        for scope in [IS_DEFAULT, IS_SEARCH, IS_URL, IS_EMAIL_SMTPEMAILADDRESS, IS_NUMBER] {
+            assert_eq!(classify_scopes(&[scope]), InputAccess::Allowed);
+            assert!(classify_scopes(&[scope]).permits_key());
+        }
+        assert!(InputAccess::Unknown.permits_key());
+        assert!(!InputAccess::Blocked.permits_key());
     }
 }

@@ -12,6 +12,7 @@
 #include <string_view>
 #include <vector>
 #include <windows.h>
+#include <aclapi.h>
 #include <wrl/client.h>
 
 using Microsoft::WRL::ComPtr;
@@ -89,6 +90,7 @@ constexpr wchar_t key[] =
     L"SOFTWARE\\Classes\\CLSID\\{7C9E6679-7425-40DE-944B-E07FC1F90AE7}";
 const GUID *const categoriesSupported[] = {
     &GUID_TFCAT_TIP_KEYBOARD,
+    &GUID_TFCAT_TIPCAP_COMLESS,
     &GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
     &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
     &GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
@@ -119,6 +121,33 @@ HRESULT setString(HKEY h, const wchar_t *name, const wchar_t *value) {
       RegSetValueExW(h, name, 0, REG_SZ, reinterpret_cast<const BYTE *>(value),
                      (DWORD)(wcslen(value) + 1) * 2));
 }
+// Custom installation directories do not inherit Program Files' package-read
+// permissions. Grant access to public runtime files only, never user data.
+HRESULT grantPackageRead(const std::wstring &path) {
+  BYTE packageSid[SECURITY_MAX_SID_SIZE];
+  DWORD sidSize = sizeof(packageSid);
+  if (!CreateWellKnownSid(WinBuiltinAnyPackageSid, nullptr, packageSid, &sidSize))
+    return HRESULT_FROM_WIN32(GetLastError());
+  PACL oldAcl = nullptr, newAcl = nullptr;
+  PSECURITY_DESCRIPTOR descriptor = nullptr;
+  DWORD error = GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT,
+      DACL_SECURITY_INFORMATION, nullptr, nullptr, &oldAcl, nullptr, &descriptor);
+  if (error != ERROR_SUCCESS)
+    return HRESULT_FROM_WIN32(error);
+  EXPLICIT_ACCESSW access{};
+  access.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+  access.grfAccessMode = GRANT_ACCESS;
+  access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+  access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+  access.Trustee.ptstrName = reinterpret_cast<LPWSTR>(packageSid);
+  error = SetEntriesInAclW(1, &access, oldAcl, &newAcl);
+  if (error == ERROR_SUCCESS)
+    error = SetNamedSecurityInfoW(const_cast<LPWSTR>(path.c_str()), SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION, nullptr, nullptr, newAcl, nullptr);
+  if (newAcl) LocalFree(newAcl);
+  LocalFree(descriptor);
+  return HRESULT_FROM_WIN32(error);
+}
 HRESULT reg(bool install) {
   ComPtr<ITfInputProcessorProfileMgr> profiles;
   ComPtr<ITfCategoryMgr> categories;
@@ -147,6 +176,11 @@ HRESULT reg(bool install) {
   DWORD n = GetModuleFileNameW(module(), path, 32768);
   if (!n || n >= 32768)
     return E_FAIL;
+  const auto directory = std::wstring(path).substr(0, std::wstring(path).find_last_of(L"\\/"));
+  for (const auto &runtime : {directory, std::wstring(path), directory + L"\\vitral-desktop.exe"}) {
+    hr = grantPackageRead(runtime);
+    if (FAILED(hr)) return hr;
+  }
   HKEY h;
   auto sub = std::wstring(key) + L"\\InprocServer32";
   LONG rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, sub.c_str(), 0, nullptr, 0,

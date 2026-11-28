@@ -209,8 +209,6 @@ pub struct EngineConfig {
     #[serde(default = "crate::shortcuts::defaults")]
     pub shortcuts: Vec<crate::shortcuts::ShortcutBinding>,
     #[serde(default = "default_enabled")]
-    pub linux_english_mode: bool,
-    #[serde(default = "default_enabled")]
     pub adaptive_learning: bool,
     #[serde(default)]
     pub fuzzy_pinyin: bool,
@@ -334,10 +332,6 @@ impl EngineConfig {
         Ok(())
     }
 
-    pub fn shortcut_enabled(&self, action: crate::shortcuts::ShortcutAction) -> bool {
-        !(cfg!(target_os = "linux") && !self.linux_english_mode && action == crate::shortcuts::ShortcutAction::ToggleLanguage)
-    }
-
     pub fn parse_json(raw: &str) -> Result<Self, VitralError> {
         let mut value: serde_json::Value = serde_json::from_str(raw).map_err(|e| VitralError::Parse(e.to_string()))?;
         crate::sync::merge_alias(&mut value,"koofr_endpoint","webdav_url")?;
@@ -437,7 +431,6 @@ impl Default for EngineConfig {
             voice_cleanup_mode: default_voice_cleanup_mode(),
             privacy_apps: Vec::new(),
             shortcuts: crate::shortcuts::defaults(),
-            linux_english_mode: true,
             adaptive_learning: true,
             fuzzy_pinyin: false,
             fuzzy_pinyin_pairs: Vec::new(),
@@ -3844,8 +3837,7 @@ impl EngineState {
         let code = self.base_code();
         let shortcut_code = self.candidate_filter().is_none_or(str::is_empty).then_some(code);
         for binding in &self.config.shortcuts {
-            if !binding.text.is_empty() && shortcut_code == Some(binding.text.as_str())
-                && self.config.shortcut_enabled(binding.action) {
+            if !binding.text.is_empty() && shortcut_code == Some(binding.text.as_str()) {
                 let label = binding.action.label().to_string();
                 overlay.push((
                     CandidateItem {
